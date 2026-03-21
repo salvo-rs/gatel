@@ -7,7 +7,9 @@ set -euo pipefail
 GATEL="${1:-./target/release/gatel}"
 PORT=19876
 TMPDIR="$(mktemp -d)"
-trap 'kill $PID 2>/dev/null; rm -rf "$TMPDIR"' EXIT
+PID=""
+cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null || true; rm -rf "$TMPDIR"; }
+trap cleanup EXIT
 
 info()  { printf '\033[1;34m[SMOKE]\033[0m %s\n' "$*"; }
 pass()  { printf '\033[1;32m[PASS]\033[0m  %s\n' "$*"; }
@@ -69,8 +71,9 @@ if [[ "$BODY" != "smoke-ok" ]]; then
 fi
 
 # Graceful stop
-kill "$PID" 2>/dev/null
+kill "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true
+PID=""
 pass "start, serve, stop"
 
 echo ""
