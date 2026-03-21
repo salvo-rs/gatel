@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description.workspace = true
 repository.workspace = true
 
 [features]
@@ -51,6 +52,7 @@ h3-quinn = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 hickory-resolver = { workspace = true }
 salvo = { workspace = true }
+tower-service = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
