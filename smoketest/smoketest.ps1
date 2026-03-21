@@ -57,8 +57,12 @@ site "*" {
     Write-Test "rejects bad config"
     $badPath = Join-Path $TmpDir "bad.kdl"
     "not valid kdl {{{{" | Set-Content $badPath -Encoding UTF8
+    $oldPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $Binary validate --config $badPath 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Fail "accepted bad config" }
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = $oldPref
+    if ($exitCode -eq 0) { Write-Fail "accepted bad config" }
     Write-Pass "rejects bad config"
 
     # Test 5: start, serve, stop
