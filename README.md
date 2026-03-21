@@ -70,5 +70,3 @@ See the [docs/en](docs/en/) directory for full English documentation, or [docs/z
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
-
-[中文文档](README.zh.md)
