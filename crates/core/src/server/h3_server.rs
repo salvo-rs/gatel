@@ -150,12 +150,10 @@ async fn handle_h3_request(
     stream.send_response(resp_head).await?;
 
     // Send the response body.
-    let collected = resp_body.collect().await.map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("body collect error: {e}"),
-        )
-    })?;
+    let collected = resp_body
+        .collect()
+        .await
+        .map_err(|e| std::io::Error::other(format!("body collect error: {e}")))?;
     let resp_bytes = collected.to_bytes();
 
     if !resp_bytes.is_empty() {
@@ -182,32 +180,33 @@ async fn route_h3_via_salvo(
 
     let service = state.service.load();
 
-    // Build a hyper request with the body.
+    // Build a hyper request with the collected body.
     let (parts, _) = req.into_parts();
-    let full_body = http_body_util::Full::new(body_data);
-    let req_body: ReqBody = ReqBody::Once(full_body.into());
-
+    let req_body: ReqBody = ReqBody::Once(body_data);
     let hyper_req = hyper::Request::from_parts(parts, req_body);
 
-    // Build a Salvo Request from the hyper request.
+    // Use the same hyper_handler path as HTTP/1+2.
     let local_addr: SocketAddr = ([0, 0, 0, 0], 443).into();
-    let mut salvo_req =
-        salvo::Request::from_hyper(hyper_req, local_addr.into(), client_addr.into());
-    salvo_req.set_scheme(salvo::http::uri::Scheme::HTTPS);
-
-    let mut salvo_res = salvo::Response::new();
-
-    // Run through the Salvo service.
-    service.handle(&mut salvo_req, &mut salvo_res).await;
-
-    // Advertise HTTP/3 support via Alt-Svc on every response.
     let https_port = state.config.load().global.https_addr.port();
-    if let Ok(val) = format!("h3=\":{https_port}\"; ma=2592000").parse() {
-        salvo_res.headers_mut().insert("Alt-Svc", val);
-    }
+    let alt_svc_h3 = format!("h3=\":{https_port}\"; ma=2592000").parse().ok();
 
-    // Convert Salvo Response back to http::Response<Body>.
-    let hyper_resp = salvo_res.into_hyper();
+    let handler = service.hyper_handler(
+        local_addr.into(),
+        client_addr.into(),
+        salvo::http::uri::Scheme::HTTPS,
+        None,
+        alt_svc_h3,
+    );
+
+    use hyper::service::Service as HyperService;
+    let hyper_resp = match handler.call(hyper_req).await {
+        Ok(resp) => resp,
+        Err(_) => hyper::Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(salvo::http::ResBody::None)
+            .unwrap(),
+    };
+
     let (parts, res_body) = hyper_resp.into_parts();
     let body: Body = res_body
         .map_err(|e| -> crate::BoxError { Box::new(e) })

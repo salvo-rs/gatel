@@ -77,12 +77,11 @@ impl salvo::Handler for ForwardAuthHoop {
             // Copy the configured headers from the auth response into the
             // original request so downstream handlers can use them.
             for header_name in &self.copy_headers {
-                if let Some(value) = auth_resp.headers().get(header_name.as_str()) {
-                    if let Ok(hn) = header_name.parse::<http::header::HeaderName>() {
-                        if let Ok(hv) = http::header::HeaderValue::from_bytes(value.as_bytes()) {
-                            req.headers_mut().insert(hn, hv);
-                        }
-                    }
+                if let Some(value) = auth_resp.headers().get(header_name.as_str())
+                    && let Ok(hn) = header_name.parse::<http::header::HeaderName>()
+                    && let Ok(hv) = http::header::HeaderValue::from_bytes(value.as_bytes())
+                {
+                    req.headers_mut().insert(hn, hv);
                 }
             }
 

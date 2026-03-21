@@ -27,10 +27,10 @@ pub fn parse_cache_control(value: &str) -> CacheControlDirectives {
             if let Ok(seconds) = value.trim().parse::<u64>() {
                 directives.max_age = Some(Duration::from_secs(seconds));
             }
-        } else if let Some(value) = part.strip_prefix("s-maxage=") {
-            if let Ok(seconds) = value.trim().parse::<u64>() {
-                directives.s_maxage = Some(Duration::from_secs(seconds));
-            }
+        } else if let Some(value) = part.strip_prefix("s-maxage=")
+            && let Ok(seconds) = value.trim().parse::<u64>()
+        {
+            directives.s_maxage = Some(Duration::from_secs(seconds));
         }
     }
 

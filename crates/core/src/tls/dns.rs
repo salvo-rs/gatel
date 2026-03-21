@@ -214,18 +214,18 @@ impl certon::DnsProvider for DigitalOceanDns {
         let body: serde_json::Value = resp.json().await.map_err(req_err)?;
         if let Some(records) = body["domain_records"].as_array() {
             for record in records {
-                if record["data"].as_str() == Some(value) {
-                    if let Some(id) = record["id"].as_u64() {
-                        self.client
-                            .delete(format!(
-                                "https://api.digitalocean.com/v2/domains/{domain}/records/{id}"
-                            ))
-                            .bearer_auth(&self.api_token)
-                            .send()
-                            .await
-                            .map_err(req_err)?;
-                        debug!(provider = "digitalocean", record = %name, "DNS TXT record deleted");
-                    }
+                if record["data"].as_str() == Some(value)
+                    && let Some(id) = record["id"].as_u64()
+                {
+                    self.client
+                        .delete(format!(
+                            "https://api.digitalocean.com/v2/domains/{domain}/records/{id}"
+                        ))
+                        .bearer_auth(&self.api_token)
+                        .send()
+                        .await
+                        .map_err(req_err)?;
+                    debug!(provider = "digitalocean", record = %name, "DNS TXT record deleted");
                 }
             }
         }
@@ -407,19 +407,19 @@ impl certon::DnsProvider for DnSimpleDns {
         let body: serde_json::Value = resp.json().await.map_err(req_err)?;
         if let Some(records) = body["data"].as_array() {
             for record in records {
-                if record["content"].as_str() == Some(value) {
-                    if let Some(id) = record["id"].as_u64() {
-                        self.client
-                            .delete(format!(
-                                "https://api.dnsimple.com/v2/{}/zones/{zone_name}/records/{id}",
-                                self.account_id
-                            ))
-                            .bearer_auth(&self.api_token)
-                            .send()
-                            .await
-                            .map_err(req_err)?;
-                        debug!(provider = "dnsimple", record = %name, "DNS TXT record deleted");
-                    }
+                if record["content"].as_str() == Some(value)
+                    && let Some(id) = record["id"].as_u64()
+                {
+                    self.client
+                        .delete(format!(
+                            "https://api.dnsimple.com/v2/{}/zones/{zone_name}/records/{id}",
+                            self.account_id
+                        ))
+                        .bearer_auth(&self.api_token)
+                        .send()
+                        .await
+                        .map_err(req_err)?;
+                    debug!(provider = "dnsimple", record = %name, "DNS TXT record deleted");
                 }
             }
         }
@@ -507,19 +507,19 @@ impl certon::DnsProvider for PorkbunDns {
         let resp_body: serde_json::Value = resp.json().await.map_err(req_err)?;
         if let Some(records) = resp_body["records"].as_array() {
             for record in records {
-                if record["content"].as_str() == Some(value) {
-                    if let Some(id) = record["id"].as_str() {
-                        let del_body = self.auth_body();
-                        self.client
-                            .post(format!(
-                                "https://api.porkbun.com/api/json/v3/dns/delete/{domain}/{id}"
-                            ))
-                            .json(&del_body)
-                            .send()
-                            .await
-                            .map_err(req_err)?;
-                        debug!(provider = "porkbun", record = %name, "DNS TXT record deleted");
-                    }
+                if record["content"].as_str() == Some(value)
+                    && let Some(id) = record["id"].as_str()
+                {
+                    let del_body = self.auth_body();
+                    self.client
+                        .post(format!(
+                            "https://api.porkbun.com/api/json/v3/dns/delete/{domain}/{id}"
+                        ))
+                        .json(&del_body)
+                        .send()
+                        .await
+                        .map_err(req_err)?;
+                    debug!(provider = "porkbun", record = %name, "DNS TXT record deleted");
                 }
             }
         }
@@ -611,6 +611,7 @@ fn sha1_hex(data: &[u8]) -> String {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
         }
         let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        #[allow(clippy::needless_range_loop)]
         for i in 0..80 {
             let (f, k) = match i {
                 0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
@@ -891,19 +892,18 @@ impl certon::DnsProvider for BunnyDns {
                 if record["Type"].as_u64() == Some(3)
                     && record["Name"].as_str() == Some(name)
                     && record["Value"].as_str() == Some(value)
+                    && let Some(id) = record["Id"].as_u64()
                 {
-                    if let Some(id) = record["Id"].as_u64() {
-                        self.client
-                            .delete(format!(
-                                "https://api.bunny.net/dnszone/{}/records/{id}",
-                                self.zone_id
-                            ))
-                            .header("AccessKey", &self.api_token)
-                            .send()
-                            .await
-                            .map_err(req_err)?;
-                        debug!(provider = "bunny", record = %name, "DNS TXT record deleted");
-                    }
+                    self.client
+                        .delete(format!(
+                            "https://api.bunny.net/dnszone/{}/records/{id}",
+                            self.zone_id
+                        ))
+                        .header("AccessKey", &self.api_token)
+                        .send()
+                        .await
+                        .map_err(req_err)?;
+                    debug!(provider = "bunny", record = %name, "DNS TXT record deleted");
                 }
             }
         }

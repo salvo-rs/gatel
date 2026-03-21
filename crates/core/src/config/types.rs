@@ -10,23 +10,12 @@ fn serialize_duration<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Err
 }
 
 /// Top-level application configuration parsed from KDL.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct AppConfig {
     pub global: GlobalConfig,
     pub tls: Option<TlsConfig>,
     pub sites: Vec<SiteConfig>,
     pub stream: Option<StreamConfig>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            global: GlobalConfig::default(),
-            tls: None,
-            sites: Vec::new(),
-            stream: None,
-        }
-    }
 }
 
 /// Global settings.
@@ -164,30 +153,20 @@ pub struct DnsProviderConfig {
     pub options: std::collections::HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
 pub enum CertAuthority {
+    #[default]
     LetsEncrypt,
     LetsEncryptStaging,
     ZeroSsl,
 }
 
-impl Default for CertAuthority {
-    fn default() -> Self {
-        Self::LetsEncrypt
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
 pub enum ChallengeType {
+    #[default]
     Http01,
     TlsAlpn01,
     Dns01,
-}
-
-impl Default for ChallengeType {
-    fn default() -> Self {
-        Self::Http01
-    }
 }
 
 /// Per-site TLS override (manual cert).
@@ -396,6 +375,7 @@ pub struct BasicAuthUser {
 
 /// Terminal handler for a route.
 #[derive(Debug, Clone, serde::Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum HandlerConfig {
     Proxy(ProxyConfig),
     FastCgi(FastCgiConfig),

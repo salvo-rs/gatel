@@ -30,10 +30,10 @@ pub fn parse_config(input: &str) -> Result<AppConfig, ConfigError> {
     // First pass: collect all `snippet "name" { ... }` blocks.
     let mut snippets: HashMap<String, KdlNode> = HashMap::new();
     for node in doc.nodes() {
-        if node.name().to_string() == "snippet" {
-            if let Some(name) = first_string_arg(node) {
-                snippets.insert(name, node.clone());
-            }
+        if node.name().to_string() == "snippet"
+            && let Some(name) = first_string_arg(node)
+        {
+            snippets.insert(name, node.clone());
         }
     }
 
@@ -310,10 +310,10 @@ fn parse_tls(node: &KdlNode) -> Result<TlsConfig, ConfigError> {
                     .unwrap_or(true);
                 if let Some(cc) = child.children() {
                     for n in cc.nodes() {
-                        if n.name().to_string() == "ca-cert" {
-                            if let Some(path) = first_string_arg(n) {
-                                ca_certs.push(path);
-                            }
+                        if n.name().to_string() == "ca-cert"
+                            && let Some(path) = first_string_arg(n)
+                        {
+                            ca_certs.push(path);
                         }
                     }
                 }
@@ -703,7 +703,7 @@ fn parse_route(
             let root = effective_nodes
                 .iter()
                 .find(|n| n.name().to_string() == "root")
-                .and_then(|n| first_string_arg(n))
+                .and_then(first_string_arg)
                 .unwrap_or_else(|| ".".into());
             let browse = fs_node
                 .get("browse")
@@ -749,10 +749,10 @@ fn parse_route(
             if !is_known_directive(&name) {
                 let mut config = HashMap::new();
                 for entry in n.entries() {
-                    if let Some(ename) = entry.name() {
-                        if let Some(val) = entry.value().as_string() {
-                            config.insert(ename.to_string(), val.to_string());
-                        }
+                    if let Some(ename) = entry.name()
+                        && let Some(val) = entry.value().as_string()
+                    {
+                        config.insert(ename.to_string(), val.to_string());
                     }
                 }
                 handler = Some(HandlerConfig::Module { name, config });
@@ -892,29 +892,29 @@ fn parse_forward_proxy(node: &KdlNode) -> Result<ForwardProxyConfig, ConfigError
 
 fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
     // Simple form: `proxy "host:port"` — single upstream, no children
-    if let Some(addr) = first_string_arg(node) {
-        if node.children().is_none() {
-            return Ok(ProxyConfig {
-                upstreams: vec![UpstreamConfig { addr, weight: 1 }],
-                lb: LbPolicy::default(),
-                lb_header: None,
-                lb_cookie: None,
-                health_check: None,
-                passive_health: None,
-                headers_up: HashMap::new(),
-                headers_down: HashMap::new(),
-                retries: 0,
-                dynamic_upstreams: None,
-                error_pages: HashMap::new(),
-                headers_up_replace: Vec::new(),
-                tls_skip_verify: false,
-                upstream_http2: false,
-                max_connections: None,
-                keepalive_timeout: None,
-                sanitize_uri: true,
-                srv_upstream: None,
-            });
-        }
+    if let Some(addr) = first_string_arg(node)
+        && node.children().is_none()
+    {
+        return Ok(ProxyConfig {
+            upstreams: vec![UpstreamConfig { addr, weight: 1 }],
+            lb: LbPolicy::default(),
+            lb_header: None,
+            lb_cookie: None,
+            health_check: None,
+            passive_health: None,
+            headers_up: HashMap::new(),
+            headers_down: HashMap::new(),
+            retries: 0,
+            dynamic_upstreams: None,
+            error_pages: HashMap::new(),
+            headers_up_replace: Vec::new(),
+            tls_skip_verify: false,
+            upstream_http2: false,
+            max_connections: None,
+            keepalive_timeout: None,
+            sanitize_uri: true,
+            srv_upstream: None,
+        });
     }
 
     let mut upstreams = Vec::new();
@@ -987,13 +987,13 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 let interval = child
                     .get("interval")
                     .and_then(|v| v.as_string())
-                    .map(|s| parse_duration(s))
+                    .map(parse_duration)
                     .transpose()?
                     .unwrap_or(Duration::from_secs(10));
                 let timeout = child
                     .get("timeout")
                     .and_then(|v| v.as_string())
-                    .map(|s| parse_duration(s))
+                    .map(parse_duration)
                     .transpose()?
                     .unwrap_or(Duration::from_secs(5));
                 let unhealthy_threshold = child
@@ -1020,13 +1020,13 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 let fail_window = child
                     .get("fail-window")
                     .and_then(|v| v.as_string())
-                    .map(|s| parse_duration(s))
+                    .map(parse_duration)
                     .transpose()?
                     .unwrap_or(Duration::from_secs(30));
                 let cooldown = child
                     .get("cooldown")
                     .and_then(|v| v.as_string())
-                    .map(|s| parse_duration(s))
+                    .map(parse_duration)
                     .transpose()?
                     .unwrap_or(Duration::from_secs(60));
                 passive_health = Some(PassiveHealthConfig {
@@ -1075,7 +1075,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 let refresh_interval = child
                     .get("refresh")
                     .and_then(|v| v.as_string())
-                    .map(|s| parse_duration(s))
+                    .map(parse_duration)
                     .transpose()?
                     .unwrap_or(Duration::from_secs(30));
                 dynamic_upstreams = Some(DnsUpstreamConfig {
@@ -1088,13 +1088,13 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 // `error-page 502 "Bad Gateway - upstream unreachable"`
                 let entries = child.entries();
                 let positional: Vec<_> = entries.iter().filter(|e| e.name().is_none()).collect();
-                if positional.len() >= 2 {
-                    if let (Some(code), Some(body)) = (
+                if positional.len() >= 2
+                    && let (Some(code), Some(body)) = (
                         positional[0].value().as_integer(),
                         positional[1].value().as_string(),
-                    ) {
-                        error_pages.insert(code as u16, body.to_string());
-                    }
+                    )
+                {
+                    error_pages.insert(code as u16, body.to_string());
                 }
             }
             "header-up-replace" => {
@@ -1120,7 +1120,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 keepalive_timeout = child
                     .get(0)
                     .and_then(|v| v.as_string())
-                    .map(|s| parse_duration(s))
+                    .map(parse_duration)
                     .transpose()?;
             }
             "sanitize-uri" => {
@@ -1141,7 +1141,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 let refresh_interval = child
                     .get("refresh")
                     .and_then(|v| v.as_string())
-                    .map(|s| parse_duration(s))
+                    .map(parse_duration)
                     .transpose()?
                     .unwrap_or(Duration::from_secs(30));
                 srv_upstream = Some(SrvUpstreamConfig {
@@ -1187,7 +1187,7 @@ fn parse_rate_limit(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
     let window = node
         .get("window")
         .and_then(|v| v.as_string())
-        .map(|s| parse_duration(s))
+        .map(parse_duration)
         .transpose()?
         .unwrap_or(Duration::from_secs(60));
     let max = node.get("max").and_then(|v| v.as_integer()).unwrap_or(100) as u64;
@@ -1545,10 +1545,10 @@ fn parse_error_pages(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
     if let Some(children) = node.children() {
         for child in children.nodes() {
             let code_str = child.name().to_string();
-            if let Ok(code) = code_str.parse::<u16>() {
-                if let Some(body) = first_string_arg(child) {
-                    pages.insert(code, body);
-                }
+            if let Ok(code) = code_str.parse::<u16>()
+                && let Some(body) = first_string_arg(child)
+            {
+                pages.insert(code, body);
             }
         }
     }
@@ -1644,13 +1644,12 @@ fn parse_matcher(node: &KdlNode) -> Result<RequestMatcher, ConfigError> {
 
     // Check for "not" or composite matchers via children.
     let kind = first_string_arg(node).unwrap_or_default();
-    if kind == "not" {
-        if let Some(children) = node.children() {
-            if let Some(child) = children.nodes().first() {
-                let inner = parse_matcher(child)?;
-                return Ok(RequestMatcher::Not(Box::new(inner)));
-            }
-        }
+    if kind == "not"
+        && let Some(children) = node.children()
+        && let Some(child) = children.nodes().first()
+    {
+        let inner = parse_matcher(child)?;
+        return Ok(RequestMatcher::Not(Box::new(inner)));
     }
 
     // Default to a path matcher using the first positional arg.
@@ -1747,14 +1746,11 @@ fn parse_cgi(node: &KdlNode) -> Result<CgiConfig, ConfigError> {
 
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            match child.name().to_string().as_str() {
-                "env" => {
-                    let args = string_args(child);
-                    if args.len() >= 2 {
-                        env.insert(args[0].clone(), args[1].clone());
-                    }
+            if child.name().to_string().as_str() == "env" {
+                let args = string_args(child);
+                if args.len() >= 2 {
+                    env.insert(args[0].clone(), args[1].clone());
                 }
-                _ => {}
             }
         }
     }
@@ -1780,14 +1776,11 @@ fn parse_scgi(node: &KdlNode) -> Result<ScgiConfig, ConfigError> {
 
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            match child.name().to_string().as_str() {
-                "env" => {
-                    let args = string_args(child);
-                    if args.len() >= 2 {
-                        env.insert(args[0].clone(), args[1].clone());
-                    }
+            if child.name().to_string().as_str() == "env" {
+                let args = string_args(child);
+                if args.len() >= 2 {
+                    env.insert(args[0].clone(), args[1].clone());
                 }
-                _ => {}
             }
         }
     }
@@ -1815,7 +1808,7 @@ fn parse_stream(node: &KdlNode) -> Result<StreamConfig, ConfigError> {
                     c.nodes()
                         .iter()
                         .find(|n| n.name().to_string() == "proxy")
-                        .and_then(|n| first_string_arg(n))
+                        .and_then(first_string_arg)
                 })
                 .ok_or_else(|| ConfigError::MissingField("stream proxy target".into()))?;
             listeners.push(StreamListenerConfig { listen, proxy });

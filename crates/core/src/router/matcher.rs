@@ -30,9 +30,8 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
         // Prefix match: "/api/*" matches "/api/", "/api/foo", "/api/foo/bar"
         return path == prefix || path.starts_with(&format!("{prefix}/"));
     }
-    if pattern.ends_with('*') {
+    if let Some(prefix) = pattern.strip_suffix('*') {
         // Glob-like: "/static*" matches "/static", "/staticfiles", etc.
-        let prefix = &pattern[..pattern.len() - 1];
         return path.starts_with(prefix);
     }
     // Exact match

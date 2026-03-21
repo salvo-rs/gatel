@@ -216,12 +216,12 @@ impl ReverseProxy {
                     active = total,
                     "connection limit exceeded, returning 503"
                 );
-                return Ok(Response::builder()
+                return Response::builder()
                     .status(http::StatusCode::SERVICE_UNAVAILABLE)
                     .body(crate::full_body(
                         "Service Unavailable: connection limit exceeded",
                     ))
-                    .map_err(|e| ProxyError::Internal(e.to_string()))?);
+                    .map_err(|e| ProxyError::Internal(e.to_string()));
             }
         }
 
@@ -239,16 +239,14 @@ impl ReverseProxy {
 
         for attempt in 0..max_attempts {
             // --- Select a backend ---
-            let backend_idx = loop {
+            let backend_idx = {
                 let idx = self.lb.select(&self.pool, &lb_ctx);
                 match idx {
                     Some(i) if last_failed_idx == Some(i) && self.pool.len() > 1 => {
                         // On retry, try to skip the backend that just failed.
-                        // Do one more selection; if we keep getting the same, accept it.
-                        let alt = self.lb.select(&self.pool, &lb_ctx);
-                        break alt;
+                        self.lb.select(&self.pool, &lb_ctx)
                     }
-                    other => break other,
+                    other => other,
                 }
             };
 
@@ -329,8 +327,7 @@ impl ReverseProxy {
 
             // Apply header-up directives.
             for (name, value) in &self.headers_up {
-                if name.starts_with('-') {
-                    let hdr_name = &name[1..];
+                if let Some(hdr_name) = name.strip_prefix('-') {
                     if let Ok(hn) = hdr_name.parse::<http::header::HeaderName>() {
                         req_parts.headers.remove(hn);
                     }
@@ -347,15 +344,13 @@ impl ReverseProxy {
 
             // Apply header-up-replace directives (regex substitution on existing values).
             for (name, re, replacement) in &self.headers_up_replace {
-                if let Ok(hn) = name.parse::<http::header::HeaderName>() {
-                    if let Some(existing) = req_parts.headers.get(&hn) {
-                        if let Ok(existing_str) = existing.to_str() {
-                            let new_value = re.replace_all(existing_str, replacement.as_str());
-                            if let Ok(hv) = new_value.as_ref().parse::<http::header::HeaderValue>()
-                            {
-                                req_parts.headers.insert(hn, hv);
-                            }
-                        }
+                if let Ok(hn) = name.parse::<http::header::HeaderName>()
+                    && let Some(existing) = req_parts.headers.get(&hn)
+                    && let Ok(existing_str) = existing.to_str()
+                {
+                    let new_value = re.replace_all(existing_str, replacement.as_str());
+                    if let Ok(hv) = new_value.as_ref().parse::<http::header::HeaderValue>() {
+                        req_parts.headers.insert(hn, hv);
                     }
                 }
             }
@@ -412,10 +407,10 @@ impl ReverseProxy {
                     let (mut resp_parts, resp_body) = resp.into_parts();
 
                     // Passive health: record 5xx
-                    if resp_parts.status.is_server_error() {
-                        if let Some(ref ph) = self.passive_health {
-                            ph.record_failure(backend_idx, &self.pool).await;
-                        }
+                    if resp_parts.status.is_server_error()
+                        && let Some(ref ph) = self.passive_health
+                    {
+                        ph.record_failure(backend_idx, &self.pool).await;
                     }
 
                     // If server error and we have retries left, retry.
@@ -438,8 +433,7 @@ impl ReverseProxy {
 
                     // Apply header-down directives.
                     for (name, value) in &self.headers_down {
-                        if name.starts_with('-') {
-                            let hdr_name = &name[1..];
+                        if let Some(hdr_name) = name.strip_prefix('-') {
                             if let Ok(hn) = hdr_name.parse::<http::header::HeaderName>() {
                                 resp_parts.headers.remove(hn);
                             }

@@ -206,39 +206,37 @@ impl salvo::Handler for CacheHoop {
                 debug!(path = path.as_str(), "no-cache directive, revalidating");
             } else {
                 // Check conditional request: If-None-Match.
-                if let Some(inm) = req.headers().get(IF_NONE_MATCH) {
-                    if let (Ok(inm_str), Some(etag)) = (inm.to_str(), &entry.etag) {
-                        if inm_str.trim_matches('"') == etag.trim_matches('"') {
-                            debug!(path = path.as_str(), "conditional cache hit (ETag), 304");
-                            res.status_code(StatusCode::NOT_MODIFIED);
-                            if let Ok(val) = etag.parse::<HeaderValue>() {
-                                res.headers_mut().insert(ETAG, val);
-                            }
-                            res.headers_mut()
-                                .insert(AGE, HeaderValue::from(entry.age_secs()));
-                            let _ = res.add_header("X-Cache", "HIT", true);
-                            ctrl.skip_rest();
-                            return;
-                        }
+                if let Some(inm) = req.headers().get(IF_NONE_MATCH)
+                    && let (Ok(inm_str), Some(etag)) = (inm.to_str(), &entry.etag)
+                    && inm_str.trim_matches('"') == etag.trim_matches('"')
+                {
+                    debug!(path = path.as_str(), "conditional cache hit (ETag), 304");
+                    res.status_code(StatusCode::NOT_MODIFIED);
+                    if let Ok(val) = etag.parse::<HeaderValue>() {
+                        res.headers_mut().insert(ETAG, val);
                     }
+                    res.headers_mut()
+                        .insert(AGE, HeaderValue::from(entry.age_secs()));
+                    let _ = res.add_header("X-Cache", "HIT", true);
+                    ctrl.skip_rest();
+                    return;
                 }
 
                 // Check conditional request: If-Modified-Since.
-                if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE) {
-                    if let (Ok(ims_str), Some(lm)) = (ims.to_str(), &entry.last_modified) {
-                        if ims_str == lm {
-                            debug!(
-                                path = path.as_str(),
-                                "conditional cache hit (If-Modified-Since), 304"
-                            );
-                            res.status_code(StatusCode::NOT_MODIFIED);
-                            res.headers_mut()
-                                .insert(AGE, HeaderValue::from(entry.age_secs()));
-                            let _ = res.add_header("X-Cache", "HIT", true);
-                            ctrl.skip_rest();
-                            return;
-                        }
-                    }
+                if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE)
+                    && let (Ok(ims_str), Some(lm)) = (ims.to_str(), &entry.last_modified)
+                    && ims_str == lm
+                {
+                    debug!(
+                        path = path.as_str(),
+                        "conditional cache hit (If-Modified-Since), 304"
+                    );
+                    res.status_code(StatusCode::NOT_MODIFIED);
+                    res.headers_mut()
+                        .insert(AGE, HeaderValue::from(entry.age_secs()));
+                    let _ = res.add_header("X-Cache", "HIT", true);
+                    ctrl.skip_rest();
+                    return;
                 }
 
                 debug!(

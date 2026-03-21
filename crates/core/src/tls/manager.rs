@@ -169,13 +169,13 @@ impl TlsManager {
         );
 
         // Log OCSP stapling status.
-        if let Some(ref tls_config) = config.tls {
-            if tls_config.ocsp_stapling {
-                info!(
-                    "OCSP stapling enabled (handled by certon for ACME certs; \
+        if let Some(ref tls_config) = config.tls
+            && tls_config.ocsp_stapling
+        {
+            info!(
+                "OCSP stapling enabled (handled by certon for ACME certs; \
                      manual certs require AIA extension parsing)"
-                );
-            }
+            );
         }
 
         Ok(Self {
@@ -261,15 +261,14 @@ impl TlsManager {
         }
 
         // Re-enroll new ACME domains (if any new ones appeared).
-        if !acme_domains.is_empty() {
-            if let Some(ref ca_config) = self.certon_config {
-                if let Err(e) = ca_config.manage_sync(&acme_domains).await {
-                    warn!(
-                        error = %e,
-                        "failed to manage new ACME domains during reload"
-                    );
-                }
-            }
+        if !acme_domains.is_empty()
+            && let Some(ref ca_config) = self.certon_config
+            && let Err(e) = ca_config.manage_sync(&acme_domains).await
+        {
+            warn!(
+                error = %e,
+                "failed to manage new ACME domains during reload"
+            );
         }
 
         // Rebuild the client cert verifier if mTLS is configured.
@@ -355,13 +354,12 @@ impl std::fmt::Debug for CompositeResolver {
 impl ResolvesServerCert for CompositeResolver {
     fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // Try manual certificates first (by SNI).
-        if let Some(sni) = client_hello.server_name() {
-            if let Ok(guard) = self.manual_certs.try_read() {
-                if let Some(ck) = guard.get(sni) {
-                    debug!(sni = %sni, "serving manual TLS certificate");
-                    return Some(ck.clone());
-                }
-            }
+        if let Some(sni) = client_hello.server_name()
+            && let Ok(guard) = self.manual_certs.try_read()
+            && let Some(ck) = guard.get(sni)
+        {
+            debug!(sni = %sni, "serving manual TLS certificate");
+            return Some(ck.clone());
         }
 
         // Fall back to the certon resolver.
@@ -561,15 +559,15 @@ fn build_on_demand_config(
     let allowlist: HashSet<String> = sites.iter().map(|s| s.host.to_lowercase()).collect();
 
     // Build the decision function if an ask URL is configured.
-    let decision_func: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>> =
-        if let Some(ref ask_url) = od_config.ask {
-            let url = ask_url.clone();
-            Some(Arc::new(move |domain: &str| {
-                check_ask_url_blocking(&url, domain)
-            }))
-        } else {
-            None
-        };
+    type DecisionFn = dyn Fn(&str) -> bool + Send + Sync;
+    let decision_func: Option<Arc<DecisionFn>> = if let Some(ref ask_url) = od_config.ask {
+        let url = ask_url.clone();
+        Some(Arc::new(move |domain: &str| {
+            check_ask_url_blocking(&url, domain)
+        }))
+    } else {
+        None
+    };
 
     // Build the rate limiter if configured.
     let rate_limit = od_config.rate_limit.map(|max_per_minute| {
@@ -581,15 +579,17 @@ fn build_on_demand_config(
 
     // Build the obtain function that triggers ACME certificate issuance.
     let issuer_for_obtain = Arc::clone(issuer);
-    let obtain_func: Arc<
-        dyn Fn(String) -> Pin<Box<dyn std::future::Future<Output = certon::Result<()>> + Send>>
-            + Send
-            + Sync,
-    > = Arc::new(move |domain: String| {
+    type ObtainFn = dyn Fn(String) -> Pin<Box<dyn std::future::Future<Output = certon::Result<()>> + Send>>
+        + Send
+        + Sync;
+    let obtain_func: Arc<ObtainFn> = Arc::new(move |domain: String| {
         let issuer = Arc::clone(&issuer_for_obtain);
         Box::pin(async move {
             info!(domain = %domain, "on-demand TLS: obtaining certificate");
-            match issuer.issue_for_domains(&[domain.clone()]).await {
+            match issuer
+                .issue_for_domains(std::slice::from_ref(&domain))
+                .await
+            {
                 Ok(_cert) => {
                     info!(domain = %domain, "on-demand TLS: certificate obtained");
                     Ok(())

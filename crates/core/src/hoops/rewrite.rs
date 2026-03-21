@@ -94,23 +94,23 @@ fn apply_rewrite(mw: &RewriteHoop, req: &mut Request) -> Result<(), ProxyError> 
     let original_query = original_uri.query().unwrap_or("");
 
     // Conditional checks: if_not_file / if_not_dir.
-    if mw.if_not_file || mw.if_not_dir {
-        if let Some(root) = &mw.root {
-            let fs_path = Path::new(root).join(original_path.trim_start_matches('/'));
-            if mw.if_not_file && fs_path.is_file() {
-                debug!(
-                    path = original_path,
-                    "rewrite skipped: path resolves to existing file"
-                );
-                return Ok(());
-            }
-            if mw.if_not_dir && fs_path.is_dir() {
-                debug!(
-                    path = original_path,
-                    "rewrite skipped: path resolves to existing directory"
-                );
-                return Ok(());
-            }
+    if (mw.if_not_file || mw.if_not_dir)
+        && let Some(root) = &mw.root
+    {
+        let fs_path = Path::new(root).join(original_path.trim_start_matches('/'));
+        if mw.if_not_file && fs_path.is_file() {
+            debug!(
+                path = original_path,
+                "rewrite skipped: path resolves to existing file"
+            );
+            return Ok(());
+        }
+        if mw.if_not_dir && fs_path.is_dir() {
+            debug!(
+                path = original_path,
+                "rewrite skipped: path resolves to existing directory"
+            );
+            return Ok(());
         }
     }
 

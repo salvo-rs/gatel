@@ -49,6 +49,12 @@ pub struct DynamicBackends {
     inner: ArcSwap<Vec<Backend>>,
 }
 
+impl Default for DynamicBackends {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DynamicBackends {
     pub fn new() -> Self {
         Self {

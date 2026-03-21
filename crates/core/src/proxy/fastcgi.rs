@@ -167,15 +167,7 @@ impl FastCgiTransport {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "index.php".into());
-            format!(
-                "{}{}",
-                script_name.trim_end_matches('/'),
-                if script_name == "/" {
-                    format!("/{idx}")
-                } else {
-                    format!("/{idx}")
-                }
-            )
+            format!("{}/{idx}", script_name.trim_end_matches('/'))
         } else {
             script_name
         };
@@ -320,9 +312,7 @@ fn build_record(record_type: u8, request_id: u16, content: &[u8]) -> Vec<u8> {
     buf.push(0); // reserved
     buf.extend_from_slice(content);
     // Append padding.
-    for _ in 0..padding_len {
-        buf.push(0);
-    }
+    buf.extend(std::iter::repeat_n(0u8, padding_len as usize));
     buf
 }
 

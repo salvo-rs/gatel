@@ -218,10 +218,10 @@ fn build_route_router(route: &RouteConfig, modules: &ModuleRegistry) -> Router {
                 overwrite,
             } => {
                 let mut rid = RequestId::new();
-                if let Some(name) = header_name {
-                    if let Ok(hn) = name.parse::<http::header::HeaderName>() {
-                        rid = rid.header_name(hn);
-                    }
+                if let Some(name) = header_name
+                    && let Ok(hn) = name.parse::<http::header::HeaderName>()
+                {
+                    rid = rid.header_name(hn);
                 }
                 rid = rid.overwrite(*overwrite);
                 router = router.hoop(rid);

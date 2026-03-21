@@ -123,10 +123,10 @@ impl ModuleRegistry {
     /// Call `on_reload` on all registered modules.
     pub fn reload_all(&self, configs: &HashMap<String, HashMap<String, String>>) {
         for (name, loader) in &self.loaders {
-            if let Some(cfg) = configs.get(name.as_str()) {
-                if let Err(e) = loader.on_reload(cfg) {
-                    tracing::warn!(module = %name, error = %e, "module on_reload failed");
-                }
+            if let Some(cfg) = configs.get(name.as_str())
+                && let Err(e) = loader.on_reload(cfg)
+            {
+                tracing::warn!(module = %name, error = %e, "module on_reload failed");
             }
         }
     }

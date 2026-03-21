@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Auto-format Rust code before committing.
+
+if ! command -v cargo &>/dev/null; then
+    exit 0
+fi
+
+cargo +nightly fmt --all 2>/dev/null
+git add -u -- '*.rs'

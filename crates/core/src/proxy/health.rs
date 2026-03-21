@@ -66,38 +66,34 @@ impl HealthChecker {
                         Ok(Ok(())) => {
                             consecutive_fail[idx] = 0;
                             consecutive_ok[idx] += 1;
-                            if consecutive_ok[idx] >= healthy_threshold {
-                                if !pool.is_healthy(idx) {
-                                    debug!(backend = addr, "active health check: marking healthy");
-                                    pool.set_healthy(idx, true);
-                                }
+                            if consecutive_ok[idx] >= healthy_threshold && !pool.is_healthy(idx) {
+                                debug!(backend = addr, "active health check: marking healthy");
+                                pool.set_healthy(idx, true);
                             }
                         }
                         Ok(Err(e)) => {
                             consecutive_ok[idx] = 0;
                             consecutive_fail[idx] += 1;
-                            if consecutive_fail[idx] >= unhealthy_threshold {
-                                if pool.is_healthy(idx) {
-                                    warn!(
-                                        backend = addr,
-                                        error = %e,
-                                        "active health check: marking unhealthy"
-                                    );
-                                    pool.set_healthy(idx, false);
-                                }
+                            if consecutive_fail[idx] >= unhealthy_threshold && pool.is_healthy(idx)
+                            {
+                                warn!(
+                                    backend = addr,
+                                    error = %e,
+                                    "active health check: marking unhealthy"
+                                );
+                                pool.set_healthy(idx, false);
                             }
                         }
                         Err(_elapsed) => {
                             consecutive_ok[idx] = 0;
                             consecutive_fail[idx] += 1;
-                            if consecutive_fail[idx] >= unhealthy_threshold {
-                                if pool.is_healthy(idx) {
-                                    warn!(
-                                        backend = addr,
-                                        "active health check: marking unhealthy (timeout)"
-                                    );
-                                    pool.set_healthy(idx, false);
-                                }
+                            if consecutive_fail[idx] >= unhealthy_threshold && pool.is_healthy(idx)
+                            {
+                                warn!(
+                                    backend = addr,
+                                    "active health check: marking unhealthy (timeout)"
+                                );
+                                pool.set_healthy(idx, false);
                             }
                         }
                     }
@@ -169,16 +165,16 @@ impl PassiveHealthChecker {
         // Remove failures outside the window.
         failures.retain(|&t| now.duration_since(t) < window);
 
-        if failures.len() as u32 >= self.config.max_fails {
-            if !entry.disabled.swap(true, Ordering::Relaxed) {
-                warn!(
-                    backend = pool.backends[idx].addr,
-                    fails = failures.len(),
-                    "passive health: disabling backend"
-                );
-                pool.set_healthy(idx, false);
-                *entry.disabled_at.lock().await = Some(now);
-            }
+        if failures.len() as u32 >= self.config.max_fails
+            && !entry.disabled.swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                backend = pool.backends[idx].addr,
+                fails = failures.len(),
+                "passive health: disabling backend"
+            );
+            pool.set_healthy(idx, false);
+            *entry.disabled_at.lock().await = Some(now);
         }
     }
 
@@ -194,18 +190,18 @@ impl PassiveHealthChecker {
                 continue;
             }
             let disabled_at = *entry.disabled_at.lock().await;
-            if let Some(at) = disabled_at {
-                if now.duration_since(at) >= cooldown {
-                    debug!(
-                        backend = pool.backends[idx].addr,
-                        "passive health: re-enabling backend after cooldown"
-                    );
-                    entry.disabled.store(false, Ordering::Relaxed);
-                    pool.set_healthy(idx, true);
-                    // Reset failure history so we start fresh.
-                    entry.failures.lock().await.clear();
-                    *entry.disabled_at.lock().await = None;
-                }
+            if let Some(at) = disabled_at
+                && now.duration_since(at) >= cooldown
+            {
+                debug!(
+                    backend = pool.backends[idx].addr,
+                    "passive health: re-enabling backend after cooldown"
+                );
+                entry.disabled.store(false, Ordering::Relaxed);
+                pool.set_healthy(idx, true);
+                // Reset failure history so we start fresh.
+                entry.failures.lock().await.clear();
+                *entry.disabled_at.lock().await = None;
             }
         }
     }

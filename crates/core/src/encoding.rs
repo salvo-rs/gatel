@@ -8,13 +8,13 @@ pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex_val(bytes[index + 1]), hex_val(bytes[index + 2]))
-            {
-                result.push(high << 4 | low);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_val(bytes[index + 1]), hex_val(bytes[index + 2]))
+        {
+            result.push(high << 4 | low);
+            index += 3;
+            continue;
         }
         result.push(bytes[index]);
         index += 1;

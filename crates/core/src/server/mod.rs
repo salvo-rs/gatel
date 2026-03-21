@@ -89,12 +89,12 @@ impl AppState {
     /// Hot-reload: atomically swap in a new config and rebuild the router.
     pub async fn reload(&self, new_config: AppConfig) {
         // Reload TLS configuration if a TlsManager is present.
-        if let Some(ref tls_mgr) = self.tls_manager {
-            if let Err(e) = tls_mgr.reload(&new_config).await {
-                error!("failed to reload TLS configuration: {e}");
-                // Continue with the rest of the reload; the old TLS config
-                // remains active via ArcSwap.
-            }
+        if let Some(ref tls_mgr) = self.tls_manager
+            && let Err(e) = tls_mgr.reload(&new_config).await
+        {
+            error!("failed to reload TLS configuration: {e}");
+            // Continue with the rest of the reload; the old TLS config
+            // remains active via ArcSwap.
         }
 
         let new_service = salvo_service::build_service(&new_config, &self.modules);

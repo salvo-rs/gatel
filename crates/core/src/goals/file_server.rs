@@ -103,7 +103,7 @@ impl FileServerGoal {
         req_headers: &http::HeaderMap,
     ) -> Result<Response<Body>, ProxyError> {
         // Resolve to filesystem path.
-        let file_path = match self.resolve_path(&request_path) {
+        let file_path = match self.resolve_path(request_path) {
             Some(p) => p,
             None => {
                 debug!(path = request_path, "path traversal blocked");
@@ -144,8 +144,7 @@ impl FileServerGoal {
             } else if self.browse {
                 // No index file found — generate a directory listing.
                 debug!(path = ?file_path, "generating directory listing");
-                let html =
-                    generate_directory_listing(&file_path, &self.root, &request_path).await?;
+                let html = generate_directory_listing(&file_path, &self.root, request_path).await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -190,32 +189,29 @@ impl FileServerGoal {
         let last_modified_str = modified.map(http_date::format_http_date);
 
         // Check If-None-Match.
-        if let Some(inm) = req_headers.get(IF_NONE_MATCH) {
-            if let Ok(inm_str) = inm.to_str() {
-                if inm_str.trim_matches('"') == etag.trim_matches('"') {
-                    return Ok(Response::builder()
-                        .status(StatusCode::NOT_MODIFIED)
-                        .header(ETAG, &etag)
-                        .body(empty_body())
-                        .unwrap());
-                }
-            }
+        if let Some(inm) = req_headers.get(IF_NONE_MATCH)
+            && let Ok(inm_str) = inm.to_str()
+            && inm_str.trim_matches('"') == etag.trim_matches('"')
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(ETAG, &etag)
+                .body(empty_body())
+                .unwrap());
         }
 
         // Check If-Modified-Since.
         if let (Some(ims), Some(mod_time)) = (req_headers.get(IF_MODIFIED_SINCE), modified.as_ref())
+            && let Ok(ims_str) = ims.to_str()
+            && let Some(ims_time) = http_date::parse_http_date(ims_str)
         {
-            if let Ok(ims_str) = ims.to_str() {
-                if let Some(ims_time) = http_date::parse_http_date(ims_str) {
-                    // File not modified since the date the client has.
-                    if *mod_time <= ims_time {
-                        return Ok(Response::builder()
-                            .status(StatusCode::NOT_MODIFIED)
-                            .header(ETAG, &etag)
-                            .body(empty_body())
-                            .unwrap());
-                    }
-                }
+            // File not modified since the date the client has.
+            if *mod_time <= ims_time {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(ETAG, &etag)
+                    .body(empty_body())
+                    .unwrap());
             }
         }
 
@@ -280,43 +276,43 @@ impl FileServerGoal {
         }
 
         // Check for Range header.
-        if let Some(range_header) = req_headers.get(RANGE) {
-            if let Ok(range_str) = range_header.to_str() {
-                if let Some((start, end)) = http_date::parse_range(range_str, file_size) {
-                    let length = end - start + 1;
+        if let Some(range_header) = req_headers.get(RANGE)
+            && let Ok(range_str) = range_header.to_str()
+        {
+            if let Some((start, end)) = http_date::parse_range(range_str, file_size) {
+                let length = end - start + 1;
 
-                    // Read the specific range.
-                    let mut file = file;
-                    use tokio::io::AsyncSeekExt;
-                    file.seek(std::io::SeekFrom::Start(start))
-                        .await
-                        .map_err(ProxyError::Io)?;
-                    let mut buf = vec![0u8; length as usize];
-                    file.read_exact(&mut buf).await.map_err(ProxyError::Io)?;
+                // Read the specific range.
+                let mut file = file;
+                use tokio::io::AsyncSeekExt;
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(ProxyError::Io)?;
+                let mut buf = vec![0u8; length as usize];
+                file.read_exact(&mut buf).await.map_err(ProxyError::Io)?;
 
-                    let content_range = format!("bytes {start}-{end}/{file_size}");
+                let content_range = format!("bytes {start}-{end}/{file_size}");
 
-                    let mut builder = Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(CONTENT_TYPE, content_type)
-                        .header(CONTENT_LENGTH, length)
-                        .header(CONTENT_RANGE, content_range)
-                        .header(ACCEPT_RANGES, "bytes")
-                        .header(ETAG, &etag);
+                let mut builder = Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_LENGTH, length)
+                    .header(CONTENT_RANGE, content_range)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header(ETAG, &etag);
 
-                    if let Some(ref lm) = last_modified_str {
-                        builder = builder.header(LAST_MODIFIED, lm.as_str());
-                    }
-
-                    return Ok(builder.body(full_body(Bytes::from(buf))).unwrap());
+                if let Some(ref lm) = last_modified_str {
+                    builder = builder.header(LAST_MODIFIED, lm.as_str());
                 }
-                // Invalid range — return 416.
-                return Ok(Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(CONTENT_RANGE, format!("bytes */{file_size}"))
-                    .body(empty_body())
-                    .unwrap());
+
+                return Ok(builder.body(full_body(Bytes::from(buf))).unwrap());
             }
+            // Invalid range — return 416.
+            return Ok(Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(CONTENT_RANGE, format!("bytes */{file_size}"))
+                .body(empty_body())
+                .unwrap());
         }
 
         // Full file read.
@@ -483,7 +479,7 @@ async fn generate_directory_listing(
 
         let date_str = entry
             .modified
-            .map(|t| http_date::format_http_date(t))
+            .map(http_date::format_http_date)
             .unwrap_or_else(|| "-".to_string());
 
         let class = if entry.is_dir { " class=\"dir\"" } else { "" };

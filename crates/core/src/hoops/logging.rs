@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 /// Format a log line by replacing known placeholders with their values.
+#[allow(clippy::too_many_arguments)]
 fn format_log_line(
     format: &str,
     client_addr: &std::net::SocketAddr,
@@ -38,7 +39,9 @@ fn format_log_line(
         // Days since epoch → year/month/day.
         let mut year = 1970u32;
         loop {
-            let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            let days_in_year = if year.is_multiple_of(4)
+                && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+            {
                 366
             } else {
                 365
@@ -49,7 +52,8 @@ fn format_log_line(
             s -= days_in_year;
             year += 1;
         }
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
         let days_in_month: [u64; 12] = [
             31,
             if leap { 29u64 } else { 28u64 },
@@ -171,10 +175,10 @@ impl RotatingLogWriter {
     /// Write bytes to the log, rotating if necessary.
     pub async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         // Check whether rotation is needed before writing.
-        if let Some(max) = self.max_size {
-            if self.current_size + data.len() as u64 > max {
-                self.rotate().await?;
-            }
+        if let Some(max) = self.max_size
+            && self.current_size + data.len() as u64 > max
+        {
+            self.rotate().await?;
         }
 
         self.writer.write_all(data).await?;
@@ -243,7 +247,7 @@ impl RotatingLogWriter {
 }
 
 /// Compute the rotated path for index `n`, e.g. `/var/log/access.log.1`.
-fn rotated_path(base: &PathBuf, n: usize) -> PathBuf {
+fn rotated_path(base: &Path, n: usize) -> PathBuf {
     let mut s = base.as_os_str().to_owned();
     s.push(format!(".{}", n));
     PathBuf::from(s)
@@ -261,7 +265,7 @@ fn rotated_path(base: &PathBuf, n: usize) -> PathBuf {
 /// separate file.
 pub struct LoggingHoop {
     log_file: Option<Arc<Mutex<RotatingLogWriter>>>,
-    error_log_file: Option<Arc<Mutex<RotatingLogWriter>>>,
+    _error_log_file: Option<Arc<Mutex<RotatingLogWriter>>>,
     format: Option<String>,
 }
 
@@ -269,7 +273,7 @@ impl LoggingHoop {
     pub fn new() -> Self {
         Self {
             log_file: None,
-            error_log_file: None,
+            _error_log_file: None,
             format: None,
         }
     }
@@ -280,7 +284,7 @@ impl LoggingHoop {
     ) -> Self {
         Self {
             log_file: Some(writer),
-            error_log_file: None,
+            _error_log_file: None,
             format,
         }
     }
@@ -293,7 +297,7 @@ impl LoggingHoop {
     ) -> Self {
         Self {
             log_file: Some(access_writer),
-            error_log_file: Some(error_writer),
+            _error_log_file: Some(error_writer),
             format,
         }
     }
@@ -303,7 +307,7 @@ impl LoggingHoop {
         let writer = RotatingLogWriter::open(path, None, None).await?;
         Ok(Self {
             log_file: Some(Arc::new(Mutex::new(writer))),
-            error_log_file: None,
+            _error_log_file: None,
             format,
         })
     }

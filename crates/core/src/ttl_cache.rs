@@ -48,15 +48,14 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
             inner.entries.retain(|_, e| e.expires_at > now);
         }
         // If still at capacity after eviction, drop the oldest entry.
-        if inner.entries.len() >= self.max_entries {
-            if let Some(oldest_key) = inner
+        if inner.entries.len() >= self.max_entries
+            && let Some(oldest_key) = inner
                 .entries
                 .iter()
                 .min_by_key(|(_, e)| e.expires_at)
                 .map(|(k, _)| k.clone())
-            {
-                inner.entries.remove(&oldest_key);
-            }
+        {
+            inner.entries.remove(&oldest_key);
         }
         inner.entries.insert(
             key,

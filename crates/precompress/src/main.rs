@@ -41,10 +41,10 @@ fn process_dir(dir: &Path, encodings: &[&str], extensions: &[&str]) {
         let path = entry.path();
         if path.is_dir() {
             process_dir(&path, encodings, extensions);
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if extensions.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
-                compress_file(&path, encodings);
-            }
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && extensions.iter().any(|&e| e.eq_ignore_ascii_case(ext))
+        {
+            compress_file(&path, encodings);
         }
     }
 }

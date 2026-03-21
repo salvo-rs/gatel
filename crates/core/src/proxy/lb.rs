@@ -41,6 +41,12 @@ pub struct RoundRobinLb {
     counter: AtomicUsize,
 }
 
+impl Default for RoundRobinLb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RoundRobinLb {
     pub fn new() -> Self {
         Self {
@@ -72,6 +78,12 @@ impl LoadBalancer for RoundRobinLb {
 
 /// Random selection across healthy backends.
 pub struct RandomLb;
+
+impl Default for RandomLb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RandomLb {
     pub fn new() -> Self {
@@ -166,6 +178,12 @@ impl LoadBalancer for WeightedRoundRobinLb {
 /// Select a backend by hashing the client IP address for session affinity.
 pub struct IpHashLb;
 
+impl Default for IpHashLb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IpHashLb {
     pub fn new() -> Self {
         Self
@@ -189,6 +207,12 @@ impl LoadBalancer for IpHashLb {
 
 /// Select the healthy backend with the fewest active connections.
 pub struct LeastConnLb;
+
+impl Default for LeastConnLb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LeastConnLb {
     pub fn new() -> Self {
@@ -223,6 +247,12 @@ impl LoadBalancer for LeastConnLb {
 /// Select a backend by hashing the request URI path.  Requests to the same
 /// path will consistently hit the same backend (useful for caching).
 pub struct UriHashLb;
+
+impl Default for UriHashLb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl UriHashLb {
     pub fn new() -> Self {
@@ -309,6 +339,12 @@ impl LoadBalancer for CookieHashLb {
 /// Always select the first healthy backend.  Simple active/standby failover.
 pub struct FirstLb;
 
+impl Default for FirstLb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FirstLb {
     pub fn new() -> Self {
         Self
@@ -335,6 +371,12 @@ impl LoadBalancer for FirstLb {
 /// - 1 healthy backend  → use it directly
 /// - 2+ healthy backends → pick 2 at random, choose the one with fewer connections
 pub struct TwoRandomChoicesLb;
+
+impl Default for TwoRandomChoicesLb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TwoRandomChoicesLb {
     pub fn new() -> Self {
@@ -386,10 +428,10 @@ fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         };
         for pair in cookie_str.split(';') {
             let pair = pair.trim();
-            if let Some((k, v)) = pair.split_once('=') {
-                if k.trim() == name {
-                    return Some(v.trim().to_string());
-                }
+            if let Some((k, v)) = pair.split_once('=')
+                && k.trim() == name
+            {
+                return Some(v.trim().to_string());
             }
         }
     }

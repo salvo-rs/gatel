@@ -75,13 +75,13 @@ async fn handle_admin_request(
 ) -> Result<Response<Body>, std::convert::Infallible> {
     // Enforce bearer token auth if configured.
     let config = state.config.load();
-    if let Some(ref token) = config.global.admin_auth_token {
-        if !check_bearer_auth(&req, token) {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                r#"{"error":"unauthorized"}"#,
-            ));
-        }
+    if let Some(ref token) = config.global.admin_auth_token
+        && !check_bearer_auth(&req, token)
+    {
+        return Ok(json_response(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"unauthorized"}"#,
+        ));
     }
 
     let path = req.uri().path().to_string();
@@ -318,7 +318,7 @@ fn check_bearer_auth(req: &Request<Incoming>, expected_token: &str) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|v| {
             v.starts_with("Bearer ")
-                && crate::crypto::constant_time_eq(v[7..].as_bytes(), expected_token.as_bytes())
+                && crate::crypto::constant_time_eq(&v.as_bytes()[7..], expected_token.as_bytes())
         })
         .unwrap_or(false)
 }

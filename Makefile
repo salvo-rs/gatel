@@ -17,10 +17,14 @@ else
   BIN_DIR = target/release
 endif
 
-.PHONY: all build build-dev run test lint fmt check install uninstall clean \
+.PHONY: all setup build build-dev run test lint fmt check install uninstall clean \
         docker docker-alpine package package-deb package-rpm help
 
 all: build
+
+setup:
+	git config core.hooksPath .githooks
+	@echo "Git hooks configured."
 
 help:
 	@echo "Gatel build targets:"

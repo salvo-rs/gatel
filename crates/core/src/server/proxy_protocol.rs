@@ -87,6 +87,7 @@ pub async fn parse_proxy_protocol(
 }
 
 /// Parse a PROXY protocol v1 (text) header.
+#[allow(clippy::ptr_arg)]
 async fn parse_v1(
     buf: &mut Vec<u8>,
     mut total_read: usize,
