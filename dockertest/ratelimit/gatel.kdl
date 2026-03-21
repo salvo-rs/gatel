@@ -1,0 +1,10 @@
+global {
+    http ":8080"
+}
+
+site "*" {
+    route "/*" {
+        rate-limit window="1s" max=3
+        respond "ok" status=200
+    }
+}

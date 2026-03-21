@@ -1,0 +1,12 @@
+/target
+/dist
+Cargo.lock
+
+.claude
+.tmp*
+_*.md
+
+# Packaging artifacts
+*.deb
+*.rpm
+gatel_*_*/

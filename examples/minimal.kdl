@@ -1,0 +1,11 @@
+// Minimal reverse proxy — forward all traffic to a single backend.
+
+global {
+    http ":8080"
+}
+
+site "localhost" {
+    route "/*" {
+        proxy "127.0.0.1:3000"
+    }
+}

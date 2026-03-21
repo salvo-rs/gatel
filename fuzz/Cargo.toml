@@ -1,0 +1,25 @@
+[package]
+name = "gatel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gatel-core = { path = "../crates/core" }
+
+[[bin]]
+name = "fuzz_config_parser"
+path = "fuzz_targets/fuzz_config_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_duration_parser"
+path = "fuzz_targets/fuzz_duration_parser.rs"
+doc = false
+
+[workspace]
+members = ["."]

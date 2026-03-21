@@ -1,0 +1,14 @@
+// Serve a static website with compression and directory browsing.
+
+global {
+    http ":8080"
+    log level="info" format="pretty"
+}
+
+site "localhost" {
+    route "/*" {
+        encode "gzip" "zstd" "brotli"
+        root "/var/www/html"
+        file-server browse=#true
+    }
+}

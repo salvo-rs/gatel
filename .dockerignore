@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+.claude/
+*.md
+!README.md
+LICENSE
+docs/
+.tmp*
+_*.md

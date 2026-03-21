@@ -1,0 +1,33 @@
+// Mutual TLS (mTLS) — require client certificates.
+//
+// Use case: internal service-to-service communication where both sides
+// must prove identity. Clients without a valid certificate signed by
+// the configured CA are rejected at the TLS handshake.
+
+global {
+    https ":443"
+    http ":80"
+}
+
+tls {
+    acme {
+        email "ops@example.com"
+        ca "letsencrypt"
+        challenge "http-01"
+    }
+
+    // Require client certificates signed by this CA.
+    client-auth required=#true {
+        ca-cert "/etc/gatel/ca/client-ca.pem"
+    }
+}
+
+site "internal-api.example.com" {
+    route "/*" {
+        proxy {
+            upstream "10.0.0.10:8080"
+            upstream "10.0.0.11:8080"
+            lb "least_conn"
+        }
+    }
+}

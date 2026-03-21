@@ -1,0 +1,12 @@
+Package: gatel
+Version: {{VERSION}}
+Architecture: {{ARCH}}
+Maintainer: Salvo Contributors <salvo@example.com>
+Description: High-performance reverse proxy and web server
+ Gatel is a modern reverse proxy and web server built with Rust,
+ inspired by Caddy. It uses KDL as its configuration language and
+ supports automatic HTTPS, load balancing, compression, rate
+ limiting, and more.
+Section: web
+Priority: optional
+Homepage: https://github.com/salvo-rs/gatel

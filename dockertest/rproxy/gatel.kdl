@@ -1,0 +1,14 @@
+global {
+    http ":8080"
+}
+
+site "*" {
+    route "/api/*" {
+        proxy {
+            upstream "backend:80"
+        }
+    }
+    route "/*" {
+        respond "gatel-direct" status=200
+    }
+}

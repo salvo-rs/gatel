@@ -1,0 +1,37 @@
+// HTTPS with automatic certificates from Let's Encrypt.
+//
+// Gatel will:
+//   1. Listen on :80 for ACME HTTP-01 challenges (and redirect other traffic to HTTPS).
+//   2. Listen on :443 for HTTPS with auto-provisioned certificates.
+//   3. Renew certificates automatically before expiration.
+
+global {
+    admin ":2019"
+    http ":80"
+    https ":443"
+    log level="info"
+}
+
+tls {
+    acme {
+        email "admin@example.com"
+        ca "letsencrypt"
+        challenge "http-01"
+    }
+}
+
+site "app.example.com" {
+    route "/*" {
+        proxy "127.0.0.1:3000"
+    }
+}
+
+site "api.example.com" {
+    route "/*" {
+        proxy {
+            upstream "127.0.0.1:4000"
+            upstream "127.0.0.1:4001"
+            lb "round_robin"
+        }
+    }
+}

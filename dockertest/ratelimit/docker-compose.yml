@@ -1,0 +1,17 @@
+services:
+  gatel:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.alpine
+    volumes:
+      - ./gatel.kdl:/etc/gatel/gatel.kdl:ro
+    expose:
+      - "8080"
+
+  test-runner:
+    image: curlimages/curl:latest
+    depends_on:
+      - gatel
+    entrypoint: ["/bin/sh", "/tests/test.sh"]
+    volumes:
+      - ./test.sh:/tests/test.sh:ro

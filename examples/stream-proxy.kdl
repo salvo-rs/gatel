@@ -1,0 +1,34 @@
+// L4 TCP stream proxy.
+//
+// Forward raw TCP connections to backend services. Useful for databases,
+// message brokers, or any non-HTTP protocol.
+
+global {
+    http ":8080"
+    log level="info"
+}
+
+// L4 stream proxies (non-HTTP)
+stream {
+    // MySQL
+    listen ":3306" {
+        proxy "mysql-primary.internal:3306"
+    }
+
+    // PostgreSQL
+    listen ":5432" {
+        proxy "pg-primary.internal:5432"
+    }
+
+    // Redis
+    listen ":6379" {
+        proxy "redis.internal:6379"
+    }
+}
+
+// HTTP admin interface for monitoring
+site "localhost" {
+    route "/*" {
+        respond "Gatel stream proxy is running." status=200
+    }
+}

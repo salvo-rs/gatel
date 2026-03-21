@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove user and directories on purge
+        if getent passwd gatel >/dev/null 2>&1; then
+            deluser --quiet gatel 2>/dev/null || true
+        fi
+        if getent group gatel >/dev/null 2>&1; then
+            delgroup --quiet gatel 2>/dev/null || true
+        fi
+        rm -rf /var/log/gatel /var/lib/gatel
+        ;;
+    remove)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+        fi
+        ;;
+esac
+
+exit 0

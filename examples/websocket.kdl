@@ -1,0 +1,33 @@
+// WebSocket reverse proxy.
+//
+// Gatel automatically detects WebSocket upgrade requests
+// (Connection: Upgrade + Upgrade: websocket) and establishes
+// a bidirectional tunnel to the backend. No special config needed.
+
+global {
+    http ":8080"
+    log level="debug"
+}
+
+site "localhost" {
+    // WebSocket endpoint — same proxy directive, upgrade is automatic
+    route "/ws/*" {
+        proxy "127.0.0.1:3001"
+    }
+
+    // REST API — standard HTTP proxy
+    route "/api/*" {
+        encode "gzip"
+        proxy {
+            upstream "127.0.0.1:3001"
+            upstream "127.0.0.1:3002"
+            lb "round_robin"
+        }
+    }
+
+    // SPA frontend
+    route "/*" {
+        root "/var/www/app/dist"
+        file-server
+    }
+}

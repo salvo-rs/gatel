@@ -1,0 +1,52 @@
+// Advanced request matching.
+//
+// Demonstrates: method matching, header matching, query parameter
+// matching, IP-based matching, protocol matching, expression matching,
+// and logical combinators (not).
+
+global {
+    http ":8080"
+    log level="debug"
+}
+
+site "api.example.com" {
+    // Only allow GET and HEAD on public endpoints
+    route "/public/*" {
+        match method="GET,HEAD"
+        encode "gzip"
+        cache max-entries=200 max-age="60s"
+        proxy "127.0.0.1:3000"
+    }
+
+    // Require a specific API key header
+    route "/partner/*" {
+        match header="X-API-Key" pattern="pk_*"
+        rate-limit window="1m" max=1000
+        proxy "127.0.0.1:3001"
+    }
+
+    // Debug endpoints only from internal IPs
+    route "/debug/*" {
+        match remote-ip="10.0.0.0/8"
+        proxy "127.0.0.1:3000"
+    }
+
+    // Conditional routing with expressions
+    route "/v2/*" {
+        match expression="{method} == POST && {path} ~ /v2/webhooks/*"
+        proxy "127.0.0.1:3002"
+    }
+
+    // Deny everything except GET (using not + method)
+    route "/readonly/*" {
+        match not {
+            match method="GET,HEAD,OPTIONS"
+        }
+        respond "Method Not Allowed" status=405
+    }
+
+    // Default
+    route "/*" {
+        proxy "127.0.0.1:3000"
+    }
+}

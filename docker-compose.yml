@@ -1,0 +1,23 @@
+services:
+  gatel:
+    build: .
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+      - "2019:2019"     # Admin API
+    volumes:
+      - ./gatel.kdl:/etc/gatel/gatel.kdl:ro
+      - gatel-data:/var/lib/gatel
+      # Mount TLS certs if using manual certificates:
+      # - ./certs:/etc/gatel/certs:ro
+    restart: unless-stopped
+
+  # Example upstream backend (for testing)
+  # backend:
+  #   image: nginx:alpine
+  #   expose:
+  #     - "80"
+
+volumes:
+  gatel-data:

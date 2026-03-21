@@ -1,0 +1,10 @@
+global {
+    http ":8080"
+}
+
+site "*" {
+    route "/*" {
+        root "/var/www/html"
+        file-server
+    }
+}

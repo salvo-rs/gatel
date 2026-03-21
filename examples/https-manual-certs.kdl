@@ -1,0 +1,35 @@
+// HTTPS with manually provided PEM certificates.
+//
+// Use this when you manage your own certificates (e.g. from a corporate CA,
+// self-signed for development, or purchased from a vendor).
+
+global {
+    http ":80"
+    https ":443"
+}
+
+// A minimal TLS block is required to enable the HTTPS listener,
+// even when all sites use manual certs.
+tls {}
+
+site "secure.example.com" {
+    tls {
+        cert "/etc/gatel/certs/secure.example.com.pem"
+        key "/etc/gatel/certs/secure.example.com-key.pem"
+    }
+
+    route "/*" {
+        proxy "127.0.0.1:8080"
+    }
+}
+
+site "internal.example.com" {
+    tls {
+        cert "/etc/gatel/certs/internal.pem"
+        key "/etc/gatel/certs/internal-key.pem"
+    }
+
+    route "/*" {
+        proxy "127.0.0.1:9090"
+    }
+}

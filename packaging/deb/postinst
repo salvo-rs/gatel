@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create gatel system user if it doesn't exist
+        if ! getent passwd gatel >/dev/null 2>&1; then
+            adduser --system --group --no-create-home \
+                --home /var/lib/gatel --shell /usr/sbin/nologin \
+                gatel
+        fi
+
+        # Ensure directories exist with correct ownership
+        mkdir -p /var/log/gatel /var/lib/gatel /etc/gatel
+        chown -R gatel:gatel /var/log/gatel /var/lib/gatel
+        chown root:gatel /etc/gatel
+        chmod 750 /etc/gatel
+
+        # Reload systemd and enable the service
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable gatel.service
+            echo "Gatel installed. Start with: sudo systemctl start gatel"
+        fi
+        ;;
+esac
+
+exit 0

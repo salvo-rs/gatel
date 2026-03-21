@@ -1,0 +1,39 @@
+// PHP application via FastCGI (PHP-FPM).
+//
+// Demonstrates: FastCGI transport, static assets served directly,
+// PHP files proxied to PHP-FPM, compression, caching.
+
+global {
+    http ":8080"
+    log level="info"
+}
+
+site "localhost" {
+    // PHP files — forward to PHP-FPM via FastCGI
+    route "*.php" {
+        fastcgi "127.0.0.1:9000" {
+            root "/var/www/html"
+            split ".php"
+            index "index.php"
+            env "APP_ENV" "production"
+            env "APP_DEBUG" "false"
+        }
+    }
+
+    // Static assets — serve directly with caching
+    route "/assets/*" {
+        encode "gzip" "brotli"
+        cache max-age="86400s"
+        root "/var/www/html"
+        file-server
+    }
+
+    // Default — try index.php
+    route "/*" {
+        fastcgi "127.0.0.1:9000" {
+            root "/var/www/html"
+            split ".php"
+            index "index.php"
+        }
+    }
+}

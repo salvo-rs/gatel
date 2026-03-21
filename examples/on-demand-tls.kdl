@@ -1,0 +1,34 @@
+// On-demand TLS — issue certificates at handshake time.
+//
+// Ideal for SaaS platforms where tenants bring their own domains.
+// When a TLS handshake arrives for an unknown domain, gatel asks
+// the permission endpoint whether to issue a certificate. If allowed,
+// certon obtains one from the ACME CA in the background.
+
+global {
+    http ":80"
+    https ":443"
+}
+
+tls {
+    acme {
+        email "platform@example.com"
+        ca "letsencrypt"
+        challenge "http-01"
+    }
+
+    on-demand {
+        // Ask this URL before issuing. Must return HTTP 200 to allow.
+        // Example: GET https://auth.internal/tls-check?domain=tenant.example.com
+        ask "https://auth.internal/tls-check"
+
+        // At most 5 new certificates per minute (prevent abuse).
+        rate-limit 5
+    }
+}
+
+site "*" {
+    route "/*" {
+        proxy "127.0.0.1:3000"
+    }
+}

@@ -1,0 +1,27 @@
+// Dynamic DNS-based upstream discovery.
+//
+// Instead of hard-coding backend IPs, resolve them from DNS.
+// Gatel periodically re-resolves the DNS name and updates
+// the backend pool. Ideal for Kubernetes, Consul, or any
+// service discovery system that publishes DNS records.
+
+global {
+    http ":80"
+    log level="info"
+}
+
+site "app.example.com" {
+    route "/*" {
+        proxy {
+            // Static fallback upstream (always available)
+            upstream "10.0.0.100:8080" weight=1
+
+            // Dynamic upstreams resolved from DNS every 30 seconds
+            dns-upstream name="app.svc.cluster.local" port=8080 refresh="30s"
+
+            lb "round_robin"
+            health-check uri="/ready" interval="5s" timeout="2s"
+            retries 1
+        }
+    }
+}

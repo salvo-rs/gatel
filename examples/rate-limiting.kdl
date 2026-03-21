@@ -1,0 +1,38 @@
+// Rate limiting and IP filtering.
+//
+// Demonstrates: per-IP token bucket rate limiting, IP allow/deny lists,
+// and basic authentication — layered together.
+
+global {
+    http ":8080"
+    log level="info"
+}
+
+site "api.example.com" {
+    // Public API: rate limited
+    route "/v1/*" {
+        rate-limit window="1m" max=60
+        proxy {
+            upstream "127.0.0.1:4000"
+            upstream "127.0.0.1:4001"
+            lb "round_robin"
+        }
+    }
+
+    // Admin panel: IP-restricted + authenticated
+    route "/admin/*" {
+        ip-filter {
+            allow "10.0.0.0/8"
+            allow "192.168.0.0/16"
+            deny "0.0.0.0/0"
+        }
+        basic-auth {
+            user "admin" hash="$2b$12$LJ3m8CpXCl7OGhRiY1MsXeUpEpG.gvMEkZvm.GHJM8fL8hAP/.Jiq"
+        }
+        proxy "127.0.0.1:5000"
+    }
+
+    route "/*" {
+        respond "Not Found" status=404
+    }
+}

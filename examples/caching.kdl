@@ -1,0 +1,40 @@
+// Response caching.
+//
+// Demonstrates: LRU response cache with size limits, default TTL,
+// and per-route cache configuration. Cached responses respect
+// Cache-Control, ETag, and Vary headers automatically.
+
+global {
+    http ":8080"
+    log level="info"
+}
+
+site "cdn.example.com" {
+    // API responses: short cache, small store
+    route "/api/*" {
+        cache max-entries=500 max-entry-size=1048576 max-age="30s"
+        encode "gzip"
+        proxy {
+            upstream "127.0.0.1:3000"
+            upstream "127.0.0.1:3001"
+            lb "uri_hash"
+        }
+    }
+
+    // Static assets: long cache
+    route "/assets/*" {
+        cache max-entries=5000 max-age="86400s"
+        encode "gzip" "brotli"
+        root "/var/www/cdn"
+        file-server
+    }
+
+    // HTML pages: moderate cache with template rendering
+    route "/*" {
+        cache max-entries=1000 max-age="300s"
+        encode "gzip"
+        templates
+        root "/var/www/site"
+        file-server
+    }
+}

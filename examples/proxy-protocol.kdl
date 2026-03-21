@@ -1,0 +1,32 @@
+// PROXY protocol support.
+//
+// When gatel sits behind a load balancer (e.g. AWS NLB, HAProxy)
+// that injects PROXY protocol headers, enable this to extract
+// the real client IP. Supports both v1 (text) and v2 (binary).
+
+global {
+    http ":80"
+    https ":443"
+    proxy-protocol #true
+    log level="info"
+}
+
+tls {
+    acme {
+        email "ops@example.com"
+        ca "letsencrypt"
+        challenge "http-01"
+    }
+}
+
+site "app.example.com" {
+    route "/*" {
+        proxy {
+            upstream "10.0.1.1:8080"
+            upstream "10.0.1.2:8080"
+            lb "ip_hash"
+            header-up "X-Real-IP" "{client_ip}"
+            header-up "X-Forwarded-For" "{client_ip}"
+        }
+    }
+}

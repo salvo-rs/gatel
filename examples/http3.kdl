@@ -1,0 +1,34 @@
+// HTTP/3 (QUIC) support.
+//
+// Requires the `http3` feature flag at compile time:
+//   cargo build --features http3
+//
+// When enabled, gatel listens for QUIC connections on the same
+// address as HTTPS and advertises HTTP/3 via the Alt-Svc header.
+// Browsers will automatically upgrade to HTTP/3 on subsequent requests.
+
+global {
+    http ":80"
+    https ":443"
+    http3 #true
+    log level="info"
+}
+
+tls {
+    acme {
+        email "admin@example.com"
+        ca "letsencrypt"
+        challenge "http-01"
+    }
+}
+
+site "fast.example.com" {
+    route "/*" {
+        encode "gzip" "brotli"
+        proxy {
+            upstream "127.0.0.1:3000"
+            upstream "127.0.0.1:3001"
+            lb "round_robin"
+        }
+    }
+}

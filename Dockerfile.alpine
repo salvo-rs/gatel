@@ -1,0 +1,46 @@
+# ---- Build stage ----
+FROM rust:1-alpine AS builder
+
+RUN apk add --no-cache musl-dev
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/gatel/Cargo.toml crates/gatel/Cargo.toml
+COPY crates/passwd/Cargo.toml crates/passwd/Cargo.toml
+COPY crates/precompress/Cargo.toml crates/precompress/Cargo.toml
+
+RUN mkdir -p crates/core/src crates/gatel/src crates/passwd/src crates/precompress/src \
+    && echo "fn main(){}" > crates/gatel/src/main.rs \
+    && echo "fn main(){}" > crates/passwd/src/main.rs \
+    && echo "fn main(){}" > crates/precompress/src/main.rs \
+    && touch crates/core/src/lib.rs
+
+RUN cargo build --release --workspace 2>/dev/null || true
+
+COPY . .
+RUN touch crates/core/src/lib.rs crates/gatel/src/main.rs \
+    crates/passwd/src/main.rs crates/precompress/src/main.rs
+
+RUN cargo build --release --workspace
+
+# ---- Runtime stage ----
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S gatel && adduser -S gatel -G gatel
+
+COPY --from=builder /build/target/release/gatel /usr/local/bin/gatel
+COPY --from=builder /build/target/release/gatel-passwd /usr/local/bin/gatel-passwd
+COPY --from=builder /build/target/release/gatel-precompress /usr/local/bin/gatel-precompress
+COPY gatel.kdl /etc/gatel/gatel.kdl
+
+RUN mkdir -p /var/log/gatel /var/lib/gatel \
+    && chown -R gatel:gatel /etc/gatel /var/log/gatel /var/lib/gatel
+
+USER gatel
+EXPOSE 80 443 443/udp 2019
+
+ENTRYPOINT ["gatel"]
+CMD ["run", "--config", "/etc/gatel/gatel.kdl"]

@@ -1,0 +1,30 @@
+global {
+    admin ":2019"
+    log level="info" format="pretty"
+    grace-period "30s"
+    http ":8080"
+}
+
+site "localhost" {
+    route "/api/*" {
+        rate-limit window="1m" max=100
+        proxy {
+            upstream "127.0.0.1:3001" weight=3
+            upstream "127.0.0.1:3002" weight=1
+            lb "weighted_round_robin"
+            health-check uri="/health" interval="10s" timeout="5s"
+            passive-health max-fails=5 fail-window="30s" cooldown="60s"
+            retries 2
+            header-up "X-Real-IP" "{client_ip}"
+            header-down "-Server"
+        }
+    }
+    route "/static/*" {
+        encode "gzip" "zstd"
+        root "/var/www/html"
+        file-server
+    }
+    route "/*" {
+        respond "Hello from gatel!" status=200
+    }
+}

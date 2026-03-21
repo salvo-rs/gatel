@@ -1,0 +1,70 @@
+// Multi-site virtual hosting.
+//
+// Demonstrates: multiple virtual hosts, each with its own routes,
+// middleware, and backend. A single gatel instance serves them all.
+
+global {
+    admin ":2019"
+    http ":80"
+    https ":443"
+    log level="info" format="json"
+    grace-period "30s"
+}
+
+tls {
+    acme {
+        email "webmaster@example.com"
+        ca "letsencrypt"
+        challenge "http-01"
+    }
+}
+
+// ---- Main website ----
+site "www.example.com" {
+    route "/api/*" {
+        rate-limit window="1m" max=100
+        encode "gzip"
+        proxy {
+            upstream "10.0.1.1:3000"
+            upstream "10.0.1.2:3000"
+            lb "round_robin"
+            health-check uri="/health" interval="10s"
+            retries 1
+        }
+    }
+
+    route "/*" {
+        encode "gzip" "brotli"
+        root "/var/www/main"
+        file-server
+    }
+}
+
+// ---- Blog ----
+site "blog.example.com" {
+    route "/*" {
+        encode "gzip"
+        cache max-entries=500 max-age="600s"
+        proxy "127.0.0.1:4000"
+    }
+}
+
+// ---- Documentation ----
+site "docs.example.com" {
+    route "/*" {
+        encode "gzip" "brotli"
+        templates
+        root "/var/www/docs"
+        file-server browse=#true
+    }
+}
+
+// ---- Internal dashboard ----
+site "dashboard.internal.example.com" {
+    route "/*" {
+        basic-auth {
+            user "ops" hash="$2b$12$LJ3m8CpXCl7OGhRiY1MsXeUpEpG.gvMEkZvm.GHJM8fL8hAP/.Jiq"
+        }
+        proxy "127.0.0.1:9090"
+    }
+}
