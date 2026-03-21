@@ -13,15 +13,34 @@ homepage = "https://github.com/salvo-rs/gatel"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "server-auto",
+    "client-legacy",
+    "http1",
+    "http2",
+] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "logging"] }
-certon = { path = "../certon" }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "ring",
+    "http1",
+    "http2",
+    "logging",
+] }
+certon = { version = "0.1.2" }
 kdl = "6"
 arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
@@ -32,15 +51,28 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd", "brotli", "deflate"] }
+async-compression = { version = "0.4", features = [
+    "tokio",
+    "gzip",
+    "zstd",
+    "brotli",
+    "deflate",
+] }
 pin-project-lite = "0.2"
 futures-util = "0.3"
 async-trait = "0.1"
 rustls-pemfile = "2"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "query",
+] }
 h3 = { version = "0.0.8", features = ["tracing"] }
 h3-quinn = { version = "0.0.10", features = ["tracing"] }
-quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+quinn = { version = "0.11", default-features = false, features = [
+    "rustls-ring",
+    "runtime-tokio",
+] }
 anyhow = "1"
 bcrypt = "0.19"
 flate2 = "1"
