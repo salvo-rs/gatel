@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-gatel-core = { path = "../core" }
+gatel-core = { workspace = true }
 mimalloc = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
