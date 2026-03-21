@@ -66,7 +66,7 @@ impl Write for UnixConnection {
     }
 }
 
-impl tower_service::Service<http::Uri> for UnixConnector {
+impl hyper::service::Service<http::Uri> for UnixConnector {
     type Response = UnixConnection;
     type Error = std::io::Error;
     type Future =
