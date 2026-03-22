@@ -535,6 +535,7 @@ impl Handler for RespondGoal {
         let status = salvo::http::StatusCode::from_u16(self.status)
             .unwrap_or(salvo::http::StatusCode::INTERNAL_SERVER_ERROR);
         res.status_code(status);
+        let _ = res.add_header("Content-Type", "text/plain; charset=utf-8", true);
         res.body(self.body.clone());
     }
 }
