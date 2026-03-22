@@ -556,12 +556,12 @@ async fn send_via_unix(
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
-        .map_err(|e| ProxyError::Hyper(e))?;
+        .map_err(ProxyError::Hyper)?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
     sender
         .send_request(request)
         .await
-        .map_err(|e| ProxyError::Hyper(e))
+        .map_err(ProxyError::Hyper)
 }
