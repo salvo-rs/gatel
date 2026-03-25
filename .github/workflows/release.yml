@@ -99,7 +99,7 @@ jobs:
           ./target/${{ matrix.target }}/release/gatel${{ matrix.os == 'windows-latest' && '.exe' || '' }} --help
         shell: bash
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gatel-${{ matrix.target }}
           path: gatel-${{ github.ref_name }}-${{ matrix.target }}.*
@@ -174,7 +174,7 @@ jobs:
       - name: Build DEB
         run: bash packaging/deb/build.sh dist/gatel ${{ github.ref_name }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gatel-deb
           path: "*.deb"
