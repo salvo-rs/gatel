@@ -88,7 +88,7 @@ mimalloc = { version = "0.1", default-features = false }
 argon2 = "0.5"
 scrypt = "0.11"
 pbkdf2 = { version = "0.12", features = ["simple"] }
-password-hash = "0.5"
+password-hash = "0.6"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
