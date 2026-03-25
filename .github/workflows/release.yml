@@ -130,7 +130,7 @@ jobs:
 
       # Distroless image
       - name: Build and push (distroless)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -144,7 +144,7 @@ jobs:
 
       # Alpine image
       - name: Build and push (alpine)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.alpine
