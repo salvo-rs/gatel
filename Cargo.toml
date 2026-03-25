@@ -10,6 +10,7 @@ license = "Apache-2.0"
 description = "A high-performance, KDL-configured reverse proxy and web server"
 repository = "https://github.com/salvo-rs/gatel"
 homepage = "https://github.com/salvo-rs/gatel"
+readme = "README.md"
 
 [workspace.dependencies]
 gatel-core = { version = "0.1.0", path = "crates/core" }
