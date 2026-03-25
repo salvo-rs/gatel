@@ -395,6 +395,7 @@ async fn generate_directory_listing(
     let mut html = String::new();
     html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
     html.push_str("<meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
     html.push_str(&format!(
         "<title>Index of {}</title>\n",
         encoding::html_escape(display_path)
