@@ -53,6 +53,33 @@ pub enum Commands {
     },
     /// Generate man page
     ManPage,
+    /// Manage the Windows service
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+/// Windows service management actions.
+#[cfg(windows)]
+#[derive(Subcommand)]
+pub enum ServiceAction {
+    /// Install gatel as a Windows service
+    Install {
+        /// Path to the KDL configuration file
+        #[arg(short, long, default_value = "gatel.kdl")]
+        config: String,
+    },
+    /// Uninstall the gatel Windows service
+    Uninstall,
+    /// Run in Windows service mode (called by Service Control Manager)
+    #[command(hide = true)]
+    Run {
+        /// Path to the KDL configuration file
+        #[arg(short, long, default_value = "gatel.kdl")]
+        config: String,
+    },
 }
 
 /// Print shell completions to stdout.

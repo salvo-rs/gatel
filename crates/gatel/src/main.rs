@@ -2,6 +2,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cli;
+#[cfg(windows)]
+mod win_service;
 
 use std::sync::Arc;
 
@@ -11,10 +13,27 @@ use gatel_core::server::{self, AppState};
 use gatel_core::tls::TlsManager;
 use tracing::{error, info, warn};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
+    // Windows service dispatcher must run before the tokio runtime is created.
+    #[cfg(windows)]
+    {
+        if let cli::Commands::Service {
+            action: cli::ServiceAction::Run { ref config },
+        } = cli.command
+        {
+            return win_service::dispatch(config.clone());
+        }
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Run {
             config: config_path,
@@ -184,6 +203,19 @@ site "*" {{
         }
         cli::Commands::ManPage => {
             cli::generate_man_page()?;
+        }
+        #[cfg(windows)]
+        cli::Commands::Service { action } => {
+            // Only Install and Uninstall reach here; Run is handled in main().
+            match action {
+                cli::ServiceAction::Install { config } => {
+                    win_service::install_service(&config)?;
+                }
+                cli::ServiceAction::Uninstall => {
+                    win_service::uninstall_service()?;
+                }
+                cli::ServiceAction::Run { .. } => unreachable!(),
+            }
         }
     }
 

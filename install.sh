@@ -250,7 +250,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=${PREFIX}/bin/gatel run --config /etc/gatel/gatel.kdl
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure

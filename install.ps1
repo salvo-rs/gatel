@@ -208,53 +208,15 @@ function Add-ToUserPath([string]$Dir) {
 }
 
 function Install-WindowsServiceHelper {
-    $scriptPath = Join-Path $Prefix "install-service.ps1"
-    if (Test-Path $scriptPath) { return }
-
     $binPath = Join-Path $Prefix "bin\gatel.exe"
     $configPath = Join-Path $Prefix "etc\gatel.kdl"
 
-    @"
-#Requires -RunAsAdministrator
-<#
-.SYNOPSIS
-    Register gatel as a Windows service using sc.exe.
-.DESCRIPTION
-    Run this script as Administrator to install gatel as a Windows service.
-    The service will start automatically on boot.
-#>
-
-`$serviceName = "gatel"
-`$displayName = "Gatel Reverse Proxy"
-`$binPath     = "`"$binPath`" run --config `"$configPath`""
-
-# Check if service exists
-`$existing = Get-Service -Name `$serviceName -ErrorAction SilentlyContinue
-if (`$existing) {
-    Write-Host "Service '`$serviceName' already exists. Stopping..."
-    Stop-Service `$serviceName -Force -ErrorAction SilentlyContinue
-    sc.exe delete `$serviceName | Out-Null
-    Start-Sleep -Seconds 2
-}
-
-Write-Host "Creating service '`$serviceName'..."
-sc.exe create `$serviceName binPath= `$binPath start= auto DisplayName= `$displayName
-sc.exe description `$serviceName "Gatel - High-performance reverse proxy and web server"
-sc.exe failure `$serviceName reset= 86400 actions= restart/5000/restart/10000/restart/30000
-
-Write-Host "Starting service..."
-Start-Service `$serviceName
-
-Write-Host ""
-Write-Host "Service installed and started successfully!" -ForegroundColor Green
-Write-Host "  Config: $configPath"
-Write-Host "  Manage: Get-Service gatel"
-Write-Host "  Logs:   Get-EventLog -LogName Application -Source gatel"
-"@ | Set-Content -Path $scriptPath -Encoding UTF8
-
-    Write-Info "Windows service helper saved to $scriptPath"
-    Write-Info "Run as Administrator to register as a service:"
-    Write-Info "  powershell -File `"$scriptPath`""
+    Write-Info "To register as a Windows service (run as Administrator):"
+    Write-Info "  & `"$binPath`" service install --config `"$configPath`""
+    Write-Info "  sc start gatel"
+    Write-Info ""
+    Write-Info "To uninstall the service:"
+    Write-Info "  & `"$binPath`" service uninstall"
 }
 
 # ---------------------------------------------------------------------------

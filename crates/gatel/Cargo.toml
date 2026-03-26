@@ -25,5 +25,8 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-service = { workspace = true }
+
 [features]
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]

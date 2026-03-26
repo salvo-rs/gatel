@@ -107,6 +107,7 @@ salvo = { version = "0.89", default-features = false, features = [
 ] }
 tempfile = "3"
 tower-service = "0.3"
+windows-service = "0.8"
 
 [profile.release]
 lto = true
