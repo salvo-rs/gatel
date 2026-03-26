@@ -16,6 +16,7 @@ pub mod proxy;
 pub mod router;
 pub mod runtime;
 pub mod salvo_service;
+pub mod sd_notify;
 pub mod server;
 pub mod storage;
 pub mod stream;

@@ -21,8 +21,15 @@ pub enum Commands {
         #[arg(short, long, default_value = "gatel.kdl")]
         config: String,
     },
-    /// Reload the running server's configuration (sends SIGHUP)
-    Reload,
+    /// Reload the running server's configuration via the admin API
+    Reload {
+        /// Path to the KDL configuration file (used to discover admin address)
+        #[arg(short, long, default_value = "gatel.kdl")]
+        config: String,
+        /// Admin API address (overrides address from config file)
+        #[arg(short, long)]
+        address: Option<String>,
+    },
     /// Quickly serve static files (development helper)
     Serve {
         /// Directory to serve

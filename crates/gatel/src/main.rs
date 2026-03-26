@@ -113,10 +113,37 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        cli::Commands::Reload => {
-            // Phase 5: send SIGHUP to the running process
-            eprintln!("reload not yet implemented");
-            std::process::exit(1);
+        cli::Commands::Reload {
+            config: config_path,
+            address,
+        } => {
+            // Determine admin address (and optional auth token) from flag or config.
+            let (admin_addr, auth_token) = if let Some(addr) = address {
+                (addr, None)
+            } else {
+                let config_str = std::fs::read_to_string(&config_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read config '{config_path}': {e}"))?;
+                let config = parse_config(&config_str)?;
+                match config.global.admin_addr {
+                    Some(addr) => (addr.to_string(), config.global.admin_auth_token.clone()),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "admin API not configured in '{config_path}'; \
+                             set 'admin' in the global block or use --address"
+                        ));
+                    }
+                }
+            };
+
+            match admin_reload_request(&admin_addr, auth_token.as_deref()) {
+                Ok(body) => {
+                    println!("Configuration reloaded: {body}");
+                }
+                Err(e) => {
+                    eprintln!("Reload failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         cli::Commands::Serve {
             root,
@@ -211,6 +238,7 @@ async fn signal_handler(state: Arc<AppState>, #[allow(unused)] config_path: Stri
 /// Initiate graceful shutdown: signal the accept loops to stop, then
 /// drain active connections.
 async fn initiate_shutdown(state: &AppState) {
+    gatel_core::sd_notify::sd_notify("STOPPING=1");
     state.shutdown.shutdown();
 
     // Stop TLS maintenance loop.
@@ -232,10 +260,13 @@ async fn initiate_shutdown(state: &AppState) {
 /// Hot-reload configuration from disk.
 #[allow(dead_code)]
 async fn reload_config(state: &AppState, config_path: &str) {
+    gatel_core::sd_notify::sd_notify("RELOADING=1");
+
     let config_str = match std::fs::read_to_string(config_path) {
         Ok(s) => s,
         Err(e) => {
             error!("failed to read config file for reload: {e}");
+            gatel_core::sd_notify::sd_notify("READY=1");
             return;
         }
     };
@@ -244,11 +275,56 @@ async fn reload_config(state: &AppState, config_path: &str) {
         Ok(c) => c,
         Err(e) => {
             error!("invalid configuration on reload: {e}");
+            gatel_core::sd_notify::sd_notify("READY=1");
             return;
         }
     };
 
     state.reload(new_config).await;
+    gatel_core::sd_notify::sd_notify("READY=1");
+}
+
+/// Send a POST /config/reload request to the admin API.
+fn admin_reload_request(addr: &str, auth_token: Option<&str>) -> Result<String, anyhow::Error> {
+    use std::io::{Read, Write};
+
+    let mut stream = std::net::TcpStream::connect(addr)
+        .map_err(|e| anyhow::anyhow!("failed to connect to admin API at {addr}: {e}"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+
+    let auth_header = match auth_token {
+        Some(token) => format!("Authorization: Bearer {token}\r\n"),
+        None => String::new(),
+    };
+
+    let request = format!(
+        "POST /config/reload HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         {auth_header}\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    // Extract status code and body from HTTP response.
+    let status_line = response.lines().next().unwrap_or("");
+    let status_ok = status_line.contains("200");
+
+    // Extract JSON body (after the blank line separating headers from body).
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.trim())
+        .unwrap_or(&response);
+
+    if status_ok {
+        Ok(body.to_string())
+    } else {
+        Err(anyhow::anyhow!("{body}"))
+    }
 }
 
 fn init_tracing(

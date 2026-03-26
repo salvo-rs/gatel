@@ -177,6 +177,9 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
             });
         }
 
+        // Notify systemd that the service is ready (Type=notify).
+        crate::sd_notify::sd_notify("READY=1");
+
         let http_state = Arc::clone(&state);
         let https_state = Arc::clone(&state);
 
@@ -193,6 +196,9 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
             }
         }
     } else {
+        // Notify systemd that the service is ready (Type=notify).
+        crate::sd_notify::sd_notify("READY=1");
+
         accept_http_loop(http_listener, state, proxy_protocol_enabled).await?;
     }
 
