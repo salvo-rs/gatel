@@ -111,6 +111,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          pattern: gatel-*-unknown-linux-*
+
+      - name: Prepare pre-built binaries
+        run: |
+          mkdir -p staging/linux/amd64 staging/linux/arm64
+          tar xzf artifacts/gatel-x86_64-unknown-linux-gnu/gatel-*.tar.gz -C staging/linux/amd64/
+          tar xzf artifacts/gatel-aarch64-unknown-linux-gnu/gatel-*.tar.gz -C staging/linux/arm64/
+          chmod +x staging/linux/amd64/* staging/linux/arm64/*
+
+          mkdir -p staging-musl/linux/amd64 staging-musl/linux/arm64
+          tar xzf artifacts/gatel-x86_64-unknown-linux-musl/gatel-*.tar.gz -C staging-musl/linux/amd64/
+          tar xzf artifacts/gatel-aarch64-unknown-linux-musl/gatel-*.tar.gz -C staging-musl/linux/arm64/
+          chmod +x staging-musl/linux/amd64/* staging-musl/linux/arm64/*
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -128,7 +145,7 @@ jobs:
         id: meta
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      # Distroless image
+      # Distroless image (uses pre-built glibc binaries)
       - name: Build and push (distroless)
         uses: docker/build-push-action@v7
         with:
@@ -136,13 +153,12 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: BUILDER=prebuilt
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-      # Alpine image
+      # Alpine image (uses pre-built musl binaries)
       - name: Build and push (alpine)
         uses: docker/build-push-action@v7
         with:
@@ -150,11 +166,10 @@ jobs:
           file: Dockerfile.alpine
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: BUILDER=prebuilt
           tags: |
             ghcr.io/${{ github.repository }}:alpine
             ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}-alpine
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   deb:
     name: Debian package

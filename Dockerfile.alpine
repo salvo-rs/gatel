@@ -1,5 +1,7 @@
+ARG BUILDER=source-build
+
 # ---- Build stage ----
-FROM rust:1-alpine AS builder
+FROM rust:1-alpine AS source-build
 
 RUN apk add --no-cache musl-dev
 
@@ -23,7 +25,17 @@ COPY . .
 RUN touch crates/core/src/lib.rs crates/gatel/src/main.rs \
     crates/passwd/src/main.rs crates/precompress/src/main.rs
 
-RUN cargo build --release --workspace
+RUN cargo build --release --workspace \
+    && mkdir /out \
+    && cp target/release/gatel target/release/gatel-passwd target/release/gatel-precompress /out/
+
+# ---- Pre-built binaries (CI release) ----
+FROM scratch AS prebuilt
+ARG TARGETPLATFORM
+COPY staging-musl/${TARGETPLATFORM}/ /out/
+
+# ---- Select builder ----
+FROM ${BUILDER} AS builder
 
 # ---- Runtime stage ----
 FROM alpine:3.21
@@ -31,9 +43,9 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S gatel && adduser -S gatel -G gatel
 
-COPY --from=builder /build/target/release/gatel /usr/local/bin/gatel
-COPY --from=builder /build/target/release/gatel-passwd /usr/local/bin/gatel-passwd
-COPY --from=builder /build/target/release/gatel-precompress /usr/local/bin/gatel-precompress
+COPY --from=builder /out/gatel /usr/local/bin/gatel
+COPY --from=builder /out/gatel-passwd /usr/local/bin/gatel-passwd
+COPY --from=builder /out/gatel-precompress /usr/local/bin/gatel-precompress
 COPY gatel.kdl /etc/gatel/gatel.kdl
 
 RUN mkdir -p /var/log/gatel /var/lib/gatel \

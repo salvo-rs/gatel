@@ -1,5 +1,7 @@
+ARG BUILDER=source-build
+
 # ---- Build stage ----
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm AS source-build
 
 WORKDIR /build
 
@@ -27,14 +29,24 @@ COPY . .
 RUN touch crates/core/src/lib.rs crates/gatel/src/main.rs \
     crates/passwd/src/main.rs crates/precompress/src/main.rs
 
-RUN cargo build --release --workspace
+RUN cargo build --release --workspace \
+    && mkdir /out \
+    && cp target/release/gatel target/release/gatel-passwd target/release/gatel-precompress /out/
+
+# ---- Pre-built binaries (CI release) ----
+FROM scratch AS prebuilt
+ARG TARGETPLATFORM
+COPY staging/${TARGETPLATFORM}/ /out/
+
+# ---- Select builder ----
+FROM ${BUILDER} AS builder
 
 # ---- Runtime stage (distroless) ----
 FROM gcr.io/distroless/cc-debian12:nonroot
 
-COPY --from=builder /build/target/release/gatel /usr/local/bin/gatel
-COPY --from=builder /build/target/release/gatel-passwd /usr/local/bin/gatel-passwd
-COPY --from=builder /build/target/release/gatel-precompress /usr/local/bin/gatel-precompress
+COPY --from=builder /out/gatel /usr/local/bin/gatel
+COPY --from=builder /out/gatel-passwd /usr/local/bin/gatel-passwd
+COPY --from=builder /out/gatel-precompress /usr/local/bin/gatel-precompress
 
 # Default config directory
 COPY gatel.kdl /etc/gatel/gatel.kdl
