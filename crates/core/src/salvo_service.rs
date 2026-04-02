@@ -276,7 +276,7 @@ fn build_route_router(route: &RouteConfig, modules: &ModuleRegistry) -> Router {
 
     // Set the terminal handler (goal).
     match &route.handler {
-        HandlerConfig::FileServer(cfg) if cfg.trailing_slash => {
+        HandlerConfig::FileServer(cfg) => {
             let mut handler = StaticDir::new(cfg.root.clone()).auto_list(cfg.browse);
             if !cfg.index.is_empty() {
                 handler = handler.defaults(cfg.index.clone());
@@ -310,15 +310,6 @@ fn build_route_router(route: &RouteConfig, modules: &ModuleRegistry) -> Router {
             cfg.addr.clone(),
             cfg.env.clone(),
         )),
-        HandlerConfig::FileServer(cfg) => {
-            // Non-trailing-slash file server uses our custom handler.
-            router.goal(crate::goals::file_server::FileServerGoal::new(
-                &cfg.root,
-                cfg.browse,
-                cfg.trailing_slash,
-                cfg.index.clone(),
-            ))
-        }
         HandlerConfig::Module { name, config } => {
             if let Some(loader) = modules.get(name) {
                 match loader.create_handler(config) {
