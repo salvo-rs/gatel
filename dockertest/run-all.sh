@@ -15,7 +15,7 @@ run_suite() {
     local suite="$1"
     local dir="${SCRIPT_DIR}/${suite}"
 
-    if [[ ! -f "${dir}/docker-compose.yml" ]]; then
+    if [[ ! -f "${dir}/compose.yml" ]]; then
         return
     fi
 

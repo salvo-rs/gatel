@@ -14,9 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Request ID middleware — reuses `salvo_extra::request_id` (ULID-based)
 - Force HTTPS middleware — reuses `salvo_extra::force_https`
 - Trailing slash middleware — reuses `salvo_extra::trailing_slash`
-- Docker support — Dockerfile (distroless), Dockerfile.alpine, docker-compose.yml
+- Docker support — Dockerfile (distroless), Dockerfile.alpine, compose.yml
 - Install scripts — `install.sh` (Linux/macOS), `install.ps1` (Windows)
-- Makefile with build, install, uninstall, test, lint, fmt, docker targets
+- Justfile with build, install, uninstall, test, lint, fmt, docker recipes
 - DEB and RPM packaging infrastructure
 - GitHub Actions release workflow with multi-platform builds
 - Community files — CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md

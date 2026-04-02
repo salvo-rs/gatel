@@ -1,0 +1,11 @@
+global {
+    http ":8080"
+    log level="error" format="json"
+}
+
+site "*" {
+    route "/*" {
+        root "/srv/www"
+        file-server
+    }
+}

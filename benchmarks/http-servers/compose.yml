@@ -1,0 +1,65 @@
+name: gatel-http-bench
+
+x-gatel-image: &gatel-image
+  image: gatel-http-bench-gatel:local
+  build:
+    context: ../..
+    dockerfile: benchmarks/http-servers/GatelBench.Dockerfile
+
+services:
+  bench:
+    image: gatel-http-bench-runner:local
+    build:
+      context: .
+      dockerfile: Runner.Dockerfile
+
+  backend:
+    image: nginx:1.27
+    volumes:
+      - ./configs/nginx-backend.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./fixtures/www:/srv/www:ro
+
+  gatel-static:
+    <<: *gatel-image
+    volumes:
+      - ./configs/gatel-static.kdl:/etc/gatel/gatel.kdl:ro
+      - ./fixtures/www:/srv/www:ro
+
+  nginx-static:
+    image: nginx:1.27
+    volumes:
+      - ./configs/nginx-static.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./fixtures/www:/srv/www:ro
+
+  caddy-static:
+    image: gatel-http-bench-caddy:local
+    build:
+      context: .
+      dockerfile: CaddyBench.Dockerfile
+    volumes:
+      - ./configs/Caddyfile.static:/etc/caddy/Caddyfile:ro
+      - ./fixtures/www:/srv/www:ro
+
+  gatel-proxy:
+    <<: *gatel-image
+    depends_on:
+      - backend
+    volumes:
+      - ./configs/gatel-proxy.kdl:/etc/gatel/gatel.kdl:ro
+
+  nginx-proxy:
+    image: nginx:1.27
+    depends_on:
+      - backend
+    volumes:
+      - ./configs/nginx-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+
+  caddy-proxy:
+    image: gatel-http-bench-caddy:local
+    build:
+      context: .
+      dockerfile: CaddyBench.Dockerfile
+    depends_on:
+      - backend
+    volumes:
+      - ./configs/Caddyfile.proxy:/etc/caddy/Caddyfile:ro

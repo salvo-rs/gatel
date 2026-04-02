@@ -1,0 +1,10 @@
+global {
+    http ":8080"
+    log level="error" format="json"
+}
+
+site "*" {
+    route "/*" {
+        proxy "backend:8080"
+    }
+}

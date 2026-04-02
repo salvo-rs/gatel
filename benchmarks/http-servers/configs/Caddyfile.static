@@ -1,0 +1,9 @@
+{
+    admin off
+    auto_https off
+}
+
+:8080 {
+    root * /srv/www
+    file_server
+}
