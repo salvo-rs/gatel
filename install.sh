@@ -7,7 +7,6 @@ set -euo pipefail
 #   or: ./install.sh [--prefix /usr/local] [--from-source]
 
 REPO="salvo-rs/gatel"
-BINARY_NAME="gatel"
 PREFIX="${PREFIX:-/usr/local}"
 FROM_SOURCE=false
 VERSION="${VERSION:-latest}"

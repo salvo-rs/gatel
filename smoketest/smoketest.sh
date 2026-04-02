@@ -8,7 +8,12 @@ GATEL="${1:-./target/release/gatel}"
 PORT=19876
 TMPDIR="$(mktemp -d)"
 PID=""
-cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null || true; rm -rf "$TMPDIR"; }
+cleanup() {
+    if [[ -n "$PID" ]]; then
+        kill "$PID" 2>/dev/null || true
+    fi
+    rm -rf "$TMPDIR"
+}
 trap cleanup EXIT
 
 info()  { printf '\033[1;34m[SMOKE]\033[0m %s\n' "$*"; }
@@ -58,7 +63,7 @@ info "Test 5: start, serve, stop"
 PID=$!
 
 # Wait for server to start
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     if curl -s -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null; then
         break
     fi
