@@ -48,7 +48,7 @@ kdl = "6"
 arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
