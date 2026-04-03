@@ -12,6 +12,8 @@ services:
     build:
       context: .
       dockerfile: Runner.Dockerfile
+    volumes:
+      - ./fixtures/range-64k.lua:/workspace/range-64k.lua:ro
 
   backend:
     image: nginx:1.27
@@ -40,12 +42,27 @@ services:
       - ./configs/Caddyfile.static:/etc/caddy/Caddyfile:ro
       - ./fixtures/www:/srv/www:ro
 
+  ferron-static:
+    image: ferronserver/ferron
+    command: ["/usr/sbin/ferron", "-c", "/etc/ferron.kdl"]
+    volumes:
+      - ./configs/ferron-static.kdl:/etc/ferron.kdl:ro
+      - ./fixtures/www:/srv/www:ro
+
   gatel-proxy:
     <<: *gatel-image
     depends_on:
       - backend
     volumes:
       - ./configs/gatel-proxy.kdl:/etc/gatel/gatel.kdl:ro
+
+  ferron-proxy:
+    image: ferronserver/ferron
+    command: ["/usr/sbin/ferron", "-c", "/etc/ferron.kdl"]
+    depends_on:
+      - backend
+    volumes:
+      - ./configs/ferron-proxy.kdl:/etc/ferron.kdl:ro
 
   nginx-proxy:
     image: nginx:1.27
