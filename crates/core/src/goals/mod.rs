@@ -1,4 +1,3 @@
-pub mod file_server;
 pub mod redirect;
 
 use http::Request;

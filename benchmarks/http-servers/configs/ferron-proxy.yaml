@@ -1,0 +1,12 @@
+global:
+  wwwroot: /var/www/ferron
+  disableNonEncryptedServer: false
+  port: 8080
+  enableHTTPS: false
+  enableCompression: false
+  enableDirectoryListing: false
+  customHeadersVHost:
+    - host: "*"
+      ips: "0.0.0.0/0"
+      isProxy: true
+      proxyTo: "http://backend:8080/"

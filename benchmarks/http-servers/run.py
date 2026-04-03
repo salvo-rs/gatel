@@ -19,18 +19,48 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 OUTPUT_ROOT = REPO_ROOT / "target" / "benchmarks" / "http-servers"
 SCENARIOS = {
-    "static": {
-        "description": "Direct static file serving of the same 4 KiB payload.",
+    "static-4k": {
+        "description": "Static file serving — 4 KiB text file.",
         "targets": {
             "gatel": "http://gatel-static:8080/payload-4k.txt",
+            "ferron": "http://ferron-static:8080/payload-4k.txt",
             "nginx": "http://nginx-static:8080/payload-4k.txt",
             "caddy": "http://caddy-static:8080/payload-4k.txt",
         },
     },
+    "static-1m": {
+        "description": "Static file serving — 1 MiB binary (chunked streaming).",
+        "targets": {
+            "gatel": "http://gatel-static:8080/payload-1m.bin",
+            "ferron": "http://ferron-static:8080/payload-1m.bin",
+            "nginx": "http://nginx-static:8080/payload-1m.bin",
+            "caddy": "http://caddy-static:8080/payload-1m.bin",
+        },
+    },
+    "static-10m": {
+        "description": "Static file serving — 10 MiB binary (sustained streaming throughput).",
+        "targets": {
+            "gatel": "http://gatel-static:8080/payload-10m.bin",
+            "ferron": "http://ferron-static:8080/payload-10m.bin",
+            "nginx": "http://nginx-static:8080/payload-10m.bin",
+            "caddy": "http://caddy-static:8080/payload-10m.bin",
+        },
+    },
+    "range-10m": {
+        "description": "Range request — first 64 KiB of a 10 MiB file (video seek simulation).",
+        "wrk_script": "/workspace/range-64k.lua",
+        "targets": {
+            "gatel": "http://gatel-static:8080/payload-10m.bin",
+            "ferron": "http://ferron-static:8080/payload-10m.bin",
+            "nginx": "http://nginx-static:8080/payload-10m.bin",
+            "caddy": "http://caddy-static:8080/payload-10m.bin",
+        },
+    },
     "proxy": {
-        "description": "Reverse proxying the same 4 KiB upstream response from backend:8080.",
+        "description": "Reverse proxying — 4 KiB upstream response.",
         "targets": {
             "gatel": "http://gatel-proxy:8080/payload-4k.txt",
+            "ferron": "http://ferron-proxy:8080/payload-4k.txt",
             "nginx": "http://nginx-proxy:8080/payload-4k.txt",
             "caddy": "http://caddy-proxy:8080/payload-4k.txt",
         },
@@ -40,9 +70,11 @@ COMPOSE_SERVICES = [
     "bench",
     "backend",
     "gatel-static",
+    "ferron-static",
     "nginx-static",
     "caddy-static",
     "gatel-proxy",
+    "ferron-proxy",
     "nginx-proxy",
     "caddy-proxy",
 ]
@@ -252,6 +284,16 @@ def collect_versions() -> dict[str, str]:
         "version",
         capture_output=True,
     ).stdout.strip()
+    ferron_result = compose(
+        "exec",
+        "-T",
+        "ferron-static",
+        "/usr/sbin/ferron",
+        "--version",
+        capture_output=True,
+        check=False,
+    )
+    versions["ferron"] = (ferron_result.stdout.strip() or ferron_result.stderr.strip() or "unknown")
     return versions
 
 
@@ -302,8 +344,14 @@ def wait_ready(url: str, timeout_seconds: int = 90) -> None:
     raise TimeoutError(f"timeout waiting for {url}")
 
 
-def benchmark_target(url: str, duration: int, threads: int, connections: int) -> str:
-    result = compose(
+def benchmark_target(
+    url: str,
+    duration: int,
+    threads: int,
+    connections: int,
+    wrk_script: str | None = None,
+) -> str:
+    cmd = [
         "exec",
         "-T",
         "bench",
@@ -317,11 +365,13 @@ def benchmark_target(url: str, duration: int, threads: int, connections: int) ->
         f"{duration}s",
         "--timeout",
         "5s",
-        "-H",
-        "Accept-Encoding: identity",
-        url,
-        capture_output=True,
-    )
+    ]
+    if wrk_script:
+        cmd.extend(["-s", wrk_script])
+    else:
+        cmd.extend(["-H", "Accept-Encoding: identity"])
+    cmd.append(url)
+    result = compose(*cmd, capture_output=True)
     return result.stdout
 
 
@@ -364,6 +414,7 @@ def generate_report(
         f"- Python: `{host_summary()['python']}`",
         "- Compared software:",
         f"  - `gatel`: `{versions['gatel']}`",
+        f"  - `ferron`: `{versions.get('ferron', 'unknown')}`",
         f"  - `nginx`: `{versions['nginx']}`",
         f"  - `caddy`: `{versions['caddy']}`",
         "",
@@ -463,12 +514,13 @@ def main() -> int:
         versions = collect_versions()
 
         for scenario, scenario_config in SCENARIOS.items():
+            wrk_script = scenario_config.get("wrk_script")
             for target, url in scenario_config["targets"].items():
                 print(f"warming up {scenario}/{target}", flush=True)
                 warmup_target(url, args.warmup)
                 for round_id in range(1, args.rounds + 1):
                     print(f"benchmarking {scenario}/{target} round {round_id}/{args.rounds}", flush=True)
-                    output = benchmark_target(url, args.duration, args.threads, args.connections)
+                    output = benchmark_target(url, args.duration, args.threads, args.connections, wrk_script)
                     raw_path = raw_dir / f"{scenario}-{target}-round{round_id}.txt"
                     raw_path.write_text(output, encoding="utf-8")
                     results.append(parse_wrk_output(scenario, target, round_id, output))

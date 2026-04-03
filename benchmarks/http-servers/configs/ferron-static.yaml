@@ -1,0 +1,7 @@
+global:
+  wwwroot: /srv/www
+  enableCompression: false
+  enableDirectoryListing: false
+  disableNonEncryptedServer: false
+  port: 8080
+  enableHTTPS: false

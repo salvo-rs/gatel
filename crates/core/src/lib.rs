@@ -7,8 +7,6 @@ pub mod events;
 mod glob;
 pub mod goals;
 pub mod hoops;
-mod http_date;
-mod mime_guess;
 pub mod observability;
 mod placeholder;
 pub mod plugin;
