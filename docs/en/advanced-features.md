@@ -567,7 +567,7 @@ global {
 
 When a reload is triggered (SIGHUP or Admin API):
 
-1. **Read**: The config file is re-read from disk.
+1. **Read**: The main config file is re-read from disk. Any `import "..."` directives it contains are re-resolved and re-loaded as well, so edits to imported files are picked up on every reload (see [Splitting Config Across Files](./configuration.md#splitting-config-across-files-import)).
 2. **Parse**: The KDL config is parsed and validated. If parsing fails, the reload is aborted.
 3. **TLS reload**: If TLS is configured, manual certificates are re-read and ACME domains are updated.
 4. **Router rebuild**: A new `Router` is compiled from the new config with fresh middleware chains.

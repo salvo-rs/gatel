@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config `import "path/to/other.kdl"` directive — split a single main config across multiple files. Paths are resolved relative to the importing file's directory, imports expand in place in source order, `global` blocks remain restricted to the main file, and circular / diamond imports are handled safely. Missing imported files emit a warning and are skipped (optional drop-ins are safe). Glob patterns (`*`, `?`, `[...]`) are supported — `import "conf.d/*.kdl"` loads every matching file in sorted order, and a glob matching zero files is a warning, not an error. Edits to imported files are picked up on hot-reload via SIGHUP, `gatel reload`, and the admin `POST /config/reload` endpoint.
 - CORS middleware — reuses `salvo-cors` with full KDL config support
 - Timeout middleware — reuses `salvo_extra::timeout`
 - Request ID middleware — reuses `salvo_extra::request_id` (ULID-based)

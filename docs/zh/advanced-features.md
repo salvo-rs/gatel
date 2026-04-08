@@ -852,7 +852,7 @@ curl -X POST http://localhost:2019/config/reload
 Gatel 使用 ArcSwap 实现无锁原子配置切换：
 
 1. 接收到重载信号。
-2. 读取并解析新的配置文件。
+2. 重新读取并解析主配置文件，并再次解析其中的 `import "..."` 指令，因此被 import 的文件的改动在每次重载时都会被加载（参见[使用 `import` 拆分配置](./configuration.md#使用-import-拆分配置)）。
 3. 验证新配置的正确性。
 4. 如果验证通过，通过 `ArcSwap::store()` 原子替换配置。
 5. 新请求使用新配置处理。

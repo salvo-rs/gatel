@@ -6,6 +6,7 @@ Gatel uses the [KDL](https://kdl.dev) document language for configuration. KDL i
 
 - [File Format](#file-format)
 - [Top-Level Blocks](#top-level-blocks)
+- [Splitting Config Across Files (`import`)](#splitting-config-across-files-import)
 - [global Block](#global-block)
   - [admin](#admin)
   - [log](#log)
@@ -43,7 +44,7 @@ node-name "positional-arg" named-prop="value" {
 }
 ```
 
-Gatel reads the config file as a KDL document. The top-level nodes must be one of: `global`, `tls`, `site`, or `stream`. Unknown top-level nodes produce a parse error.
+Gatel reads the config file as a KDL document. The top-level nodes must be one of: `global`, `tls`, `site`, `stream`, `snippet`, or `import`. Unknown top-level nodes produce a parse error.
 
 ---
 
@@ -51,10 +52,101 @@ Gatel reads the config file as a KDL document. The top-level nodes must be one o
 
 | Block | Required | Description |
 |---|---|---|
-| `global` | No | Server-wide settings (listen addresses, logging, admin, shutdown). |
+| `global` | No | Server-wide settings (listen addresses, logging, admin, shutdown). Only allowed in the main config file. |
 | `tls` | No | Global TLS and ACME settings. |
 | `site` | Yes (at least one) | Virtual host definition. Takes a hostname as argument. |
 | `stream` | No | L4 TCP stream proxy listeners. |
+| `snippet` | No | Reusable fragment that can be referenced from `site` / `route` blocks. |
+| `import` | No | Pull in another KDL file, expanded in place. See below. |
+
+---
+
+## Splitting Config Across Files (`import`)
+
+Gatel still loads a **single main config file** (by default `gatel.kdl`, or whatever you pass to `--config`), but that file can pull in additional files using the `import` directive:
+
+```kdl
+global {
+    http ":80"
+    https ":443"
+    admin ":2019"
+}
+
+// Relative to the directory of the file containing this `import`.
+import "conf.d/api.kdl"
+import "conf.d/static.kdl"
+import "shared/snippets.kdl"
+```
+
+### Rules
+
+- **`import` is only valid at the top level** of a KDL document (same level as `global` / `site` / etc.).
+- **Paths are resolved relative to the file that contains the `import`**, not to the process's working directory. This means imports compose naturally: `main.kdl` can import `conf.d/api.kdl`, and `conf.d/api.kdl` can itself import `snippets/auth.kdl` (resolved relative to `conf.d/`).
+- **Imports are expanded in place, in source order.** For example:
+  ```kdl
+  import "a.kdl"
+  site "main.example.com" { route "/*" { proxy "localhost:3000" } }
+  import "b.kdl"
+  ```
+  is processed as: all nodes from `a.kdl`, then the inline `site "main.example.com"`, then all nodes from `b.kdl`.
+- **`global` blocks are only permitted in the main config file.** An imported file that contains a `global` block is rejected with a clear error. This keeps server-wide settings (listen addresses, log level, admin API, grace period, …) in one obvious place.
+- **All other top-level blocks are allowed in imported files**: `tls`, `site`, `stream`, `snippet`, and nested `import` directives.
+- **`snippet` definitions are global.** A snippet defined in any imported file is visible to every `site` block in the combined configuration, regardless of import order.
+- **Circular and diamond imports are safe.** The loader tracks canonicalized file paths and silently skips a file that has already been visited, so `a → b → a` terminates and a file imported via two different paths is loaded at most once.
+- **Missing imported files emit a warning, not an error.** If an imported path does not exist, Gatel logs a `WARN` message and continues loading. This lets you reference optional drop-in files like `import "conf.d/local-overrides.kdl"` without breaking the config when the file is absent. Malformed KDL, permission errors, and other IO failures on a file that *does* exist are still hard errors. (Note: the *main* config file is still required — if it is missing, the server refuses to start unless `GATEL_*` environment variables are set for auto-config.)
+- **Glob patterns are supported.** An import path containing `*`, `?`, or `[...]` is treated as a glob pattern (via the [`glob`](https://crates.io/crates/glob) crate) and expanded relative to the importing file's directory. Matches are loaded in **sorted** order so the result is deterministic regardless of filesystem iteration order. A glob that matches zero files is a warning, not an error — this is the idiom for optional drop-in directories. Only regular files are loaded; directories matched by a pattern like `*` are skipped.
+
+  ```kdl
+  // Load every .kdl file under conf.d/, alphabetically.
+  import "conf.d/*.kdl"
+
+  // Combine prefixes (e.g. 01-api.kdl, 02-static.kdl, …) for ordering.
+  import "sites/[0-9][0-9]-*.kdl"
+  ```
+
+### Hot-reload
+
+Both `gatel reload` and the admin `POST /config/reload` endpoint re-run `parse_config_file` against the main config path, so edits to imported files are picked up on reload just like edits to the main file. The same applies to `SIGHUP` on Unix.
+
+### Validating
+
+`gatel validate --config /path/to/gatel.kdl` also resolves imports, so you can confirm a split configuration is well-formed before reloading the live server:
+
+```bash
+gatel validate --config /etc/gatel/gatel.kdl
+```
+
+### Example: `conf.d` layout
+
+```
+/etc/gatel/
+├── gatel.kdl          # main file — global lives here
+└── conf.d/
+    ├── api.kdl        # site "api.example.com" { … }
+    ├── static.kdl     # site "www.example.com" { … }
+    └── snippets.kdl   # snippet "common-headers" { … }
+```
+
+`gatel.kdl`:
+
+```kdl
+global {
+    http ":80"
+    https ":443"
+    admin ":2019"
+    log level="info" format="json"
+}
+
+tls {
+    acme {
+        email "admin@example.com"
+    }
+}
+
+import "conf.d/snippets.kdl"
+import "conf.d/api.kdl"
+import "conf.d/static.kdl"
+```
 
 ---
 

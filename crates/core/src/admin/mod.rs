@@ -131,24 +131,17 @@ fn handle_get_config(state: &AppState) -> Response<Body> {
 /// success to confirm the endpoint is wired up; the actual file re-read is
 /// done by the caller that owns the config path.
 async fn handle_config_reload(state: &AppState) -> Response<Body> {
-    // Read the config path from global state — the admin API can only signal
-    // that a reload was requested. The actual file-based reload requires the
-    // config path which is stored in AppState.config_path.
+    // Read the config path from global state — the admin API re-reads the
+    // file via `parse_config_file` so any `import` directives are resolved.
     if let Some(ref config_path) = state.config_path {
-        match std::fs::read_to_string(config_path) {
-            Ok(config_str) => match crate::config::parse_config(&config_str) {
-                Ok(new_config) => {
-                    state.reload(new_config).await;
-                    json_response(StatusCode::OK, r#"{"status":"reloaded"}"#)
-                }
-                Err(e) => json_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!(r#"{{"error":"config parse failed: {e}"}}"#),
-                ),
-            },
+        match crate::config::parse_config_file(config_path) {
+            Ok(new_config) => {
+                state.reload(new_config).await;
+                json_response(StatusCode::OK, r#"{"status":"reloaded"}"#)
+            }
             Err(e) => json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!(r#"{{"error":"failed to read config file: {e}"}}"#),
+                StatusCode::BAD_REQUEST,
+                &format!(r#"{{"error":"config reload failed: {e}"}}"#),
             ),
         }
     } else {

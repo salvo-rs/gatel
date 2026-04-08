@@ -8,6 +8,7 @@
 
 - [配置格式概述](#配置格式概述)
 - [顶层结构](#顶层结构)
+- [使用 `import` 拆分配置](#使用-import-拆分配置)
 - [global 指令](#global-指令)
 - [tls 指令](#tls-指令)
 - [site 指令](#site-指令)
@@ -54,10 +55,10 @@ gatel validate --config /path/to/gatel.kdl
 
 ## 顶层结构
 
-Gatel 配置由四个顶层指令组成：
+Gatel 配置由以下顶层指令组成：
 
 ```kdl
-// 全局设置
+// 全局设置（只允许出现在主配置文件中）
 global {
     // ...
 }
@@ -76,9 +77,106 @@ site "host:port" {
 stream {
     // ...
 }
+
+// 可复用片段，可以在 site / route 中引用
+snippet "name" {
+    // ...
+}
+
+// 将另一个 KDL 文件原地展开到此处
+import "path/to/other.kdl"
 ```
 
-所有顶层指令均为可选。一个最小的配置只需要一个 `site` 指令。
+除 `site` 外，所有顶层指令均为可选。一个最小的配置只需要一个 `site` 指令。出现未识别的顶层节点会产生解析错误。
+
+---
+
+## 使用 `import` 拆分配置
+
+Gatel 仍然**只加载一个主配置文件**（默认 `gatel.kdl`，或通过 `--config` 指定的路径），但你可以在这个主文件中使用 `import` 指令把配置拆分到多个文件：
+
+```kdl
+global {
+    http ":80"
+    https ":443"
+    admin ":2019"
+}
+
+// 路径相对于包含此 `import` 的文件所在目录。
+import "conf.d/api.kdl"
+import "conf.d/static.kdl"
+import "shared/snippets.kdl"
+```
+
+### 规则
+
+- **`import` 只能出现在 KDL 文档的顶层**（与 `global` / `site` 等同级）。
+- **路径相对于包含 `import` 的文件所在目录**，而不是进程的当前工作目录。这样 import 可以自然嵌套：`main.kdl` 可以 `import "conf.d/api.kdl"`，而 `conf.d/api.kdl` 中又可以 `import "snippets/auth.kdl"`（相对于 `conf.d/` 解析）。
+- **import 按源码出现的顺序原地展开**。例如：
+  ```kdl
+  import "a.kdl"
+  site "main.example.com" { route "/*" { proxy "localhost:3000" } }
+  import "b.kdl"
+  ```
+  处理顺序为：`a.kdl` 的所有节点 → 内联的 `site "main.example.com"` → `b.kdl` 的所有节点。
+- **`global` 块只允许出现在主配置文件中**。被 import 的文件中如果出现 `global` 块，会以清晰的错误信息被拒绝。这样可以保证服务器级别的设置（监听地址、日志级别、admin API、优雅关机超时……）始终集中在一个显眼的位置。
+- **其它所有顶层块都可以出现在被 import 的文件中**：`tls`、`site`、`stream`、`snippet`，以及嵌套的 `import`。
+- **`snippet` 定义是全局可见的**。任何被 import 的文件中定义的 snippet，都可以被合并后配置中的任意 `site` 引用，与 import 顺序无关。
+- **循环 import 和菱形 import 是安全的**。加载器通过规范化路径去重：已经加载过的文件会被静默跳过，所以 `a → b → a` 不会无限递归，同一个文件即使通过两条不同路径被 import，也最多加载一次。
+- **被 import 的文件不存在时只会发出警告，不会报错**。如果 import 的路径不存在，Gatel 会打印一条 `WARN` 日志然后继续加载。这样你就可以放心地 `import "conf.d/local-overrides.kdl"` 这种可选的 drop-in 文件，即使该文件尚未创建也不会影响配置加载。对于**存在但内容错误**的文件（KDL 语法错误、权限问题、IO 异常等），仍然会以硬错误的形式返回。（注意：**主配置文件本身**仍然是必须的 —— 如果主配置文件不存在，服务器会拒绝启动，除非设置了 `GATEL_*` 环境变量以启用自动配置。）
+- **支持 glob 通配符**。包含 `*`、`?` 或 `[...]` 字符类的 import 路径会被当作 glob 模式（基于 [`glob`](https://crates.io/crates/glob) crate 实现），并相对于**包含 import 的文件所在目录**展开。匹配到的文件会**按字母顺序排序**后依次加载，加载顺序与文件系统的目录遍历顺序无关，保证确定性。匹配到零个文件只会打印警告,不会报错 —— 这正是 optional drop-in 目录的惯用写法。模式命中的目录会被跳过,只加载普通文件。
+
+  ```kdl
+  // 按字母顺序加载 conf.d/ 下的所有 .kdl 文件
+  import "conf.d/*.kdl"
+
+  // 使用数字前缀控制加载顺序（01-api.kdl、02-static.kdl…）
+  import "sites/[0-9][0-9]-*.kdl"
+  ```
+
+### 热重载
+
+`gatel reload` 和 admin API 的 `POST /config/reload` 都会对主配置文件重新调用 `parse_config_file`，因此对被 import 文件的修改在热重载时也会被正确地加载。Unix 下的 `SIGHUP` 信号同理。
+
+### 校验
+
+`gatel validate --config /path/to/gatel.kdl` 同样会解析 import，所以你可以在重载运行中的服务器之前，先校验拆分后的配置是否正确：
+
+```bash
+gatel validate --config /etc/gatel/gatel.kdl
+```
+
+### 示例：`conf.d` 目录结构
+
+```
+/etc/gatel/
+├── gatel.kdl          # 主文件 —— global 只能写在这里
+└── conf.d/
+    ├── api.kdl        # site "api.example.com" { … }
+    ├── static.kdl     # site "www.example.com" { … }
+    └── snippets.kdl   # snippet "common-headers" { … }
+```
+
+`gatel.kdl`：
+
+```kdl
+global {
+    http ":80"
+    https ":443"
+    admin ":2019"
+    log level="info" format="json"
+}
+
+tls {
+    acme {
+        email "admin@example.com"
+    }
+}
+
+import "conf.d/snippets.kdl"
+import "conf.d/api.kdl"
+import "conf.d/static.kdl"
+```
 
 ---
 
