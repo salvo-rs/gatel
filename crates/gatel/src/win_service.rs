@@ -99,14 +99,12 @@ fn run_service() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?;
 
     rt.block_on(async {
-        use gatel_core::config::parse_config;
+        use gatel_core::config::parse_config_file;
         use gatel_core::server::{self, AppState};
         use gatel_core::tls::TlsManager;
         use tracing::{error, info};
 
-        let config_str = std::fs::read_to_string(config_path)
-            .map_err(|e| anyhow::anyhow!("failed to read config: {e}"))?;
-        let config = parse_config(&config_str)?;
+        let config = parse_config_file(config_path)?;
 
         super::init_tracing(
             &config.global.log_level,

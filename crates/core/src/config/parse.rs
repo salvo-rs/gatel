@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kdl::{KdlDocument, KdlNode};
@@ -23,6 +24,11 @@ pub enum ConfigError {
 }
 
 /// Parse a KDL configuration string into an `AppConfig`.
+///
+/// This function parses a single KDL string and does **not** resolve
+/// `import "..."` directives — imports require a filesystem context, so use
+/// [`parse_config_file`] when loading from disk.  If an `import` directive is
+/// encountered here it is reported as an error.
 pub fn parse_config(input: &str) -> Result<AppConfig, ConfigError> {
     let doc: KdlDocument = input.parse()?;
     let mut config = AppConfig::default();
@@ -41,6 +47,15 @@ pub fn parse_config(input: &str) -> Result<AppConfig, ConfigError> {
     for node in doc.nodes() {
         match node.name().to_string().as_str() {
             "snippet" => { /* already collected above */ }
+            "import" => {
+                return Err(ConfigError::InvalidValue {
+                    field: "import".into(),
+                    detail: "`import` directives can only be resolved when loading from a file; \
+                         use parse_config_file() instead of parse_config() for file-based \
+                         configs"
+                        .into(),
+                });
+            }
             "global" => config.global = parse_global(node)?,
             "tls" => config.tls = Some(parse_tls(node)?),
             "site" => {
@@ -53,6 +68,213 @@ pub fn parse_config(input: &str) -> Result<AppConfig, ConfigError> {
         }
     }
     Ok(config)
+}
+
+/// Parse a KDL configuration file from disk, resolving any `import "..."`
+/// directives relative to the importing file's directory.
+///
+/// # Import semantics
+///
+/// - `import "path/to/other.kdl"` may appear at the top level of the main config file or of any
+///   imported file.  Paths are resolved relative to the directory of the file in which the `import`
+///   appears.
+/// - Imports are expanded **in place**, in source order.  For example, ```text import "a.kdl" site
+///   "x" { ... } import "b.kdl" ``` is processed as: nodes from `a.kdl`, then the inline `site
+///   "x"`, then nodes from `b.kdl`.
+/// - Imported files may contain `tls`, `site`, `stream`, and `snippet` blocks and their own nested
+///   `import` directives — but **not** `global` blocks. Global configuration is only permitted in
+///   the main config file.
+/// - If the same file (by canonical path) is reached more than once, the subsequent visit is
+///   silently skipped.  This breaks circular imports and also de-duplicates diamond-shaped import
+///   graphs.
+/// - `snippet` definitions from any file (main or imported) are visible to every `site` block in
+///   the combined configuration.
+pub fn parse_config_file(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
+    let path = path.as_ref();
+
+    // Phase 1: recursively walk files, flattening their top-level nodes into a
+    // single in-order list alongside the path they came from and whether that
+    // path is the main config file.
+    let mut nodes: Vec<(PathBuf, KdlNode, bool)> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    flatten_config_file(path, true, &mut nodes, &mut visited)?;
+
+    // Phase 2: collect snippets from the flattened node list so every site can
+    // reference any snippet regardless of which file defined it.
+    let mut snippets: HashMap<String, KdlNode> = HashMap::new();
+    for (_, node, _) in &nodes {
+        if node.name().to_string() == "snippet"
+            && let Some(name) = first_string_arg(node)
+        {
+            snippets.insert(name, node.clone());
+        }
+    }
+
+    // Phase 3: build the AppConfig from the flattened nodes.
+    let mut config = AppConfig::default();
+    for (origin, node, is_main) in &nodes {
+        match node.name().to_string().as_str() {
+            "snippet" => { /* already collected in phase 2 */ }
+            "global" => {
+                if !is_main {
+                    return Err(ConfigError::InvalidValue {
+                        field: "global".into(),
+                        detail: format!(
+                            "'global' block is only allowed in the main config file, \
+                             not in imported file '{}'",
+                            origin.display()
+                        ),
+                    });
+                }
+                config.global = parse_global(node)?;
+            }
+            "tls" => config.tls = Some(parse_tls(node)?),
+            "site" => {
+                let host = first_string_arg(node)
+                    .ok_or_else(|| ConfigError::MissingField("site host".into()))?;
+                config.sites.push(parse_site(&host, node, &snippets)?);
+            }
+            "stream" => config.stream = Some(parse_stream(node)?),
+            other => return Err(ConfigError::UnknownDirective(other.into())),
+        }
+    }
+    Ok(config)
+}
+
+/// Recursively flatten a KDL config file and its imports into a single
+/// ordered list of `(origin_path, node, is_from_main_file)` tuples.
+///
+/// `visited` holds the set of canonicalized paths that have already been
+/// loaded; re-entering a visited path is a no-op, which both breaks cycles
+/// and de-duplicates diamond imports.
+///
+/// # Missing files
+///
+/// - If **the main config file** does not exist, this function returns a hard error — the server
+///   cannot start without its top-level config.
+/// - If **an imported file** does not exist, a warning is logged and the import is silently
+///   skipped.  This makes it safe to `import "conf.d/optional.kdl"` where the file may be added
+///   later without breaking config loading.
+/// - Other IO errors (permission denied, invalid UTF-8, etc.) and KDL parse errors on a file that
+///   *does* exist are always returned as hard errors — those indicate a real problem with the file
+///   that needs attention.
+fn flatten_config_file(
+    path: &Path,
+    is_main: bool,
+    out: &mut Vec<(PathBuf, KdlNode, bool)>,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<(), ConfigError> {
+    // Missing imports should be tolerated with a warning so that optional
+    // drop-in files can be referenced without breaking the main config.
+    // A missing main config file is still a hard error — callers are
+    // expected to check `path.exists()` before invoking this function for
+    // the top-level file (main.rs already does this and falls back to
+    // auto-config-from-env when appropriate).
+    if !is_main && !path.exists() {
+        tracing::warn!(
+            path = %path.display(),
+            "imported config file not found; skipping"
+        );
+        return Ok(());
+    }
+
+    // Canonicalize to detect the same file reached via different paths.
+    // On failure (e.g. the file does not yet exist) fall back to the raw path
+    // so the subsequent read surfaces a clear error for the main-file case.
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(path).map_err(|e| ConfigError::InvalidValue {
+        field: "config file".into(),
+        detail: format!("failed to read '{}': {e}", path.display()),
+    })?;
+    let doc: KdlDocument = content.parse()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+
+    for node in doc.nodes() {
+        if node.name().to_string() == "import" {
+            let sub = first_string_arg(node)
+                .ok_or_else(|| ConfigError::MissingField("import path".into()))?;
+            resolve_import(&sub, parent, out, visited)?;
+        } else {
+            out.push((path.to_path_buf(), node.clone(), is_main));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a single `import "pattern"` directive.
+///
+/// `pattern` may be either a plain path (relative or absolute) or a glob
+/// pattern containing `*`, `?`, or `[...]` character classes — see the
+/// [`glob`] crate for full pattern syntax.
+///
+/// - Plain paths are loaded via [`flatten_config_file`]; a missing file emits a warning and is
+///   skipped (see that function's docs).
+/// - Glob patterns are expanded to a sorted list of matching files relative to `base_dir` (the
+///   directory of the importing file).  Each match is loaded in order.  **A glob that matches zero
+///   files is not an error** — this mirrors nginx's `include /etc/nginx/conf.d/*.conf` idiom, where
+///   a missing drop-in directory should not break startup.
+fn resolve_import(
+    pattern: &str,
+    base_dir: &Path,
+    out: &mut Vec<(PathBuf, KdlNode, bool)>,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<(), ConfigError> {
+    // Cheap check: if the pattern contains no glob metacharacters, treat it
+    // as a plain path and keep the existing "missing file → warning" path.
+    if !is_glob_pattern(pattern) {
+        let sub_path = base_dir.join(pattern);
+        return flatten_config_file(&sub_path, false, out, visited);
+    }
+
+    // Glob pattern — expand relative to `base_dir`.  `glob::glob` only
+    // accepts string paths, so we join the pattern to `base_dir` as a string.
+    let joined = base_dir.join(pattern);
+    let joined_str = joined.to_string_lossy();
+
+    let matches = glob::glob(&joined_str).map_err(|e| ConfigError::InvalidValue {
+        field: "import glob".into(),
+        detail: format!("invalid glob pattern '{pattern}': {e}"),
+    })?;
+
+    // Collect, sort, then load — sorting gives deterministic load order
+    // independent of the filesystem's directory iteration order.
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in matches {
+        let entry_path = entry.map_err(|e| ConfigError::InvalidValue {
+            field: "import glob".into(),
+            detail: format!("glob error for '{pattern}': {e}"),
+        })?;
+        // Skip directories — glob patterns like `conf.d/*` may include dir
+        // entries; only `.kdl` (or any regular file) should be loaded.
+        if entry_path.is_file() {
+            paths.push(entry_path);
+        }
+    }
+    paths.sort();
+
+    if paths.is_empty() {
+        tracing::warn!(
+            pattern = %pattern,
+            base = %base_dir.display(),
+            "import glob matched no files; skipping"
+        );
+        return Ok(());
+    }
+
+    for p in paths {
+        flatten_config_file(&p, false, out, visited)?;
+    }
+    Ok(())
+}
+
+/// Returns `true` if the given string contains glob metacharacters recognised
+/// by the [`glob`] crate (`*`, `?`, or `[`).
+fn is_glob_pattern(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
 }
 
 /// Generate a minimal KDL config string from well-known environment variables.
@@ -2092,5 +2314,221 @@ site "app.example.com" {
             }
             _ => panic!("expected Header matcher"),
         }
+    }
+
+    #[test]
+    fn test_parse_config_file_with_imports() {
+        let dir = tempdir();
+        let main_path = dir.join("gatel.kdl");
+        let sub_dir = dir.join("conf.d");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let sub_path = sub_dir.join("site.kdl");
+
+        std::fs::write(
+            &main_path,
+            r#"
+global {
+    http ":8080"
+}
+import "conf.d/site.kdl"
+site "main.example.com" {
+    route "/*" {
+        proxy "localhost:3000"
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &sub_path,
+            r#"
+site "imported.example.com" {
+    route "/*" {
+        proxy "localhost:4000"
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let config = parse_config_file(&main_path).unwrap();
+        // Imports are expanded in-place, so the imported site appears first.
+        assert_eq!(config.sites.len(), 2);
+        assert_eq!(config.sites[0].host, "imported.example.com");
+        assert_eq!(config.sites[1].host, "main.example.com");
+        assert_eq!(config.global.http_addr.port(), 8080);
+    }
+
+    #[test]
+    fn test_parse_config_file_rejects_global_in_import() {
+        let dir = tempdir();
+        let main_path = dir.join("gatel.kdl");
+        let sub_path = dir.join("bad.kdl");
+
+        std::fs::write(&main_path, r#"import "bad.kdl""#).unwrap();
+        std::fs::write(
+            &sub_path,
+            r#"
+global {
+    http ":9090"
+}
+"#,
+        )
+        .unwrap();
+
+        let err = parse_config_file(&main_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'global'") && msg.contains("main config file"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_config_file_missing_import_is_warning() {
+        let dir = tempdir();
+        let main_path = dir.join("gatel.kdl");
+
+        // The main file references a file that does not exist.  This should
+        // succeed with a warning (logged via tracing) rather than failing.
+        std::fs::write(
+            &main_path,
+            r#"
+global {
+    http ":8080"
+}
+import "conf.d/does-not-exist.kdl"
+site "main.example.com" {
+    route "/*" {
+        proxy "localhost:3000"
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let config = parse_config_file(&main_path).unwrap();
+        // Only the inline site should be present; the missing import is skipped.
+        assert_eq!(config.sites.len(), 1);
+        assert_eq!(config.sites[0].host, "main.example.com");
+        assert_eq!(config.global.http_addr.port(), 8080);
+    }
+
+    #[test]
+    fn test_parse_config_file_missing_main_file_is_error() {
+        // A missing *main* file should still be reported as a hard error,
+        // because the server has no config to load from at all.
+        let dir = tempdir();
+        let missing = dir.join("does-not-exist.kdl");
+        assert!(parse_config_file(&missing).is_err());
+    }
+
+    #[test]
+    fn test_parse_config_file_invalid_import_is_error() {
+        // An import that *exists* but is malformed should still be a hard
+        // error — only the missing-file case degrades to a warning.
+        let dir = tempdir();
+        let main_path = dir.join("gatel.kdl");
+        let sub_path = dir.join("bad.kdl");
+
+        std::fs::write(&main_path, r#"import "bad.kdl""#).unwrap();
+        std::fs::write(&sub_path, r#"this is not valid kdl {{{"#).unwrap();
+
+        assert!(parse_config_file(&main_path).is_err());
+    }
+
+    #[test]
+    fn test_parse_config_file_glob_import() {
+        let dir = tempdir();
+        let main_path = dir.join("gatel.kdl");
+        let sub_dir = dir.join("conf.d");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        // Three site files, loaded in sorted order.
+        std::fs::write(
+            sub_dir.join("01-api.kdl"),
+            r#"site "api.example.com" { route "/*" { proxy "localhost:4001" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sub_dir.join("02-static.kdl"),
+            r#"site "static.example.com" { route "/*" { proxy "localhost:4002" } }"#,
+        )
+        .unwrap();
+        // A non-.kdl file should not be matched by the `*.kdl` glob.
+        std::fs::write(sub_dir.join("ignore.txt"), "not kdl").unwrap();
+
+        std::fs::write(
+            &main_path,
+            r#"
+global { http ":8080" }
+import "conf.d/*.kdl"
+site "main.example.com" { route "/*" { proxy "localhost:3000" } }
+"#,
+        )
+        .unwrap();
+
+        let config = parse_config_file(&main_path).unwrap();
+        // Glob matches appear before the inline site, sorted alphabetically.
+        assert_eq!(config.sites.len(), 3);
+        assert_eq!(config.sites[0].host, "api.example.com");
+        assert_eq!(config.sites[1].host, "static.example.com");
+        assert_eq!(config.sites[2].host, "main.example.com");
+    }
+
+    #[test]
+    fn test_parse_config_file_glob_zero_matches_is_warning() {
+        let dir = tempdir();
+        let main_path = dir.join("gatel.kdl");
+
+        // No conf.d directory exists at all — glob should match zero files
+        // and emit a warning, not a hard error.
+        std::fs::write(
+            &main_path,
+            r#"
+global { http ":8080" }
+import "conf.d/*.kdl"
+site "main.example.com" { route "/*" { proxy "localhost:3000" } }
+"#,
+        )
+        .unwrap();
+
+        let config = parse_config_file(&main_path).unwrap();
+        assert_eq!(config.sites.len(), 1);
+        assert_eq!(config.sites[0].host, "main.example.com");
+    }
+
+    #[test]
+    fn test_parse_config_file_circular_import_is_safe() {
+        let dir = tempdir();
+        let a = dir.join("a.kdl");
+        let b = dir.join("b.kdl");
+
+        // a imports b, b imports a — the second visit to `a` is a no-op so
+        // this must return a valid (empty) config rather than recursing
+        // forever.
+        std::fs::write(&a, r#"import "b.kdl""#).unwrap();
+        std::fs::write(&b, r#"import "a.kdl""#).unwrap();
+
+        let config = parse_config_file(&a).unwrap();
+        assert_eq!(config.sites.len(), 0);
+    }
+
+    /// Create a unique temporary directory for import tests.  Avoids pulling
+    /// in an extra dev-dependency for such a small need.
+    fn tempdir() -> PathBuf {
+        let base = std::env::temp_dir();
+        let unique = format!(
+            "gatel-parse-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = base.join(unique);
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }

@@ -8,7 +8,7 @@ mod win_service;
 use std::sync::Arc;
 
 use clap::Parser;
-use gatel_core::config::{auto_config_from_env, parse_config};
+use gatel_core::config::{auto_config_from_env, parse_config, parse_config_file};
 use gatel_core::server::{self, AppState};
 use gatel_core::tls::TlsManager;
 use tracing::{error, info, warn};
@@ -39,12 +39,14 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
             config: config_path,
         } => {
             // If the config file does not exist but environment variables are
-            // set, use the auto-generated config instead of failing.
-            let config_str = if !std::path::Path::new(&config_path).exists() {
+            // set, use the auto-generated config instead of failing.  Otherwise
+            // load the file via `parse_config_file` so `import "..."` directives
+            // are resolved relative to the main config's directory.
+            let config = if !std::path::Path::new(&config_path).exists() {
                 match auto_config_from_env() {
                     Some(auto_cfg) => {
                         info!("config file not found; using auto-config from environment");
-                        auto_cfg
+                        parse_config(&auto_cfg)?
                     }
                     None => {
                         return Err(anyhow::anyhow!(
@@ -55,10 +57,8 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                std::fs::read_to_string(&config_path)
-                    .map_err(|e| anyhow::anyhow!("failed to read config {config_path}: {e}"))?
+                parse_config_file(&config_path)?
             };
-            let config = parse_config(&config_str)?;
 
             // Initialize tracing
             init_tracing(
@@ -115,23 +115,19 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
         }
         cli::Commands::Validate {
             config: config_path,
-        } => {
-            let config_str = std::fs::read_to_string(&config_path)
-                .map_err(|e| anyhow::anyhow!("failed to read config {config_path}: {e}"))?;
-            match parse_config(&config_str) {
-                Ok(config) => {
-                    println!(
-                        "Configuration is valid ({} site(s), {} route(s))",
-                        config.sites.len(),
-                        config.sites.iter().map(|s| s.routes.len()).sum::<usize>()
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Configuration error: {e}");
-                    std::process::exit(1);
-                }
+        } => match parse_config_file(&config_path) {
+            Ok(config) => {
+                println!(
+                    "Configuration is valid ({} site(s), {} route(s))",
+                    config.sites.len(),
+                    config.sites.iter().map(|s| s.routes.len()).sum::<usize>()
+                );
             }
-        }
+            Err(e) => {
+                eprintln!("Configuration error: {e}");
+                std::process::exit(1);
+            }
+        },
         cli::Commands::Reload {
             config: config_path,
             address,
@@ -140,9 +136,7 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
             let (admin_addr, auth_token) = if let Some(addr) = address {
                 (addr, None)
             } else {
-                let config_str = std::fs::read_to_string(&config_path)
-                    .map_err(|e| anyhow::anyhow!("failed to read config '{config_path}': {e}"))?;
-                let config = parse_config(&config_str)?;
+                let config = parse_config_file(&config_path)?;
                 match config.global.admin_addr {
                     Some(addr) => (addr.to_string(), config.global.admin_auth_token.clone()),
                     None => {
@@ -294,19 +288,10 @@ async fn initiate_shutdown(state: &AppState) {
 async fn reload_config(state: &AppState, config_path: &str) {
     gatel_core::sd_notify::sd_notify("RELOADING=1");
 
-    let config_str = match std::fs::read_to_string(config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("failed to read config file for reload: {e}");
-            gatel_core::sd_notify::sd_notify("READY=1");
-            return;
-        }
-    };
-
-    let new_config = match parse_config(&config_str) {
+    let new_config = match parse_config_file(config_path) {
         Ok(c) => c,
         Err(e) => {
-            error!("invalid configuration on reload: {e}");
+            error!("failed to reload config from '{config_path}': {e}");
             gatel_core::sd_notify::sd_notify("READY=1");
             return;
         }

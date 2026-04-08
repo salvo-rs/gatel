@@ -45,6 +45,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
 ] }
 certon = { version = "0.1.2" }
 kdl = "6"
+glob = "0.3"
 arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
