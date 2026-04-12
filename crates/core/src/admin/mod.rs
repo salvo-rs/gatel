@@ -99,7 +99,7 @@ async fn handle_admin_request(
     if let Err(response) =
         authorize_admin_request(&req, &config.global, &method, segments.as_slice())
     {
-        return Ok(response);
+        return Ok(*response);
     }
 
     let result = match segments.as_slice() {
@@ -1025,22 +1025,24 @@ fn expected_revision(req: &Request<Incoming>) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+type AdminAuthorizationResult = Result<(), Box<Response<Body>>>;
+
 fn authorize_admin_request<B>(
     req: &Request<B>,
     global: &GlobalConfig,
     method: &http::Method,
     segments: &[&str],
-) -> Result<(), Response<Body>> {
+) -> AdminAuthorizationResult {
     let needs_write = admin_request_needs_write(method, segments);
 
     if let Some(token) = &global.admin_auth_token {
         if check_bearer_auth(req, token) {
             return Ok(());
         }
-        return Err(json_response(
+        return Err(Box::new(json_response(
             StatusCode::UNAUTHORIZED,
             r#"{"error":"unauthorized"}"#,
-        ));
+        )));
     }
 
     let read_allowed = global
@@ -1056,31 +1058,33 @@ fn authorize_admin_request<B>(
         if write_allowed {
             Ok(())
         } else if global.admin_write_token.is_some() || global.admin_read_token.is_some() {
-            Err(json_response(
+            Err(Box::new(json_response(
                 StatusCode::FORBIDDEN,
                 r#"{"error":"write access required"}"#,
-            ))
+            )))
         } else {
             Ok(())
         }
     } else if read_allowed || write_allowed {
         Ok(())
     } else if global.admin_read_token.is_some() || global.admin_write_token.is_some() {
-        Err(json_response(
+        Err(Box::new(json_response(
             StatusCode::UNAUTHORIZED,
             r#"{"error":"unauthorized"}"#,
-        ))
+        )))
     } else {
         Ok(())
     }
 }
 
 fn admin_request_needs_write(method: &http::Method, segments: &[&str]) -> bool {
-    match (method, segments) {
-        (&http::Method::POST, ["config", "test"]) => false,
-        (&http::Method::GET, _) | (&http::Method::HEAD, _) | (&http::Method::OPTIONS, _) => false,
-        _ => true,
-    }
+    !matches!(
+        (method, segments),
+        (&http::Method::POST, ["config", "test"])
+            | (&http::Method::GET, _)
+            | (&http::Method::HEAD, _)
+            | (&http::Method::OPTIONS, _)
+    )
 }
 
 /// Check for a valid `Authorization: Bearer <token>` header.
@@ -1093,6 +1097,214 @@ fn check_bearer_auth<B>(req: &Request<B>, expected_token: &str) -> bool {
                 && crate::crypto::constant_time_eq(&v.as_bytes()[7..], expected_token.as_bytes())
         })
         .unwrap_or(false)
+}
+
+fn render_runtime_target_metrics(
+    snapshot: &crate::runtime_services::RuntimeState,
+    backend_activity: &crate::proxy::activity::BackendActivityTracker,
+) -> String {
+    let mut counts: BTreeMap<(String, String, String, &'static str), u64> = BTreeMap::new();
+    let mut activity_rows: Vec<(String, String, String, String, &'static str, usize)> = Vec::new();
+    for service in snapshot.list_services() {
+        for route in service.routes {
+            for group in route.target_groups {
+                for target in group.targets {
+                    let state = match target.state {
+                        RuntimeTargetState::Active => "healthy",
+                        RuntimeTargetState::Warming => "warming",
+                        RuntimeTargetState::Draining => "draining",
+                        RuntimeTargetState::Failed => "failed",
+                    };
+                    *counts
+                        .entry((
+                            service.id.clone(),
+                            route.id.clone(),
+                            group.id.clone(),
+                            state,
+                        ))
+                        .or_default() += 1;
+                    activity_rows.push((
+                        service.id.clone(),
+                        route.id.clone(),
+                        group.id.clone(),
+                        target.id.clone(),
+                        state,
+                        backend_activity.active(&runtime_target_activity_key(
+                            &service.id,
+                            &route.id,
+                            &group.id,
+                            &target.id,
+                        )),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut output = String::new();
+    output.push_str(
+        "# HELP gatel_runtime_targets Number of runtime targets by service, route, group, and state.\n",
+    );
+    output.push_str("# TYPE gatel_runtime_targets gauge\n");
+    for ((service, route, group, state), count) in counts {
+        output.push_str(&format!(
+            "gatel_runtime_targets{{service=\"{service}\",route=\"{route}\",group=\"{group}\",state=\"{state}\"}} {count}\n"
+        ));
+    }
+    output.push_str(
+        "# HELP gatel_runtime_target_activity Active in-flight activity per runtime target.\n",
+    );
+    output.push_str("# TYPE gatel_runtime_target_activity gauge\n");
+    for (service, route, group, target, state, activity) in activity_rows {
+        output.push_str(&format!(
+            "gatel_runtime_target_activity{{service=\"{service}\",route=\"{route}\",group=\"{group}\",target=\"{target}\",state=\"{state}\"}} {activity}\n"
+        ));
+    }
+    output
+}
+
+fn render_runtime_state_status_metrics(status: &crate::server::RuntimeStateStatus) -> String {
+    let mut output = String::new();
+    output.push_str(
+        "# HELP gatel_runtime_state_corrupted Whether the persisted runtime state is currently marked corrupted.\n",
+    );
+    output.push_str("# TYPE gatel_runtime_state_corrupted gauge\n");
+    output.push_str(&format!(
+        "gatel_runtime_state_corrupted {}\n",
+        if status.corrupted { 1 } else { 0 }
+    ));
+    output.push_str(
+        "# HELP gatel_runtime_state_available Whether a runtime state snapshot is currently available.\n",
+    );
+    output.push_str("# TYPE gatel_runtime_state_available gauge\n");
+    output.push_str(&format!(
+        "gatel_runtime_state_available {}\n",
+        if status.available { 1 } else { 0 }
+    ));
+    output
+}
+
+fn runtime_actor<B>(req: &Request<B>) -> String {
+    req.headers()
+        .get("x-gatel-actor")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("admin_api")
+        .to_string()
+}
+
+fn log_runtime_mutation(actor: &str, action: &str, before: &RuntimeState, after: &RuntimeState) {
+    info!(
+        actor = actor,
+        action = action,
+        before_revision = before.revision,
+        after_revision = after.revision,
+        diff = %summarize_runtime_diff(before, after),
+        "runtime state mutated"
+    );
+}
+
+fn summarize_runtime_diff(before: &RuntimeState, after: &RuntimeState) -> String {
+    let before_services: BTreeSet<_> = before.services.keys().cloned().collect();
+    let after_services: BTreeSet<_> = after.services.keys().cloned().collect();
+    let services_added = after_services.difference(&before_services).count();
+    let services_removed = before_services.difference(&after_services).count();
+    let services_updated = before_services
+        .intersection(&after_services)
+        .filter(|service_id| before.services.get(*service_id) != after.services.get(*service_id))
+        .count();
+
+    let before_listeners = collect_listener_map(before);
+    let after_listeners = collect_listener_map(after);
+    let listeners_added = count_added(&before_listeners, &after_listeners);
+    let listeners_removed = count_added(&after_listeners, &before_listeners);
+    let listeners_updated = count_updated(&before_listeners, &after_listeners);
+
+    let before_routes = collect_route_map(before);
+    let after_routes = collect_route_map(after);
+    let routes_added = count_added(&before_routes, &after_routes);
+    let routes_removed = count_added(&after_routes, &before_routes);
+    let routes_updated = count_updated(&before_routes, &after_routes);
+
+    let before_targets = collect_target_map(before);
+    let after_targets = collect_target_map(after);
+    let targets_added = count_added(&before_targets, &after_targets);
+    let targets_removed = count_added(&after_targets, &before_targets);
+    let targets_updated = count_updated(&before_targets, &after_targets);
+
+    format!(
+        "services +{services_added} -{services_removed} ~{services_updated}; listeners +{listeners_added} -{listeners_removed} ~{listeners_updated}; routes +{routes_added} -{routes_removed} ~{routes_updated}; targets +{targets_added} -{targets_removed} ~{targets_updated}"
+    )
+}
+
+fn collect_listener_map(state: &RuntimeState) -> BTreeMap<(String, String), RuntimeListener> {
+    let mut listeners = BTreeMap::new();
+    for service in state.list_services() {
+        for listener in service.listeners {
+            listeners.insert((service.id.clone(), listener.id.clone()), listener);
+        }
+    }
+    listeners
+}
+
+fn collect_route_map(state: &RuntimeState) -> BTreeMap<(String, String), RuntimeRoute> {
+    let mut routes = BTreeMap::new();
+    for service in state.list_services() {
+        for route in service.routes {
+            routes.insert((service.id.clone(), route.id.clone()), route);
+        }
+    }
+    routes
+}
+
+fn collect_target_map(
+    state: &RuntimeState,
+) -> BTreeMap<(String, String, String, String), RuntimeTarget> {
+    let mut targets = BTreeMap::new();
+    for service in state.list_services() {
+        for route in service.routes {
+            for group in route.target_groups {
+                for target in group.targets {
+                    targets.insert(
+                        (
+                            service.id.clone(),
+                            route.id.clone(),
+                            group.id.clone(),
+                            target.id.clone(),
+                        ),
+                        target,
+                    );
+                }
+            }
+        }
+    }
+    targets
+}
+
+fn count_added<K, V>(before: &BTreeMap<K, V>, after: &BTreeMap<K, V>) -> usize
+where
+    K: Ord,
+{
+    after
+        .keys()
+        .filter(|key| !before.contains_key(*key))
+        .count()
+}
+
+fn count_updated<K, V>(before: &BTreeMap<K, V>, after: &BTreeMap<K, V>) -> usize
+where
+    K: Ord,
+    V: PartialEq,
+{
+    before
+        .iter()
+        .filter(|(key, value)| {
+            after
+                .get(*key)
+                .is_some_and(|after_value| after_value != *value)
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -1326,212 +1538,4 @@ mod tests {
         assert!(metrics.contains("state=\"draining\""));
         assert!(metrics.contains("} 1"));
     }
-}
-
-fn render_runtime_target_metrics(
-    snapshot: &crate::runtime_services::RuntimeState,
-    backend_activity: &crate::proxy::activity::BackendActivityTracker,
-) -> String {
-    let mut counts: BTreeMap<(String, String, String, &'static str), u64> = BTreeMap::new();
-    let mut activity_rows: Vec<(String, String, String, String, &'static str, usize)> = Vec::new();
-    for service in snapshot.list_services() {
-        for route in service.routes {
-            for group in route.target_groups {
-                for target in group.targets {
-                    let state = match target.state {
-                        RuntimeTargetState::Active => "healthy",
-                        RuntimeTargetState::Warming => "warming",
-                        RuntimeTargetState::Draining => "draining",
-                        RuntimeTargetState::Failed => "failed",
-                    };
-                    *counts
-                        .entry((
-                            service.id.clone(),
-                            route.id.clone(),
-                            group.id.clone(),
-                            state,
-                        ))
-                        .or_default() += 1;
-                    activity_rows.push((
-                        service.id.clone(),
-                        route.id.clone(),
-                        group.id.clone(),
-                        target.id.clone(),
-                        state,
-                        backend_activity.active(&runtime_target_activity_key(
-                            &service.id,
-                            &route.id,
-                            &group.id,
-                            &target.id,
-                        )),
-                    ));
-                }
-            }
-        }
-    }
-
-    let mut output = String::new();
-    output.push_str(
-        "# HELP gatel_runtime_targets Number of runtime targets by service, route, group, and state.\n",
-    );
-    output.push_str("# TYPE gatel_runtime_targets gauge\n");
-    for ((service, route, group, state), count) in counts {
-        output.push_str(&format!(
-            "gatel_runtime_targets{{service=\"{service}\",route=\"{route}\",group=\"{group}\",state=\"{state}\"}} {count}\n"
-        ));
-    }
-    output.push_str(
-        "# HELP gatel_runtime_target_activity Active in-flight activity per runtime target.\n",
-    );
-    output.push_str("# TYPE gatel_runtime_target_activity gauge\n");
-    for (service, route, group, target, state, activity) in activity_rows {
-        output.push_str(&format!(
-            "gatel_runtime_target_activity{{service=\"{service}\",route=\"{route}\",group=\"{group}\",target=\"{target}\",state=\"{state}\"}} {activity}\n"
-        ));
-    }
-    output
-}
-
-fn render_runtime_state_status_metrics(status: &crate::server::RuntimeStateStatus) -> String {
-    let mut output = String::new();
-    output.push_str(
-        "# HELP gatel_runtime_state_corrupted Whether the persisted runtime state is currently marked corrupted.\n",
-    );
-    output.push_str("# TYPE gatel_runtime_state_corrupted gauge\n");
-    output.push_str(&format!(
-        "gatel_runtime_state_corrupted {}\n",
-        if status.corrupted { 1 } else { 0 }
-    ));
-    output.push_str(
-        "# HELP gatel_runtime_state_available Whether a runtime state snapshot is currently available.\n",
-    );
-    output.push_str("# TYPE gatel_runtime_state_available gauge\n");
-    output.push_str(&format!(
-        "gatel_runtime_state_available {}\n",
-        if status.available { 1 } else { 0 }
-    ));
-    output
-}
-
-fn runtime_actor<B>(req: &Request<B>) -> String {
-    req.headers()
-        .get("x-gatel-actor")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("admin_api")
-        .to_string()
-}
-
-fn log_runtime_mutation(actor: &str, action: &str, before: &RuntimeState, after: &RuntimeState) {
-    info!(
-        actor = actor,
-        action = action,
-        before_revision = before.revision,
-        after_revision = after.revision,
-        diff = %summarize_runtime_diff(before, after),
-        "runtime state mutated"
-    );
-}
-
-fn summarize_runtime_diff(before: &RuntimeState, after: &RuntimeState) -> String {
-    let before_services: BTreeSet<_> = before.services.keys().cloned().collect();
-    let after_services: BTreeSet<_> = after.services.keys().cloned().collect();
-    let services_added = after_services.difference(&before_services).count();
-    let services_removed = before_services.difference(&after_services).count();
-    let services_updated = before_services
-        .intersection(&after_services)
-        .filter(|service_id| before.services.get(*service_id) != after.services.get(*service_id))
-        .count();
-
-    let before_listeners = collect_listener_map(before);
-    let after_listeners = collect_listener_map(after);
-    let listeners_added = count_added(&before_listeners, &after_listeners);
-    let listeners_removed = count_added(&after_listeners, &before_listeners);
-    let listeners_updated = count_updated(&before_listeners, &after_listeners);
-
-    let before_routes = collect_route_map(before);
-    let after_routes = collect_route_map(after);
-    let routes_added = count_added(&before_routes, &after_routes);
-    let routes_removed = count_added(&after_routes, &before_routes);
-    let routes_updated = count_updated(&before_routes, &after_routes);
-
-    let before_targets = collect_target_map(before);
-    let after_targets = collect_target_map(after);
-    let targets_added = count_added(&before_targets, &after_targets);
-    let targets_removed = count_added(&after_targets, &before_targets);
-    let targets_updated = count_updated(&before_targets, &after_targets);
-
-    format!(
-        "services +{services_added} -{services_removed} ~{services_updated}; listeners +{listeners_added} -{listeners_removed} ~{listeners_updated}; routes +{routes_added} -{routes_removed} ~{routes_updated}; targets +{targets_added} -{targets_removed} ~{targets_updated}"
-    )
-}
-
-fn collect_listener_map(state: &RuntimeState) -> BTreeMap<(String, String), RuntimeListener> {
-    let mut listeners = BTreeMap::new();
-    for service in state.list_services() {
-        for listener in service.listeners {
-            listeners.insert((service.id.clone(), listener.id.clone()), listener);
-        }
-    }
-    listeners
-}
-
-fn collect_route_map(state: &RuntimeState) -> BTreeMap<(String, String), RuntimeRoute> {
-    let mut routes = BTreeMap::new();
-    for service in state.list_services() {
-        for route in service.routes {
-            routes.insert((service.id.clone(), route.id.clone()), route);
-        }
-    }
-    routes
-}
-
-fn collect_target_map(
-    state: &RuntimeState,
-) -> BTreeMap<(String, String, String, String), RuntimeTarget> {
-    let mut targets = BTreeMap::new();
-    for service in state.list_services() {
-        for route in service.routes {
-            for group in route.target_groups {
-                for target in group.targets {
-                    targets.insert(
-                        (
-                            service.id.clone(),
-                            route.id.clone(),
-                            group.id.clone(),
-                            target.id.clone(),
-                        ),
-                        target,
-                    );
-                }
-            }
-        }
-    }
-    targets
-}
-
-fn count_added<K, V>(before: &BTreeMap<K, V>, after: &BTreeMap<K, V>) -> usize
-where
-    K: Ord,
-{
-    after
-        .keys()
-        .filter(|key| !before.contains_key(*key))
-        .count()
-}
-
-fn count_updated<K, V>(before: &BTreeMap<K, V>, after: &BTreeMap<K, V>) -> usize
-where
-    K: Ord,
-    V: PartialEq,
-{
-    before
-        .iter()
-        .filter(|(key, value)| {
-            after
-                .get(*key)
-                .is_some_and(|after_value| after_value != *value)
-        })
-        .count()
 }
