@@ -12,6 +12,8 @@ use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
+use super::activity::BackendActivityGuard;
+use super::upstream::ConnGuard;
 use crate::{Body, ProxyError, empty_body, websocket};
 
 /// Check whether an incoming request is a WebSocket upgrade.
@@ -37,6 +39,8 @@ pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
 pub async fn proxy_websocket(
     mut req: Request<Body>,
     upstream_addr: &str,
+    conn_guard: ConnGuard,
+    activity_guard: BackendActivityGuard,
 ) -> Result<Response<Body>, ProxyError> {
     // Connect to the upstream over TCP.
     let mut upstream_stream = TcpStream::connect(upstream_addr).await.map_err(|e| {
@@ -139,6 +143,8 @@ pub async fn proxy_websocket(
     // Spawn the bidirectional copy task. It will run once the client side
     // completes its upgrade (i.e., after the 101 response is sent).
     tokio::spawn(async move {
+        let _conn_guard = conn_guard;
+        let _activity_guard = activity_guard;
         match client_upgrade.await {
             Ok(client_io) => {
                 let mut client_io = hyper_util::rt::TokioIo::new(client_io);

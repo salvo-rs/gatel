@@ -129,6 +129,7 @@ async fn resolve_and_update(dns_name: &str, port: u16, backends: &DynamicBackend
                 .map(|addr| Backend {
                     addr: addr.to_string(),
                     weight: 1,
+                    activity_key: None,
                 })
                 .collect();
 
@@ -191,10 +192,12 @@ mod tests {
             Backend {
                 addr: "1.2.3.4:8080".into(),
                 weight: 1,
+                activity_key: None,
             },
             Backend {
                 addr: "5.6.7.8:8080".into(),
                 weight: 1,
+                activity_key: None,
             },
         ]);
         let loaded = db.load();

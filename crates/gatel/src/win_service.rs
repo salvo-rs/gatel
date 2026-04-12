@@ -20,6 +20,10 @@ const SERVICE_NAME: &str = "gatel";
 /// Config path passed from main() → service_main() via static.
 static CONFIG_PATH: OnceLock<String> = OnceLock::new();
 
+fn config_has_tls(config: &gatel_core::config::AppConfig) -> bool {
+    config.tls.is_some() || config.sites.iter().any(|site| site.tls.is_some())
+}
+
 define_windows_service!(ffi_service_main, service_main);
 
 // ---------------------------------------------------------------------------
@@ -115,7 +119,7 @@ fn run_service() -> anyhow::Result<()> {
 
         info!("gatel starting as Windows service");
 
-        let tls_manager = if config.tls.is_some() {
+        let tls_manager = if config_has_tls(&config) {
             match TlsManager::build(&config).await {
                 Ok(mgr) => Some(mgr),
                 Err(e) => {

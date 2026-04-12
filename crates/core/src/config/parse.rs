@@ -455,6 +455,12 @@ fn parse_global(node: &KdlNode) -> Result<GlobalConfig, ConfigError> {
             "admin-auth-token" => {
                 cfg.admin_auth_token = first_string_arg(child);
             }
+            "admin-read-token" => {
+                cfg.admin_read_token = first_string_arg(child);
+            }
+            "admin-write-token" => {
+                cfg.admin_write_token = first_string_arg(child);
+            }
             other => return Err(ConfigError::UnknownDirective(other.into())),
         }
     }
@@ -1118,7 +1124,11 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
         && node.children().is_none()
     {
         return Ok(ProxyConfig {
-            upstreams: vec![UpstreamConfig { addr, weight: 1 }],
+            upstreams: vec![UpstreamConfig {
+                addr,
+                weight: 1,
+                activity_key: None,
+            }],
             lb: LbPolicy::default(),
             lb_header: None,
             lb_cookie: None,
@@ -1170,7 +1180,11 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                     .get("weight")
                     .and_then(|v| v.as_integer())
                     .unwrap_or(1) as u32;
-                upstreams.push(UpstreamConfig { addr, weight });
+                upstreams.push(UpstreamConfig {
+                    addr,
+                    weight,
+                    activity_key: None,
+                });
             }
             "lb" => {
                 let policy = first_string_arg(child).unwrap_or_default();
@@ -1814,6 +1828,7 @@ fn parse_stream_replace(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
 /// - `match method="GET"`
 /// - `match path="/api/*"`
 /// - `match header="X-Custom" pattern="foo*"`
+/// - `match cookie="deploy" pattern="canary"`
 /// - `match query="key" value="val"`
 /// - `match remote-ip="192.168.0.0/16"`
 /// - `match protocol="https"`
@@ -1836,6 +1851,17 @@ fn parse_matcher(node: &KdlNode) -> Result<RequestMatcher, ConfigError> {
             .to_string();
         return Ok(RequestMatcher::Header {
             name: header_name.to_string(),
+            pattern,
+        });
+    }
+    if let Some(cookie_name) = node.get("cookie").and_then(|v| v.as_string()) {
+        let pattern = node
+            .get("pattern")
+            .and_then(|v| v.as_string())
+            .unwrap_or("*")
+            .to_string();
+        return Ok(RequestMatcher::Cookie {
+            name: cookie_name.to_string(),
             pattern,
         });
     }
@@ -2293,13 +2319,14 @@ site "app.example.com" {
     route "/api/*" {
         match method="GET,POST"
         match header="X-Custom" pattern="foo*"
+        match cookie="deploy" pattern="canary"
         proxy "localhost:8080"
     }
 }
 "#;
         let config = parse_config(input).unwrap();
         let route = &config.sites[0].routes[0];
-        assert_eq!(route.matchers.len(), 2);
+        assert_eq!(route.matchers.len(), 3);
         match &route.matchers[0] {
             RequestMatcher::Method(methods) => {
                 assert!(methods.contains(&"GET".to_string()));
@@ -2313,6 +2340,13 @@ site "app.example.com" {
                 assert_eq!(pattern, "foo*");
             }
             _ => panic!("expected Header matcher"),
+        }
+        match &route.matchers[2] {
+            RequestMatcher::Cookie { name, pattern } => {
+                assert_eq!(name, "deploy");
+                assert_eq!(pattern, "canary");
+            }
+            _ => panic!("expected Cookie matcher"),
         }
     }
 

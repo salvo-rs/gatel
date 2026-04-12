@@ -16,6 +16,12 @@ type CounterKey = (String, String, u16);
 /// Composite key for duration histograms: `(host, method)`.
 type DurationKey = (String, String);
 
+/// Composite key for route match counters: `(site, route)`.
+type RouteMatchKey = (String, String);
+
+/// Composite key for backend selection counters: `(site, route, backend, policy)`.
+type BackendSelectionKey = (String, String, String, String);
+
 /// Shared metrics store. Safe to use from multiple tasks concurrently.
 pub struct Metrics {
     /// `gatel_requests_total` — counter per (host, method, status).
@@ -25,6 +31,10 @@ pub struct Metrics {
     /// `gatel_request_duration_seconds_count` — request count per (host, method)
     /// (used together with sum to compute average).
     request_duration_count: DashMap<DurationKey, AtomicU64>,
+    /// `gatel_route_matches_total` — counter per (site, route).
+    route_match_counts: DashMap<RouteMatchKey, AtomicU64>,
+    /// `gatel_backend_selections_total` — counter per (site, route, backend, policy).
+    backend_selection_counts: DashMap<BackendSelectionKey, AtomicU64>,
     /// `gatel_active_connections` — gauge.
     active_connections: AtomicU64,
 }
@@ -36,6 +46,8 @@ impl Metrics {
             request_counts: DashMap::new(),
             request_duration_sum: DashMap::new(),
             request_duration_count: DashMap::new(),
+            route_match_counts: DashMap::new(),
+            backend_selection_counts: DashMap::new(),
             active_connections: AtomicU64::new(0),
         }
     }
@@ -65,6 +77,29 @@ impl Metrics {
     /// Increment the active-connections gauge.
     pub fn inc_active_connections(&self) {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a route match against the resolved site/route labels.
+    pub fn record_route_match(&self, site: &str, route: &str) {
+        let key: RouteMatchKey = (site.to_string(), route.to_string());
+        self.route_match_counts
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a backend selection made by the proxy load balancer.
+    pub fn record_backend_selection(&self, site: &str, route: &str, backend: &str, policy: &str) {
+        let key: BackendSelectionKey = (
+            site.to_string(),
+            route.to_string(),
+            backend.to_string(),
+            policy.to_string(),
+        );
+        self.backend_selection_counts
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement the active-connections gauge.
@@ -119,6 +154,30 @@ impl Metrics {
         out.push_str("# TYPE gatel_active_connections gauge\n");
         let active = self.active_connections.load(Ordering::Relaxed);
         out.push_str(&format!("gatel_active_connections {active}\n"));
+
+        // -- gatel_route_matches_total --
+        out.push_str("# HELP gatel_route_matches_total Total number of matched routes.\n");
+        out.push_str("# TYPE gatel_route_matches_total counter\n");
+        for entry in self.route_match_counts.iter() {
+            let (site, route) = entry.key();
+            let count = entry.value().load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "gatel_route_matches_total{{site=\"{site}\",route=\"{route}\"}} {count}\n"
+            ));
+        }
+
+        // -- gatel_backend_selections_total --
+        out.push_str(
+            "# HELP gatel_backend_selections_total Total number of upstream backend selections.\n",
+        );
+        out.push_str("# TYPE gatel_backend_selections_total counter\n");
+        for entry in self.backend_selection_counts.iter() {
+            let (site, route, backend, policy) = entry.key();
+            let count = entry.value().load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "gatel_backend_selections_total{{site=\"{site}\",route=\"{route}\",backend=\"{backend}\",policy=\"{policy}\"}} {count}\n"
+            ));
+        }
 
         out
     }
@@ -189,6 +248,13 @@ mod tests {
         m.record_request("example.com", "GET", 200, Duration::from_millis(50));
         m.record_request("example.com", "GET", 200, Duration::from_millis(30));
         m.record_request("example.com", "POST", 201, Duration::from_millis(100));
+        m.record_route_match("example.com", "/api/*");
+        m.record_backend_selection(
+            "example.com",
+            "/api/*",
+            "127.0.0.1:3000",
+            "weighted_round_robin",
+        );
         m.inc_active_connections();
         m.inc_active_connections();
         m.dec_active_connections();
@@ -197,6 +263,8 @@ mod tests {
 
         assert!(output.contains("gatel_requests_total"));
         assert!(output.contains("gatel_request_duration_seconds"));
+        assert!(output.contains("gatel_route_matches_total"));
+        assert!(output.contains("gatel_backend_selections_total"));
         assert!(output.contains("gatel_active_connections 1"));
     }
 }

@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod cgi;
 pub mod circuit_breaker;
 pub mod dns_upstream;
@@ -13,24 +14,77 @@ pub mod upstream;
 pub mod websocket;
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use http::{Request, Response, Uri};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt;
+use pin_project_lite::pin_project;
 use regex::Regex;
 use tracing::{debug, warn};
 
+use self::activity::{BackendActivityGuard, BackendActivityTracker};
 use self::health::{HealthChecker, PassiveHealthChecker};
 use self::lb::*;
-use self::upstream::UpstreamPool;
+use self::upstream::{ConnGuard, UpstreamPool};
 use crate::config::{LbPolicy, ProxyConfig};
+use crate::hoops::metrics::Metrics;
 use crate::{Body, ProxyError, goals};
+
+pin_project! {
+    struct GuardedBody<B> {
+        #[pin]
+        inner: B,
+        _conn_guard: ConnGuard,
+        _activity_guard: BackendActivityGuard,
+    }
+}
+
+impl<B> GuardedBody<B> {
+    fn new(inner: B, conn_guard: ConnGuard, activity_guard: BackendActivityGuard) -> Self {
+        Self {
+            inner,
+            _conn_guard: conn_guard,
+            _activity_guard: activity_guard,
+        }
+    }
+}
+
+impl<B> HttpBody for GuardedBody<B>
+where
+    B: HttpBody<Data = Bytes, Error = crate::BoxError>,
+{
+    type Data = Bytes;
+    type Error = crate::BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 /// Reverse proxy handler: forwards requests to upstream backends with
 /// load balancing, health checking, and retry support.
 pub struct ReverseProxy {
     pool: Arc<UpstreamPool>,
     lb: Box<dyn LoadBalancer>,
+    backend_activity: Arc<BackendActivityTracker>,
+    metrics: Arc<Metrics>,
+    site_label: String,
+    route_label: String,
     headers_up: Vec<(String, String)>,
     headers_down: Vec<(String, String)>,
     retries: u32,
@@ -49,7 +103,13 @@ pub struct ReverseProxy {
 }
 
 impl ReverseProxy {
-    pub fn new(config: &ProxyConfig) -> Self {
+    pub fn new(
+        config: &ProxyConfig,
+        backend_activity: Arc<BackendActivityTracker>,
+        metrics: Arc<Metrics>,
+        site_label: String,
+        route_label: String,
+    ) -> Self {
         let pool = Arc::new(UpstreamPool::from_config(config));
 
         // Collect weights for weighted strategies.
@@ -124,6 +184,10 @@ impl ReverseProxy {
         Self {
             pool,
             lb,
+            backend_activity,
+            metrics,
+            site_label,
+            route_label,
             headers_up,
             headers_down,
             retries: config.retries,
@@ -191,9 +255,18 @@ impl ReverseProxy {
                 .select(&self.pool, &ws_lb_ctx)
                 .ok_or(ProxyError::NoUpstream)?;
             let backend = &self.pool.backends[backend_idx];
-            let _conn_guard = self.pool.acquire_conn(backend_idx);
+            let activity_key = backend.activity_key.as_deref().unwrap_or(&backend.addr);
+            self.metrics.record_backend_selection(
+                &self.site_label,
+                &self.route_label,
+                &backend.addr,
+                self.lb.name(),
+            );
+            let conn_guard = self.pool.acquire_conn(backend_idx);
+            let activity_guard = self.backend_activity.acquire(activity_key);
 
-            return websocket::proxy_websocket(request, &backend.addr).await;
+            return websocket::proxy_websocket(request, &backend.addr, conn_guard, activity_guard)
+                .await;
         }
 
         // Build LbContext from the incoming request.
@@ -258,6 +331,20 @@ impl ReverseProxy {
             };
 
             let backend = &self.pool.backends[backend_idx];
+            let activity_key = backend.activity_key.as_deref().unwrap_or(&backend.addr);
+            self.metrics.record_backend_selection(
+                &self.site_label,
+                &self.route_label,
+                &backend.addr,
+                self.lb.name(),
+            );
+            debug!(
+                lb_policy = self.lb.name(),
+                upstream = %backend.addr,
+                uri = %lb_ctx.uri,
+                attempt = attempt + 1,
+                "selected upstream backend"
+            );
 
             // --- Build the upstream request ---
             let mut req_parts = parts.clone();
@@ -366,7 +453,8 @@ impl ReverseProxy {
             );
 
             // --- Track active connections ---
-            let _conn_guard = self.pool.acquire_conn(backend_idx);
+            let conn_guard = self.pool.acquire_conn(backend_idx);
+            let activity_guard = self.backend_activity.acquire(activity_key);
 
             // --- Send the request ---
             // Unix socket backends bypass the shared HTTPS connector.
@@ -464,7 +552,14 @@ impl ReverseProxy {
                         ));
                     }
 
-                    return Ok(Response::from_parts(resp_parts, resp_body));
+                    return Ok(Response::from_parts(
+                        resp_parts,
+                        http_body_util::BodyExt::boxed(GuardedBody::new(
+                            resp_body,
+                            conn_guard,
+                            activity_guard,
+                        )),
+                    ));
                 }
                 Err(e) => {
                     // Passive health: record connection failure as well.
