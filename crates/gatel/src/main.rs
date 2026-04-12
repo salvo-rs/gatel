@@ -8,7 +8,7 @@ mod win_service;
 use std::sync::Arc;
 
 use clap::Parser;
-use gatel_core::config::{auto_config_from_env, parse_config, parse_config_file};
+use gatel_core::config::{GlobalConfig, auto_config_from_env, parse_config, parse_config_file};
 use gatel_core::server::{self, AppState};
 use gatel_core::tls::TlsManager;
 use tracing::{error, info, warn};
@@ -142,7 +142,10 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
             } else {
                 let config = parse_config_file(&config_path)?;
                 match config.global.admin_addr {
-                    Some(addr) => (addr.to_string(), config.global.admin_auth_token.clone()),
+                    Some(addr) => (
+                        addr.to_string(),
+                        reload_auth_token(&config.global).map(str::to_owned),
+                    ),
                     None => {
                         return Err(anyhow::anyhow!(
                             "admin API not configured in '{config_path}'; \
@@ -350,6 +353,13 @@ fn admin_reload_request(addr: &str, auth_token: Option<&str>) -> Result<String, 
     }
 }
 
+fn reload_auth_token(global: &GlobalConfig) -> Option<&str> {
+    global
+        .admin_auth_token
+        .as_deref()
+        .or(global.admin_write_token.as_deref())
+}
+
 fn init_tracing(
     level: &str,
     format: &str,
@@ -423,5 +433,31 @@ fn init_tracing(
         _ => {
             tracing_subscriber::fmt().with_env_filter(filter).init();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_auth_token_prefers_admin_auth_token() {
+        let global = GlobalConfig {
+            admin_auth_token: Some("admin-token".to_string()),
+            admin_write_token: Some("write-token".to_string()),
+            ..GlobalConfig::default()
+        };
+
+        assert_eq!(reload_auth_token(&global), Some("admin-token"));
+    }
+
+    #[test]
+    fn reload_auth_token_falls_back_to_write_token() {
+        let global = GlobalConfig {
+            admin_write_token: Some("write-token".to_string()),
+            ..GlobalConfig::default()
+        };
+
+        assert_eq!(reload_auth_token(&global), Some("write-token"));
     }
 }

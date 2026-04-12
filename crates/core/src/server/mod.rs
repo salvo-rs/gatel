@@ -13,6 +13,7 @@ pub use graceful::GracefulShutdown;
 pub use proxy_protocol::{PrefixedStream, ProxyProtocolHeader};
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -74,6 +75,7 @@ pub struct AppState {
     pub modules: Arc<ModuleRegistry>,
     /// Runtime-managed services independent from the static config file.
     pub runtime_services: Arc<RuntimeServiceRegistry>,
+    runtime_state_write_lock: AsyncMutex<()>,
     runtime_tasks: Arc<RuntimeTaskState>,
     runtime_state_status: Arc<RwLock<RuntimeStateStatus>>,
 }
@@ -99,6 +101,7 @@ impl AppState {
             backend_activity,
             modules: Arc::new(ModuleRegistry::new()),
             runtime_services: Arc::new(RuntimeServiceRegistry::default()),
+            runtime_state_write_lock: AsyncMutex::new(()),
             runtime_tasks: Arc::new(RuntimeTaskState::default()),
             runtime_state_status: Arc::new(RwLock::new(RuntimeStateStatus::default())),
         })
@@ -130,6 +133,7 @@ impl AppState {
             backend_activity,
             modules: Arc::new(ModuleRegistry::new()),
             runtime_services: Arc::new(RuntimeServiceRegistry::default()),
+            runtime_state_write_lock: AsyncMutex::new(()),
             runtime_tasks: Arc::new(RuntimeTaskState::default()),
             runtime_state_status: Arc::new(RwLock::new(RuntimeStateStatus {
                 path: Some(status_path),
@@ -164,6 +168,7 @@ impl AppState {
             backend_activity,
             modules,
             runtime_services: Arc::new(RuntimeServiceRegistry::default()),
+            runtime_state_write_lock: AsyncMutex::new(()),
             runtime_tasks: Arc::new(RuntimeTaskState::default()),
             runtime_state_status: Arc::new(RwLock::new(RuntimeStateStatus::default())),
         })
@@ -245,6 +250,7 @@ impl AppState {
     where
         F: FnOnce(&mut RuntimeState) -> Result<T, RuntimeServiceError>,
     {
+        let _guard = self.runtime_state_write_lock.lock().await;
         let mut snapshot = self.runtime_services.snapshot();
         let result = mutator(&mut snapshot)?;
         self.commit_runtime_snapshot(snapshot).await?;
@@ -1706,5 +1712,44 @@ mod tests {
         header_canary_handle.abort();
         cookie_default_handle.abort();
         cookie_canary_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mutate_runtime_state_serializes_concurrent_writers() {
+        let state = AppState::new(AppConfig::default(), None);
+        let guard = state.runtime_state_write_lock.lock().await;
+        let started = Arc::new(Notify::new());
+
+        let state_for_task = Arc::clone(&state);
+        let started_for_task = Arc::clone(&started);
+        let pending_mutation = tokio::spawn(async move {
+            started_for_task.notify_one();
+            state_for_task
+                .mutate_runtime_state(|runtime| {
+                    runtime.upsert_service(
+                        runtime_service(
+                            "127.0.0.1:3000".to_string(),
+                            RuntimeTargetState::Active,
+                            Duration::from_secs(1),
+                        ),
+                        None,
+                    )
+                })
+                .await
+        });
+
+        started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(state.runtime_services.get("api").is_none());
+
+        drop(guard);
+
+        let service = tokio::time::timeout(Duration::from_secs(1), pending_mutation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.revision, 1);
+        assert_eq!(state.runtime_services.get("api").unwrap().revision, 1);
     }
 }
