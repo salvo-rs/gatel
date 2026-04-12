@@ -17,22 +17,29 @@ use crate::config::{
 };
 use crate::hoops::metrics::{Metrics, MetricsHoop};
 use crate::plugin::ModuleRegistry;
+use crate::proxy::activity::BackendActivityTracker;
 use crate::router::matcher::{RequestMatcher, path_matches, pattern_specificity};
 
 pub fn build_service(
     config: &AppConfig,
     modules: &ModuleRegistry,
     metrics: Arc<Metrics>,
+    backend_activity: Arc<BackendActivityTracker>,
 ) -> Service {
-    Service::new(build_router(config, modules, &metrics))
+    Service::new(build_router(config, modules, &metrics, &backend_activity))
         .hoop(MetricsHoop::new(metrics))
         .hoop(Logger::new())
 }
 
-fn build_router(config: &AppConfig, modules: &ModuleRegistry, metrics: &Arc<Metrics>) -> Router {
+fn build_router(
+    config: &AppConfig,
+    modules: &ModuleRegistry,
+    metrics: &Arc<Metrics>,
+    backend_activity: &Arc<BackendActivityTracker>,
+) -> Router {
     let mut root = Router::new();
     for site in &config.sites {
-        root = root.push(build_site_router(site, modules, metrics));
+        root = root.push(build_site_router(site, modules, metrics, backend_activity));
     }
     root
 }
@@ -41,6 +48,7 @@ fn build_site_router(
     site: &SiteConfig,
     modules: &ModuleRegistry,
     metrics: &Arc<Metrics>,
+    backend_activity: &Arc<BackendActivityTracker>,
 ) -> Router {
     let mut site_router = if site.host == "*" {
         Router::new()
@@ -62,6 +70,7 @@ fn build_site_router(
             route,
             modules,
             Arc::clone(metrics),
+            Arc::clone(backend_activity),
         ));
     }
     site_router
@@ -72,8 +81,9 @@ fn build_route_router(
     route: &RouteConfig,
     modules: &ModuleRegistry,
     metrics: Arc<Metrics>,
+    backend_activity: Arc<BackendActivityTracker>,
 ) -> Router {
-    let mut router = Router::with_path("{**gatel_rest}");
+    let mut router = Router::with_filter_fn(consume_remaining_path);
 
     let site_host = site_host.to_string();
     let route_site_host = site_host.clone();
@@ -325,6 +335,7 @@ fn build_route_router(
         }),
         HandlerConfig::Proxy(proxy_cfg) => router.goal(crate::proxy::ReverseProxy::new(
             proxy_cfg,
+            Arc::clone(&backend_activity),
             Arc::clone(&metrics),
             site_host,
             route.path.clone(),
@@ -402,6 +413,13 @@ fn build_salvo_compression(encodings: &[String], level: Option<u32>) -> Option<C
     }
 
     if enabled_any { Some(compression) } else { None }
+}
+
+fn consume_remaining_path(_: &mut Request, path_state: &mut salvo::routing::PathState) -> bool {
+    if let Some(rest) = path_state.all_rest() {
+        path_state.forward(rest.len());
+    }
+    true
 }
 
 fn site_matches(site_host: &str, req: &Request) -> bool {

@@ -521,6 +521,8 @@ pub struct SrvUpstreamConfig {
 pub struct UpstreamConfig {
     pub addr: String,
     pub weight: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

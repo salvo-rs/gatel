@@ -57,6 +57,7 @@ impl ServerCertVerifier for NoVerifier {
 pub struct Backend {
     pub addr: String,
     pub weight: u32,
+    pub activity_key: Option<String>,
 }
 
 /// Pool of upstream backends with a shared HTTP client, health status,
@@ -67,7 +68,7 @@ pub struct UpstreamPool {
     /// Per-backend health flag. `true` = healthy, `false` = unhealthy.
     pub healthy: Vec<AtomicBool>,
     /// Per-backend active connection count (used by LeastConn).
-    pub active_conns: Vec<AtomicUsize>,
+    pub active_conns: Arc<Vec<AtomicUsize>>,
     /// Optional total connection limit across all backends.
     pub max_connections: Option<usize>,
 }
@@ -80,12 +81,14 @@ impl UpstreamPool {
             .map(|u| Backend {
                 addr: u.addr.clone(),
                 weight: u.weight,
+                activity_key: u.activity_key.clone(),
             })
             .collect();
 
         let n = backends.len();
         let healthy: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(true)).collect();
-        let active_conns: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let active_conns: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
 
         // Build the HTTPS connector — handles both HTTP and HTTPS upstreams.
         let connector = if config.tls_skip_verify {
@@ -167,12 +170,12 @@ impl UpstreamPool {
 
     /// Increment the active connection count for a backend. Returns a guard
     /// that decrements on drop.
-    pub fn acquire_conn(&self, idx: usize) -> ConnGuard<'_> {
+    pub fn acquire_conn(&self, idx: usize) -> ConnGuard {
         if let Some(c) = self.active_conns.get(idx) {
             c.fetch_add(1, Ordering::Relaxed);
         }
         ConnGuard {
-            active_conns: &self.active_conns,
+            active_conns: Arc::clone(&self.active_conns),
             idx,
         }
     }
@@ -205,12 +208,12 @@ impl UpstreamPool {
 }
 
 /// RAII guard that decrements the active-connection counter on drop.
-pub struct ConnGuard<'a> {
-    active_conns: &'a [AtomicUsize],
+pub struct ConnGuard {
+    active_conns: Arc<Vec<AtomicUsize>>,
     idx: usize,
 }
 
-impl<'a> Drop for ConnGuard<'a> {
+impl Drop for ConnGuard {
     fn drop(&mut self) {
         if let Some(c) = self.active_conns.get(self.idx) {
             c.fetch_sub(1, Ordering::Relaxed);

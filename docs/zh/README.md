@@ -73,6 +73,7 @@ Gatel 的设计目标是提供一个**配置简洁、性能优异、功能完整
 - 静态文件服务器（MIME 检测、ETag、Range 请求、目录浏览）
 - L4 TCP 流代理
 - 管理 API（配置查看、热重载、健康状态、上游状态、Prometheus 指标）
+- Runtime 控制面（service/route/target 的运行时变更、健康门控激活、drain、runtime TLS）
 - 热重载（SIGHUP 信号，ArcSwap 原子切换）
 - 优雅关闭（连接排空 + 可配置宽限期）
 
@@ -131,6 +132,7 @@ HTTP 解析 (hyper auto: H1 / H2 / H3)
 | [快速开始](getting-started.md) | 安装、首次运行、基础配置 |
 | [配置参考](configuration.md) | 完整的 KDL 配置语法手册 |
 | [反向代理](reverse-proxy.md) | 代理、负载均衡、健康检查、重试、请求头 |
+| [Runtime 控制面](runtime-control-plane.md) | Runtime service 模型、admin API、drain 语义、runtime TLS、控制器边界 |
 | [中间件参考](middleware.md) | 所有内置中间件的详细说明 |
 | [TLS 与 ACME](tls-and-acme.md) | TLS 配置、自动证书、mTLS、按需 TLS |
 | [高级功能](advanced-features.md) | HTTP/3、WebSocket、FastCGI、流代理等 |

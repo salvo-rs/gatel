@@ -22,10 +22,20 @@ use crate::hoops::metrics::Metrics;
 use crate::runtime_services::{
     RuntimeListener, RuntimeListenerPatch, RuntimeRoute, RuntimeRoutePatch, RuntimeService,
     RuntimeServiceError, RuntimeServicePatch, RuntimeState, RuntimeTarget, RuntimeTargetPatch,
-    RuntimeTargetState,
+    RuntimeTargetRef, RuntimeTargetState, runtime_target_activity_key,
 };
 use crate::server::{AppState, RuntimeStateError};
 use crate::{Body, ProxyError, full_body};
+
+#[derive(serde::Serialize)]
+struct RuntimeTargetView {
+    service_id: String,
+    route_id: String,
+    group_id: String,
+    activity: usize,
+    #[serde(flatten)]
+    target: RuntimeTarget,
+}
 
 /// Start the admin HTTP server on the given address.
 ///
@@ -386,7 +396,13 @@ fn handle_get_route(state: &AppState, service_id: &str, route_id: &str) -> Respo
 fn handle_list_route_targets(state: &AppState, service_id: &str, route_id: &str) -> Response<Body> {
     let snapshot = state.runtime_services.snapshot();
     match snapshot.list_route_targets(service_id, route_id) {
-        Ok(targets) => json_pretty_response(StatusCode::OK, &targets),
+        Ok(targets) => json_pretty_response(
+            StatusCode::OK,
+            &targets
+                .into_iter()
+                .map(|target| target_view_from_ref(state, service_id, route_id, target))
+                .collect::<Vec<_>>(),
+        ),
         Err(error) => json_runtime_service_error(error),
     }
 }
@@ -399,7 +415,13 @@ fn handle_list_targets(
 ) -> Response<Body> {
     let snapshot = state.runtime_services.snapshot();
     match snapshot.list_targets(service_id, route_id, group_id) {
-        Ok(targets) => json_pretty_response(StatusCode::OK, &targets),
+        Ok(targets) => json_pretty_response(
+            StatusCode::OK,
+            &targets
+                .into_iter()
+                .map(|target| target_view(state, service_id, route_id, group_id, target))
+                .collect::<Vec<_>>(),
+        ),
         Err(error) => json_runtime_service_error(error),
     }
 }
@@ -413,7 +435,10 @@ fn handle_get_target(
 ) -> Response<Body> {
     let snapshot = state.runtime_services.snapshot();
     match snapshot.get_target(service_id, route_id, group_id, target_id) {
-        Ok(target) => json_pretty_response(StatusCode::OK, &target),
+        Ok(target) => json_pretty_response(
+            StatusCode::OK,
+            &target_view(state, service_id, route_id, group_id, target),
+        ),
         Err(error) => json_runtime_service_error(error),
     }
 }
@@ -776,6 +801,7 @@ fn handle_metrics(state: &AppState, metrics: &Metrics) -> Response<Body> {
     let mut output = metrics.render_prometheus();
     output.push_str(&render_runtime_target_metrics(
         &state.runtime_services.snapshot(),
+        &state.backend_activity,
     ));
     output.push_str(&render_runtime_state_status_metrics(
         &state.runtime_state_status(),
@@ -901,6 +927,40 @@ where
             &format!(r#"{{"error":"serialization failed: {e}"}}"#),
         ),
     }
+}
+
+fn target_view(
+    state: &AppState,
+    service_id: &str,
+    route_id: &str,
+    group_id: &str,
+    target: RuntimeTarget,
+) -> RuntimeTargetView {
+    let activity = state.backend_activity.active(&runtime_target_activity_key(
+        service_id, route_id, group_id, &target.id,
+    ));
+    RuntimeTargetView {
+        service_id: service_id.to_string(),
+        route_id: route_id.to_string(),
+        group_id: group_id.to_string(),
+        activity,
+        target,
+    }
+}
+
+fn target_view_from_ref(
+    state: &AppState,
+    service_id: &str,
+    route_id: &str,
+    target_ref: RuntimeTargetRef,
+) -> RuntimeTargetView {
+    target_view(
+        state,
+        service_id,
+        route_id,
+        &target_ref.group_id,
+        target_ref.target,
+    )
 }
 
 fn json_runtime_service_error(error: RuntimeServiceError) -> Response<Body> {
@@ -1044,6 +1104,9 @@ mod tests {
 
     use super::*;
     use crate::config::AppConfig;
+    use crate::runtime_services::{
+        RuntimeRoute, RuntimeService, RuntimeTarget, RuntimeTargetGroup,
+    };
 
     fn request(method: http::Method) -> Request<()> {
         Request::builder()
@@ -1144,10 +1207,24 @@ mod tests {
         assert!(state.runtime_services.get("api").is_some());
 
         let response = client
+            .get(format!(
+                "{base_url}/services/api/routes/api/target-groups/primary/targets/app-1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(payload["activity"], 0);
+        assert_eq!(payload["service_id"], "api");
+        assert_eq!(payload["route_id"], "api");
+        assert_eq!(payload["group_id"], "primary");
+
+        let response = client
             .patch(format!(
                 "{base_url}/services/api/routes/api/target-groups/primary/targets/app-1"
             ))
-            .json(&json!({ "state": "draining" }))
+            .json(&json!({ "weight": 250, "drain_timeout": "2s" }))
             .send()
             .await
             .unwrap();
@@ -1158,8 +1235,8 @@ mod tests {
                 .snapshot()
                 .get_target("api", "api", "primary", "app-1")
                 .unwrap()
-                .state,
-            RuntimeTargetState::Draining
+                .weight,
+            250
         );
 
         let response = client
@@ -1170,15 +1247,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
-        assert_eq!(
-            state
-                .runtime_services
-                .snapshot()
-                .get_target("api", "api", "primary", "app-1")
-                .unwrap()
-                .state,
-            RuntimeTargetState::Draining
-        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .runtime_services
+                    .snapshot()
+                    .get_target("api", "api", "primary", "app-1")
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
 
         let response = client
             .delete(format!("{base_url}/services/api"))
@@ -1190,10 +1273,67 @@ mod tests {
 
         server.abort();
     }
+
+    #[test]
+    fn render_runtime_target_metrics_includes_activity_gauge() {
+        let mut runtime = RuntimeState::default();
+        runtime
+            .upsert_service(
+                RuntimeService {
+                    id: "api".to_string(),
+                    revision: 0,
+                    listeners: Vec::new(),
+                    routes: vec![RuntimeRoute {
+                        id: "api".to_string(),
+                        hosts: vec!["example.com".to_string()],
+                        path_prefix: "/api".to_string(),
+                        matchers: Vec::new(),
+                        strip_path_prefix: true,
+                        lb: crate::config::LbPolicy::RoundRobin,
+                        lb_header: None,
+                        lb_cookie: None,
+                        response: None,
+                        timeout_seconds: None,
+                        target_groups: vec![RuntimeTargetGroup {
+                            id: "primary".to_string(),
+                            weight: 100,
+                            targets: vec![RuntimeTarget {
+                                id: "app-1".to_string(),
+                                addr: "127.0.0.1:3000".to_string(),
+                                weight: 100,
+                                state: RuntimeTargetState::Draining,
+                                drain_timeout: Duration::from_secs(5),
+                                last_error: None,
+                            }],
+                        }],
+                        health_check: Default::default(),
+                    }],
+                    tls: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let activity = crate::proxy::activity::BackendActivityTracker::default();
+        let _guard = activity.acquire(runtime_target_activity_key(
+            "api", "api", "primary", "app-1",
+        ));
+
+        let metrics = render_runtime_target_metrics(&runtime, &activity);
+        assert!(metrics.contains("gatel_runtime_targets"));
+        assert!(metrics.contains("gatel_runtime_target_activity"));
+        assert!(metrics.contains("target=\"app-1\""));
+        assert!(metrics.contains("state=\"draining\""));
+        assert!(metrics.contains("} 1"));
+    }
 }
 
-fn render_runtime_target_metrics(snapshot: &crate::runtime_services::RuntimeState) -> String {
+fn render_runtime_target_metrics(
+    snapshot: &crate::runtime_services::RuntimeState,
+    backend_activity: &crate::proxy::activity::BackendActivityTracker,
+) -> String {
     let mut counts: BTreeMap<(String, String, String, &'static str), u64> = BTreeMap::new();
+    let mut activity_rows: Vec<(String, String, String, String, &'static str, usize)> = Vec::new();
     for service in snapshot.list_services() {
         for route in service.routes {
             for group in route.target_groups {
@@ -1212,6 +1352,19 @@ fn render_runtime_target_metrics(snapshot: &crate::runtime_services::RuntimeStat
                             state,
                         ))
                         .or_default() += 1;
+                    activity_rows.push((
+                        service.id.clone(),
+                        route.id.clone(),
+                        group.id.clone(),
+                        target.id.clone(),
+                        state,
+                        backend_activity.active(&runtime_target_activity_key(
+                            &service.id,
+                            &route.id,
+                            &group.id,
+                            &target.id,
+                        )),
+                    ));
                 }
             }
         }
@@ -1225,6 +1378,15 @@ fn render_runtime_target_metrics(snapshot: &crate::runtime_services::RuntimeStat
     for ((service, route, group, state), count) in counts {
         output.push_str(&format!(
             "gatel_runtime_targets{{service=\"{service}\",route=\"{route}\",group=\"{group}\",state=\"{state}\"}} {count}\n"
+        ));
+    }
+    output.push_str(
+        "# HELP gatel_runtime_target_activity Active in-flight activity per runtime target.\n",
+    );
+    output.push_str("# TYPE gatel_runtime_target_activity gauge\n");
+    for (service, route, group, target, state, activity) in activity_rows {
+        output.push_str(&format!(
+            "gatel_runtime_target_activity{{service=\"{service}\",route=\"{route}\",group=\"{group}\",target=\"{target}\",state=\"{state}\"}} {activity}\n"
         ));
     }
     output

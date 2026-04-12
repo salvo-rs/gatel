@@ -496,10 +496,12 @@ mod tests {
                 UpstreamConfig {
                     addr: "127.0.0.1:3000".to_string(),
                     weight: 100,
+                    activity_key: None,
                 },
                 UpstreamConfig {
                     addr: "127.0.0.1:3001".to_string(),
                     weight: 100,
+                    activity_key: None,
                 },
             ],
             lb: LbPolicy::RoundRobin,

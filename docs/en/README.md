@@ -112,7 +112,7 @@ HTTP/3 (QUIC) via quinn, transparent WebSocket proxying, full FastCGI protocol i
 MIME type detection, ETag and Last-Modified headers, conditional requests (304), byte-range requests, directory index files, and optional directory browsing with styled HTML listings.
 
 ### Admin API
-REST endpoints for inspecting and managing the running server: read the current configuration, trigger a hot reload, check health, list upstream backends, and scrape Prometheus-format metrics.
+REST endpoints for inspecting and managing the running server: read the current configuration, trigger a hot reload, inspect runtime services, mutate runtime targets, check health, list upstream backends, and scrape Prometheus-format metrics. See [Runtime Control Plane](runtime-control-plane.md).
 
 ### Observability
 Structured logging via the `tracing` crate with pretty or JSON output. Prometheus metrics expose request counts, latency histograms, and active connection gauges.
@@ -126,6 +126,7 @@ Structured logging via the `tracing` crate with pretty or JSON output. Prometheu
 | [Getting Started](getting-started.md) | Installation, first run, basic configuration |
 | [Configuration Reference](configuration.md) | Complete KDL config reference for every directive |
 | [Reverse Proxy](reverse-proxy.md) | Proxy, load balancing, health checks, retries, headers |
+| [Runtime Control Plane](runtime-control-plane.md) | Runtime service model, admin API, drain semantics, runtime TLS, controller boundary |
 | [Middleware](middleware.md) | All middleware: rate limiting, compression, auth, caching, etc. |
 | [TLS and ACME](tls-and-acme.md) | TLS, ACME auto-certs, mTLS, on-demand TLS |
 | [Advanced Features](advanced-features.md) | HTTP/3, WebSocket, FastCGI, stream proxy, PROXY protocol, matchers, templates, caching |

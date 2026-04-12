@@ -265,9 +265,19 @@ pub struct RuntimeRoute {
     #[serde(default)]
     pub lb_cookie: Option<String>,
     #[serde(default)]
+    pub response: Option<RuntimeFixedResponse>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
     pub target_groups: Vec<RuntimeTargetGroup>,
     #[serde(default)]
     pub health_check: RuntimeHealthCheck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeFixedResponse {
+    pub status: u16,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,6 +338,10 @@ pub struct RuntimeRoutePatch {
     pub lb_header: Option<String>,
     #[serde(default)]
     pub lb_cookie: Option<String>,
+    #[serde(default)]
+    pub response: Option<RuntimeFixedResponse>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub target_groups: Option<Vec<RuntimeTargetGroup>>,
     #[serde(default)]
@@ -737,6 +751,12 @@ impl RuntimeState {
         if let Some(lb_cookie) = patch.lb_cookie {
             route.lb_cookie = Some(lb_cookie);
         }
+        if let Some(response) = patch.response {
+            route.response = Some(response);
+        }
+        if let Some(timeout_seconds) = patch.timeout_seconds {
+            route.timeout_seconds = Some(timeout_seconds);
+        }
         if let Some(target_groups) = patch.target_groups {
             route.target_groups = target_groups;
         }
@@ -1017,8 +1037,8 @@ pub fn merge_runtime_config(
             .as_ref()
             .and_then(|tls| tls.canonical_host.as_deref());
         for route in &service.routes {
-            let upstreams = active_upstreams(route);
-            if upstreams.is_empty() {
+            let upstreams = active_upstreams(&service.id, route);
+            if upstreams.is_empty() && route.response.is_none() {
                 continue;
             }
 
@@ -1264,7 +1284,7 @@ fn listener_protocols_for_service(service: &RuntimeService) -> BTreeSet<RuntimeL
     }
 }
 
-fn active_upstreams(route: &RuntimeRoute) -> Vec<UpstreamConfig> {
+fn active_upstreams(service_id: &str, route: &RuntimeRoute) -> Vec<UpstreamConfig> {
     let mut upstreams = Vec::new();
     for group in &route.target_groups {
         for target in &group.targets {
@@ -1274,10 +1294,22 @@ fn active_upstreams(route: &RuntimeRoute) -> Vec<UpstreamConfig> {
             upstreams.push(UpstreamConfig {
                 addr: target.addr.clone(),
                 weight: group.weight.saturating_mul(target.weight).max(1),
+                activity_key: Some(runtime_target_activity_key(
+                    service_id, &route.id, &group.id, &target.id,
+                )),
             });
         }
     }
     upstreams
+}
+
+pub(crate) fn runtime_target_activity_key(
+    service_id: &str,
+    route_id: &str,
+    group_id: &str,
+    target_id: &str,
+) -> String {
+    format!("{service_id}/{route_id}/{group_id}/{target_id}")
 }
 
 fn route_pattern(path_prefix: &str) -> String {
@@ -1425,11 +1457,19 @@ fn proxy_route_config(
         middlewares.push(HoopConfig::ForceHttps { https_port: None });
     }
 
-    RouteConfig {
-        path: route_pattern(&route.path_prefix),
-        matchers: route_matchers_for_listener_protocols(route, listener_protocols),
-        middlewares,
-        handler: HandlerConfig::Proxy(ProxyConfig {
+    if let Some(timeout_seconds) = route.timeout_seconds {
+        middlewares.push(HoopConfig::Timeout {
+            duration: Duration::from_secs(timeout_seconds),
+        });
+    }
+
+    let handler = if let Some(response) = &route.response {
+        HandlerConfig::Respond {
+            status: response.status,
+            body: response.body.clone(),
+        }
+    } else {
+        HandlerConfig::Proxy(ProxyConfig {
             upstreams,
             lb: route.lb,
             lb_header: route.lb_header.clone(),
@@ -1448,7 +1488,14 @@ fn proxy_route_config(
             keepalive_timeout: None,
             sanitize_uri: true,
             srv_upstream: None,
-        }),
+        })
+    };
+
+    RouteConfig {
+        path: route_pattern(&route.path_prefix),
+        matchers: route_matchers_for_listener_protocols(route, listener_protocols),
+        middlewares,
+        handler,
         condition: None,
     }
 }
@@ -1575,6 +1622,9 @@ fn normalize_route(route: &mut RuntimeRoute) -> Result<(), RuntimeServiceError> 
         .as_ref()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    if let Some(response) = route.response.as_mut() {
+        response.body = response.body.trim().to_string();
+    }
     for group in &mut route.target_groups {
         normalize_group(group)?;
     }
@@ -1912,6 +1962,8 @@ mod tests {
                 lb: default_lb_policy(),
                 lb_header: None,
                 lb_cookie: None,
+                response: None,
+                timeout_seconds: None,
                 target_groups: vec![RuntimeTargetGroup {
                     id: "primary".to_string(),
                     weight: 100,
@@ -2009,6 +2061,8 @@ mod tests {
             lb: default_lb_policy(),
             lb_header: None,
             lb_cookie: None,
+            response: None,
+            timeout_seconds: None,
             target_groups: vec![RuntimeTargetGroup {
                 id: "secondary".to_string(),
                 weight: 100,
@@ -2047,6 +2101,8 @@ mod tests {
             lb: LbPolicy::CookieHash,
             lb_header: None,
             lb_cookie: Some("deploy".to_string()),
+            response: None,
+            timeout_seconds: None,
             target_groups: vec![RuntimeTargetGroup {
                 id: "canary".to_string(),
                 weight: 20,
@@ -2085,6 +2141,8 @@ mod tests {
             lb: default_lb_policy(),
             lb_header: None,
             lb_cookie: None,
+            response: None,
+            timeout_seconds: None,
             target_groups: vec![RuntimeTargetGroup {
                 id: "cookie".to_string(),
                 weight: 100,
@@ -2111,6 +2169,8 @@ mod tests {
             lb: default_lb_policy(),
             lb_header: None,
             lb_cookie: None,
+            response: None,
+            timeout_seconds: None,
             target_groups: vec![RuntimeTargetGroup {
                 id: "header".to_string(),
                 weight: 100,
@@ -2222,6 +2282,8 @@ mod tests {
                         lb: LbPolicy::CookieHash,
                         lb_header: None,
                         lb_cookie: Some("deploy".to_string()),
+                        response: None,
+                        timeout_seconds: None,
                         target_groups: vec![RuntimeTargetGroup {
                             id: "primary".to_string(),
                             weight: 50,

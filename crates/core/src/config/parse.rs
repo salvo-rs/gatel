@@ -1124,7 +1124,11 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
         && node.children().is_none()
     {
         return Ok(ProxyConfig {
-            upstreams: vec![UpstreamConfig { addr, weight: 1 }],
+            upstreams: vec![UpstreamConfig {
+                addr,
+                weight: 1,
+                activity_key: None,
+            }],
             lb: LbPolicy::default(),
             lb_header: None,
             lb_cookie: None,
@@ -1176,7 +1180,11 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                     .get("weight")
                     .and_then(|v| v.as_integer())
                     .unwrap_or(1) as u32;
-                upstreams.push(UpstreamConfig { addr, weight });
+                upstreams.push(UpstreamConfig {
+                    addr,
+                    weight,
+                    activity_key: None,
+                });
             }
             "lb" => {
                 let policy = first_string_arg(child).unwrap_or_default();

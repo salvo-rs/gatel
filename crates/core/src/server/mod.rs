@@ -19,9 +19,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::AppConfig;
 use crate::hoops::metrics::Metrics;
 use crate::plugin::ModuleRegistry;
+use crate::proxy::activity::BackendActivityTracker;
 use crate::runtime_services::{
     RuntimeHealthCheck, RuntimeServiceError, RuntimeServiceRegistry, RuntimeState,
-    RuntimeTargetState, merge_runtime_config, route_health_check,
+    RuntimeTargetState, merge_runtime_config, route_health_check, runtime_target_activity_key,
 };
 use crate::salvo_service;
 use crate::tls::TlsManager;
@@ -67,6 +68,8 @@ pub struct AppState {
     pub config_path: Option<String>,
     /// Shared metrics store.
     pub metrics: Arc<Metrics>,
+    /// Active runtime backend request/tunnel tracker used for draining.
+    pub backend_activity: Arc<BackendActivityTracker>,
     /// Module registry for plugin-provided middleware and handlers.
     pub modules: Arc<ModuleRegistry>,
     /// Runtime-managed services independent from the static config file.
@@ -79,10 +82,12 @@ impl AppState {
     pub fn new(config: AppConfig, tls_manager: Option<TlsManager>) -> Arc<Self> {
         let grace_period = config.global.grace_period;
         let metrics = Arc::new(Metrics::new());
+        let backend_activity = Arc::new(BackendActivityTracker::default());
         let service = salvo_service::build_service(
             &config,
             &crate::plugin::ModuleRegistry::new(),
             Arc::clone(&metrics),
+            Arc::clone(&backend_activity),
         );
         Arc::new(Self {
             config: ArcSwap::from_pointee(config),
@@ -91,6 +96,7 @@ impl AppState {
             shutdown: GracefulShutdown::new(grace_period),
             config_path: None,
             metrics,
+            backend_activity,
             modules: Arc::new(ModuleRegistry::new()),
             runtime_services: Arc::new(RuntimeServiceRegistry::default()),
             runtime_tasks: Arc::new(RuntimeTaskState::default()),
@@ -106,10 +112,12 @@ impl AppState {
     ) -> Arc<Self> {
         let grace_period = config.global.grace_period;
         let metrics = Arc::new(Metrics::new());
+        let backend_activity = Arc::new(BackendActivityTracker::default());
         let service = salvo_service::build_service(
             &config,
             &crate::plugin::ModuleRegistry::new(),
             Arc::clone(&metrics),
+            Arc::clone(&backend_activity),
         );
         let status_path = path.clone();
         Arc::new(Self {
@@ -119,6 +127,7 @@ impl AppState {
             shutdown: GracefulShutdown::new(grace_period),
             config_path: Some(path),
             metrics,
+            backend_activity,
             modules: Arc::new(ModuleRegistry::new()),
             runtime_services: Arc::new(RuntimeServiceRegistry::default()),
             runtime_tasks: Arc::new(RuntimeTaskState::default()),
@@ -137,8 +146,14 @@ impl AppState {
     ) -> Arc<Self> {
         let grace_period = config.global.grace_period;
         let metrics = Arc::new(Metrics::new());
+        let backend_activity = Arc::new(BackendActivityTracker::default());
         let modules = Arc::new(modules);
-        let service = salvo_service::build_service(&config, &modules, Arc::clone(&metrics));
+        let service = salvo_service::build_service(
+            &config,
+            &modules,
+            Arc::clone(&metrics),
+            Arc::clone(&backend_activity),
+        );
         Arc::new(Self {
             config: ArcSwap::from_pointee(config),
             service: ArcSwap::new(Arc::new(service)),
@@ -146,6 +161,7 @@ impl AppState {
             shutdown: GracefulShutdown::new(grace_period),
             config_path: None,
             metrics,
+            backend_activity,
             modules,
             runtime_services: Arc::new(RuntimeServiceRegistry::default()),
             runtime_tasks: Arc::new(RuntimeTaskState::default()),
@@ -157,8 +173,12 @@ impl AppState {
     pub async fn reload(&self, new_config: AppConfig) -> Result<(), RuntimeStateError> {
         let runtime_snapshot = self.runtime_services.snapshot();
         let merged_config = merge_runtime_config(&new_config, &runtime_snapshot)?;
-        let new_service =
-            salvo_service::build_service(&merged_config, &self.modules, Arc::clone(&self.metrics));
+        let new_service = salvo_service::build_service(
+            &merged_config,
+            &self.modules,
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.backend_activity),
+        );
         self.reload_tls_config(&merged_config).await?;
 
         self.service.store(Arc::new(new_service));
@@ -256,8 +276,12 @@ impl AppState {
     ) -> Result<(), RuntimeStateError> {
         let base_config = self.config.load();
         let merged = merge_runtime_config(&base_config, &snapshot)?;
-        let new_service =
-            salvo_service::build_service(&merged, &self.modules, Arc::clone(&self.metrics));
+        let new_service = salvo_service::build_service(
+            &merged,
+            &self.modules,
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.backend_activity),
+        );
         if persist {
             self.persist_runtime_state(&snapshot)?;
         }
@@ -365,7 +389,7 @@ impl AppState {
         group_id: String,
         target_id: String,
     ) {
-        let key = runtime_task_key(&service_id, &route_id, &group_id, &target_id);
+        let key = runtime_target_activity_key(&service_id, &route_id, &group_id, &target_id);
         let mut tasks = self
             .runtime_tasks
             .health_checks
@@ -401,7 +425,7 @@ impl AppState {
         target_id: String,
         drain_timeout: std::time::Duration,
     ) {
-        let key = runtime_task_key(&service_id, &route_id, &group_id, &target_id);
+        let key = runtime_target_activity_key(&service_id, &route_id, &group_id, &target_id);
         let mut tasks = self
             .runtime_tasks
             .drains
@@ -415,28 +439,57 @@ impl AppState {
 
         let state = Arc::clone(self);
         let cleanup_key = key.clone();
+        let activity_key = key.clone();
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(drain_timeout).await;
-            let snapshot = state.runtime_services.snapshot();
-            if matches!(
-                snapshot.get_target(&service_id, &route_id, &group_id, &target_id),
-                Ok(target) if target.state == RuntimeTargetState::Draining
-            ) {
-                if let Err(error) = state
-                    .mutate_runtime_state(|runtime| {
-                        runtime.remove_target(&service_id, &route_id, &group_id, &target_id, None)
-                    })
-                    .await
-                {
-                    warn!(
-                        service = %service_id,
-                        route = %route_id,
-                        group = %group_id,
-                        target = %target_id,
-                        error = %error,
-                        "failed to finalize drained runtime target removal"
-                    );
+            let deadline = tokio::time::Instant::now() + drain_timeout;
+            loop {
+                let snapshot = state.runtime_services.snapshot();
+                let draining = matches!(
+                    snapshot.get_target(&service_id, &route_id, &group_id, &target_id),
+                    Ok(target) if target.state == RuntimeTargetState::Draining
+                );
+                if !draining {
+                    break;
                 }
+
+                let active = state.backend_activity.active(&activity_key);
+                let timed_out = tokio::time::Instant::now() >= deadline;
+                if active == 0 || timed_out {
+                    if timed_out && active > 0 {
+                        warn!(
+                            service = %service_id,
+                            route = %route_id,
+                            group = %group_id,
+                            target = %target_id,
+                            active,
+                            "drain timeout expired with active long-lived connections"
+                        );
+                    }
+                    if let Err(error) = state
+                        .mutate_runtime_state(|runtime| {
+                            runtime.remove_target(
+                                &service_id,
+                                &route_id,
+                                &group_id,
+                                &target_id,
+                                None,
+                            )
+                        })
+                        .await
+                    {
+                        warn!(
+                            service = %service_id,
+                            route = %route_id,
+                            group = %group_id,
+                            target = %target_id,
+                            error = %error,
+                            "failed to finalize drained runtime target removal"
+                        );
+                    }
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             state
                 .runtime_tasks
@@ -537,10 +590,6 @@ impl AppState {
             tokio::time::sleep(health_check.interval).await;
         }
     }
-}
-
-fn runtime_task_key(service_id: &str, route_id: &str, group_id: &str, target_id: &str) -> String {
-    format!("{service_id}/{route_id}/{group_id}/{target_id}")
 }
 
 fn config_requires_tls_manager(config: &AppConfig) -> bool {
@@ -856,11 +905,17 @@ async fn accept_https_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use http::header::{COOKIE, HOST};
+    use reqwest::StatusCode;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
 
     use super::*;
+    use crate::config::LbPolicy;
+    use crate::router::matcher::RequestMatcher;
     use crate::runtime_services::{
         RuntimeHealthCheck, RuntimeRoute, RuntimeService, RuntimeTarget, RuntimeTargetGroup,
     };
@@ -883,6 +938,8 @@ mod tests {
                 lb: crate::config::LbPolicy::WeightedRoundRobin,
                 lb_header: None,
                 lb_cookie: None,
+                response: None,
+                timeout_seconds: None,
                 target_groups: vec![RuntimeTargetGroup {
                     id: "primary".to_string(),
                     weight: 100,
@@ -903,6 +960,257 @@ mod tests {
                     ..RuntimeHealthCheck::default()
                 },
             }],
+            tls: None,
+        }
+    }
+
+    fn active_target(id: &str, addr: String) -> RuntimeTarget {
+        RuntimeTarget {
+            id: id.to_string(),
+            addr,
+            weight: 100,
+            state: RuntimeTargetState::Active,
+            drain_timeout: Duration::from_secs(1),
+            last_error: None,
+        }
+    }
+
+    async fn spawn_backend(body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response_body = Arc::new(body.to_string());
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(_) => break,
+                };
+                let response_body = Arc::clone(&response_body);
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), handle)
+    }
+
+    async fn spawn_streaming_backend(
+        first_chunk: &str,
+        second_chunk: &str,
+    ) -> (String, Arc<Notify>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let release = Arc::new(Notify::new());
+        let first_chunk = Arc::new(first_chunk.to_string());
+        let second_chunk = Arc::new(second_chunk.to_string());
+        let handle = {
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = match listener.accept().await {
+                        Ok(connection) => connection,
+                        Err(_) => break,
+                    };
+                    let release = Arc::clone(&release);
+                    let first_chunk = Arc::clone(&first_chunk);
+                    let second_chunk = Arc::clone(&second_chunk);
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 2048];
+                        let _ = stream.read(&mut buffer).await;
+                        let response_head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                        let first = format!("{:X}\r\n{}\r\n", first_chunk.len(), first_chunk);
+                        let second = format!("{:X}\r\n{}\r\n", second_chunk.len(), second_chunk);
+                        let _ = stream.write_all(response_head.as_bytes()).await;
+                        let _ = stream.write_all(first.as_bytes()).await;
+                        release.notified().await;
+                        let _ = stream.write_all(second.as_bytes()).await;
+                        let _ = stream.write_all(b"0\r\n\r\n").await;
+                    });
+                }
+            })
+        };
+        (format!("127.0.0.1:{}", addr.port()), release, handle)
+    }
+
+    async fn free_http_addr() -> std::net::SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    async fn spawn_proxy() -> (
+        Arc<AppState>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let http_addr = free_http_addr().await;
+        let mut config = AppConfig::default();
+        config.global.http_addr = http_addr;
+
+        let state = AppState::new(config, None);
+        let run_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            let _ = run(run_state).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}/", http_addr.port());
+        for _ in 0..40 {
+            if client.get(&url).send().await.is_ok() {
+                return (state, http_addr, handle);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("proxy listener did not start");
+    }
+
+    async fn proxy_get(
+        client: &reqwest::Client,
+        http_addr: std::net::SocketAddr,
+        path: &str,
+        host: &str,
+        headers: &[(&http::header::HeaderName, &str)],
+    ) -> (StatusCode, String) {
+        let mut request = client
+            .get(format!("http://127.0.0.1:{}{}", http_addr.port(), path))
+            .header(HOST, host);
+        for (name, value) in headers {
+            request = request.header((*name).clone(), *value);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        (status, body)
+    }
+
+    fn split_runtime_service(
+        weighted_primary: String,
+        weighted_secondary: String,
+        header_default: String,
+        header_canary: String,
+        cookie_default: String,
+        cookie_canary: String,
+    ) -> RuntimeService {
+        RuntimeService {
+            id: "split".to_string(),
+            revision: 0,
+            listeners: Vec::new(),
+            routes: vec![
+                RuntimeRoute {
+                    id: "weighted".to_string(),
+                    hosts: Vec::new(),
+                    path_prefix: "/weighted".to_string(),
+                    matchers: Vec::new(),
+                    strip_path_prefix: true,
+                    lb: LbPolicy::WeightedRoundRobin,
+                    lb_header: None,
+                    lb_cookie: None,
+                    response: None,
+                    timeout_seconds: None,
+                    target_groups: vec![
+                        RuntimeTargetGroup {
+                            id: "primary".to_string(),
+                            weight: 1,
+                            targets: vec![active_target("weighted-primary", weighted_primary)],
+                        },
+                        RuntimeTargetGroup {
+                            id: "secondary".to_string(),
+                            weight: 2,
+                            targets: vec![active_target("weighted-secondary", weighted_secondary)],
+                        },
+                    ],
+                    health_check: RuntimeHealthCheck::default(),
+                },
+                RuntimeRoute {
+                    id: "header-canary".to_string(),
+                    hosts: Vec::new(),
+                    path_prefix: "/header".to_string(),
+                    matchers: vec![RequestMatcher::Header {
+                        name: "x-deploy".to_string(),
+                        pattern: "canary".to_string(),
+                    }],
+                    strip_path_prefix: true,
+                    lb: LbPolicy::WeightedRoundRobin,
+                    lb_header: None,
+                    lb_cookie: None,
+                    response: None,
+                    timeout_seconds: None,
+                    target_groups: vec![RuntimeTargetGroup {
+                        id: "header-canary".to_string(),
+                        weight: 1,
+                        targets: vec![active_target("header-canary", header_canary)],
+                    }],
+                    health_check: RuntimeHealthCheck::default(),
+                },
+                RuntimeRoute {
+                    id: "header-default".to_string(),
+                    hosts: Vec::new(),
+                    path_prefix: "/header".to_string(),
+                    matchers: Vec::new(),
+                    strip_path_prefix: true,
+                    lb: LbPolicy::WeightedRoundRobin,
+                    lb_header: None,
+                    lb_cookie: None,
+                    response: None,
+                    timeout_seconds: None,
+                    target_groups: vec![RuntimeTargetGroup {
+                        id: "header-default".to_string(),
+                        weight: 1,
+                        targets: vec![active_target("header-default", header_default)],
+                    }],
+                    health_check: RuntimeHealthCheck::default(),
+                },
+                RuntimeRoute {
+                    id: "cookie-canary".to_string(),
+                    hosts: Vec::new(),
+                    path_prefix: "/cookie".to_string(),
+                    matchers: vec![RequestMatcher::Cookie {
+                        name: "deploy".to_string(),
+                        pattern: "canary".to_string(),
+                    }],
+                    strip_path_prefix: true,
+                    lb: LbPolicy::WeightedRoundRobin,
+                    lb_header: None,
+                    lb_cookie: None,
+                    response: None,
+                    timeout_seconds: None,
+                    target_groups: vec![RuntimeTargetGroup {
+                        id: "cookie-canary".to_string(),
+                        weight: 1,
+                        targets: vec![active_target("cookie-canary", cookie_canary)],
+                    }],
+                    health_check: RuntimeHealthCheck::default(),
+                },
+                RuntimeRoute {
+                    id: "cookie-default".to_string(),
+                    hosts: Vec::new(),
+                    path_prefix: "/cookie".to_string(),
+                    matchers: Vec::new(),
+                    strip_path_prefix: true,
+                    lb: LbPolicy::WeightedRoundRobin,
+                    lb_header: None,
+                    lb_cookie: None,
+                    response: None,
+                    timeout_seconds: None,
+                    target_groups: vec![RuntimeTargetGroup {
+                        id: "cookie-default".to_string(),
+                        weight: 1,
+                        targets: vec![active_target("cookie-default", cookie_default)],
+                    }],
+                    health_check: RuntimeHealthCheck::default(),
+                },
+            ],
             tls: None,
         }
     }
@@ -1019,6 +1327,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_gated_activation_updates_live_proxy_requests() {
+        let (backend_addr, backend_handle) = spawn_backend("warming-live").await;
+        let (state, http_addr, proxy_handle) = spawn_proxy().await;
+        let client = reqwest::Client::new();
+
+        let mut service = runtime_service(
+            backend_addr,
+            RuntimeTargetState::Warming,
+            Duration::from_secs(1),
+        );
+        service.routes[0].hosts.clear();
+        service.routes[0].health_check.interval = Duration::from_millis(150);
+        service.routes[0].health_check.success_threshold = 2;
+
+        state
+            .mutate_runtime_state(|runtime| runtime.upsert_service(service, None))
+            .await
+            .unwrap();
+
+        let (status, _) = proxy_get(&client, http_addr, "/api", "example.com", &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (status, body) =
+                    proxy_get(&client, http_addr, "/api", "example.com", &[]).await;
+                if status == StatusCode::OK {
+                    assert_eq!(body, "warming-live");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        state.shutdown.shutdown();
+        proxy_handle.abort();
+        backend_handle.abort();
+    }
+
+    #[tokio::test]
     async fn draining_target_is_removed_after_timeout() {
         let state = AppState::new(AppConfig::default(), None);
         let service = state
@@ -1067,5 +1417,294 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn draining_target_stops_new_requests_and_is_removed() {
+        let (backend_addr, backend_handle) = spawn_backend("drain-live").await;
+        let (state, http_addr, proxy_handle) = spawn_proxy().await;
+        let client = reqwest::Client::new();
+
+        let service = runtime_service(
+            backend_addr,
+            RuntimeTargetState::Active,
+            Duration::from_millis(100),
+        );
+        let mut service = service;
+        service.routes[0].hosts.clear();
+        let service = state
+            .mutate_runtime_state(|runtime| runtime.upsert_service(service, None))
+            .await
+            .unwrap();
+
+        let (status, body) = proxy_get(&client, http_addr, "/api", "example.com", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "drain-live");
+
+        state
+            .mutate_runtime_state(|runtime| {
+                runtime.patch_target(
+                    "api",
+                    "api",
+                    "primary",
+                    "app-1",
+                    crate::runtime_services::RuntimeTargetPatch {
+                        state: Some(RuntimeTargetState::Draining),
+                        ..crate::runtime_services::RuntimeTargetPatch::default()
+                    },
+                    Some(service.revision),
+                )
+            })
+            .await
+            .unwrap();
+
+        let (status, _) = proxy_get(&client, http_addr, "/api", "example.com", &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .runtime_services
+                    .snapshot()
+                    .get_target("api", "api", "primary", "app-1")
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        state.shutdown.shutdown();
+        proxy_handle.abort();
+        backend_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn draining_target_waits_for_stream_completion_before_removal() {
+        let (backend_addr, release_stream, backend_handle) =
+            spawn_streaming_backend("hello", "-world").await;
+        let (state, http_addr, proxy_handle) = spawn_proxy().await;
+        let client = reqwest::Client::new();
+
+        let service = runtime_service(
+            backend_addr,
+            RuntimeTargetState::Active,
+            Duration::from_secs(2),
+        );
+        let service = state
+            .mutate_runtime_state(|runtime| runtime.upsert_service(service.clone(), None))
+            .await
+            .unwrap();
+
+        let response = client
+            .get(format!("http://{http_addr}/api"))
+            .header(HOST, "example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        state
+            .mutate_runtime_state(|runtime| {
+                runtime.patch_target(
+                    "api",
+                    "api",
+                    "primary",
+                    "app-1",
+                    crate::runtime_services::RuntimeTargetPatch {
+                        state: Some(RuntimeTargetState::Draining),
+                        ..crate::runtime_services::RuntimeTargetPatch::default()
+                    },
+                    Some(service.revision),
+                )
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            state
+                .runtime_services
+                .snapshot()
+                .get_target("api", "api", "primary", "app-1")
+                .is_ok()
+        );
+
+        release_stream.notify_waiters();
+        assert_eq!(response.text().await.unwrap(), "hello-world");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .runtime_services
+                    .snapshot()
+                    .get_target("api", "api", "primary", "app-1")
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        state.shutdown.shutdown();
+        proxy_handle.abort();
+        backend_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn draining_target_times_out_but_keeps_existing_stream_alive() {
+        let (backend_addr, release_stream, backend_handle) =
+            spawn_streaming_backend("hello", "-late").await;
+        let (state, http_addr, proxy_handle) = spawn_proxy().await;
+        let client = reqwest::Client::new();
+
+        let service = runtime_service(
+            backend_addr,
+            RuntimeTargetState::Active,
+            Duration::from_millis(150),
+        );
+        let service = state
+            .mutate_runtime_state(|runtime| runtime.upsert_service(service.clone(), None))
+            .await
+            .unwrap();
+
+        let response = client
+            .get(format!("http://{http_addr}/api"))
+            .header(HOST, "example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        state
+            .mutate_runtime_state(|runtime| {
+                runtime.patch_target(
+                    "api",
+                    "api",
+                    "primary",
+                    "app-1",
+                    crate::runtime_services::RuntimeTargetPatch {
+                        state: Some(RuntimeTargetState::Draining),
+                        ..crate::runtime_services::RuntimeTargetPatch::default()
+                    },
+                    Some(service.revision),
+                )
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .runtime_services
+                    .snapshot()
+                    .get_target("api", "api", "primary", "app-1")
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        release_stream.notify_waiters();
+        assert_eq!(response.text().await.unwrap(), "hello-late");
+
+        state.shutdown.shutdown();
+        proxy_handle.abort();
+        backend_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn weighted_split_and_cookie_header_matching_route_live_requests() {
+        let (weighted_primary_addr, weighted_primary_handle) =
+            spawn_backend("weighted-primary").await;
+        let (weighted_secondary_addr, weighted_secondary_handle) =
+            spawn_backend("weighted-secondary").await;
+        let (header_default_addr, header_default_handle) = spawn_backend("header-default").await;
+        let (header_canary_addr, header_canary_handle) = spawn_backend("header-canary").await;
+        let (cookie_default_addr, cookie_default_handle) = spawn_backend("cookie-default").await;
+        let (cookie_canary_addr, cookie_canary_handle) = spawn_backend("cookie-canary").await;
+        let (state, http_addr, proxy_handle) = spawn_proxy().await;
+        let client = reqwest::Client::new();
+
+        state
+            .mutate_runtime_state(|runtime| {
+                runtime.upsert_service(
+                    split_runtime_service(
+                        weighted_primary_addr,
+                        weighted_secondary_addr,
+                        header_default_addr,
+                        header_canary_addr,
+                        cookie_default_addr,
+                        cookie_canary_addr,
+                    ),
+                    None,
+                )
+            })
+            .await
+            .unwrap();
+
+        let mut weighted_primary_hits = 0;
+        let mut weighted_secondary_hits = 0;
+        for _ in 0..6 {
+            let (status, body) =
+                proxy_get(&client, http_addr, "/weighted", "example.com", &[]).await;
+            assert_eq!(status, StatusCode::OK);
+            match body.as_str() {
+                "weighted-primary" => weighted_primary_hits += 1,
+                "weighted-secondary" => weighted_secondary_hits += 1,
+                other => panic!("unexpected weighted response: {other}"),
+            }
+        }
+        assert_eq!(weighted_primary_hits, 2);
+        assert_eq!(weighted_secondary_hits, 4);
+
+        let (status, body) = proxy_get(
+            &client,
+            http_addr,
+            "/header",
+            "example.com",
+            &[(&http::header::HeaderName::from_static("x-deploy"), "canary")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "header-canary");
+
+        let (status, body) = proxy_get(&client, http_addr, "/header", "example.com", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "header-default");
+
+        let (status, body) = proxy_get(
+            &client,
+            http_addr,
+            "/cookie",
+            "example.com",
+            &[(&COOKIE, "deploy=canary")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "cookie-canary");
+
+        let (status, body) = proxy_get(&client, http_addr, "/cookie", "example.com", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "cookie-default");
+
+        state.shutdown.shutdown();
+        proxy_handle.abort();
+        weighted_primary_handle.abort();
+        weighted_secondary_handle.abort();
+        header_default_handle.abort();
+        header_canary_handle.abort();
+        cookie_default_handle.abort();
+        cookie_canary_handle.abort();
     }
 }
