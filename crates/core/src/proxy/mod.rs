@@ -24,6 +24,7 @@ use self::health::{HealthChecker, PassiveHealthChecker};
 use self::lb::*;
 use self::upstream::UpstreamPool;
 use crate::config::{LbPolicy, ProxyConfig};
+use crate::hoops::metrics::Metrics;
 use crate::{Body, ProxyError, goals};
 
 /// Reverse proxy handler: forwards requests to upstream backends with
@@ -31,6 +32,9 @@ use crate::{Body, ProxyError, goals};
 pub struct ReverseProxy {
     pool: Arc<UpstreamPool>,
     lb: Box<dyn LoadBalancer>,
+    metrics: Arc<Metrics>,
+    site_label: String,
+    route_label: String,
     headers_up: Vec<(String, String)>,
     headers_down: Vec<(String, String)>,
     retries: u32,
@@ -49,7 +53,12 @@ pub struct ReverseProxy {
 }
 
 impl ReverseProxy {
-    pub fn new(config: &ProxyConfig) -> Self {
+    pub fn new(
+        config: &ProxyConfig,
+        metrics: Arc<Metrics>,
+        site_label: String,
+        route_label: String,
+    ) -> Self {
         let pool = Arc::new(UpstreamPool::from_config(config));
 
         // Collect weights for weighted strategies.
@@ -124,6 +133,9 @@ impl ReverseProxy {
         Self {
             pool,
             lb,
+            metrics,
+            site_label,
+            route_label,
             headers_up,
             headers_down,
             retries: config.retries,
@@ -191,6 +203,12 @@ impl ReverseProxy {
                 .select(&self.pool, &ws_lb_ctx)
                 .ok_or(ProxyError::NoUpstream)?;
             let backend = &self.pool.backends[backend_idx];
+            self.metrics.record_backend_selection(
+                &self.site_label,
+                &self.route_label,
+                &backend.addr,
+                self.lb.name(),
+            );
             let _conn_guard = self.pool.acquire_conn(backend_idx);
 
             return websocket::proxy_websocket(request, &backend.addr).await;
@@ -258,6 +276,19 @@ impl ReverseProxy {
             };
 
             let backend = &self.pool.backends[backend_idx];
+            self.metrics.record_backend_selection(
+                &self.site_label,
+                &self.route_label,
+                &backend.addr,
+                self.lb.name(),
+            );
+            debug!(
+                lb_policy = self.lb.name(),
+                upstream = %backend.addr,
+                uri = %lb_ctx.uri,
+                attempt = attempt + 1,
+                "selected upstream backend"
+            );
 
             // --- Build the upstream request ---
             let mut req_parts = parts.clone();

@@ -28,6 +28,9 @@ pub struct LbContext {
 ///
 /// Implementations must be `Send + Sync` so they can be shared across tasks.
 pub trait LoadBalancer: Send + Sync {
+    /// Human-readable strategy name for tracing and diagnostics.
+    fn name(&self) -> &'static str;
+
     /// Choose a backend index.  Returns `None` when no backend is available.
     fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize>;
 }
@@ -56,6 +59,10 @@ impl RoundRobinLb {
 }
 
 impl LoadBalancer for RoundRobinLb {
+    fn name(&self) -> &'static str {
+        "round_robin"
+    }
+
     fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
         let n = pool.len();
         if n == 0 {
@@ -92,6 +99,10 @@ impl RandomLb {
 }
 
 impl LoadBalancer for RandomLb {
+    fn name(&self) -> &'static str {
+        "random"
+    }
+
     fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
         use rand::prelude::IndexedRandom;
 
@@ -140,6 +151,10 @@ impl WeightedRoundRobinLb {
 }
 
 impl LoadBalancer for WeightedRoundRobinLb {
+    fn name(&self) -> &'static str {
+        "weighted_round_robin"
+    }
+
     fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
         let mut entries = self.state.lock().ok()?;
         if entries.is_empty() {
@@ -191,6 +206,10 @@ impl IpHashLb {
 }
 
 impl LoadBalancer for IpHashLb {
+    fn name(&self) -> &'static str {
+        "ip_hash"
+    }
+
     fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
         let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
         if healthy.is_empty() {
@@ -221,6 +240,10 @@ impl LeastConnLb {
 }
 
 impl LoadBalancer for LeastConnLb {
+    fn name(&self) -> &'static str {
+        "least_conn"
+    }
+
     fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
         let mut best_idx: Option<usize> = None;
         let mut best_count = usize::MAX;
@@ -261,6 +284,10 @@ impl UriHashLb {
 }
 
 impl LoadBalancer for UriHashLb {
+    fn name(&self) -> &'static str {
+        "uri_hash"
+    }
+
     fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
         let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
         if healthy.is_empty() {
@@ -287,6 +314,10 @@ impl HeaderHashLb {
 }
 
 impl LoadBalancer for HeaderHashLb {
+    fn name(&self) -> &'static str {
+        "header_hash"
+    }
+
     fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
         let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
         if healthy.is_empty() {
@@ -320,6 +351,10 @@ impl CookieHashLb {
 }
 
 impl LoadBalancer for CookieHashLb {
+    fn name(&self) -> &'static str {
+        "cookie_hash"
+    }
+
     fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
         let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
         if healthy.is_empty() {
@@ -352,6 +387,10 @@ impl FirstLb {
 }
 
 impl LoadBalancer for FirstLb {
+    fn name(&self) -> &'static str {
+        "first"
+    }
+
     fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
         (0..pool.len()).find(|&i| pool.is_healthy(i))
     }
@@ -385,6 +424,10 @@ impl TwoRandomChoicesLb {
 }
 
 impl LoadBalancer for TwoRandomChoicesLb {
+    fn name(&self) -> &'static str {
+        "two_random_choices"
+    }
+
     fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
         use rand::prelude::IndexedRandom;
 
@@ -436,4 +479,70 @@ fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use http::HeaderValue;
+
+    use super::*;
+    use crate::config::{LbPolicy, ProxyConfig, UpstreamConfig};
+
+    fn proxy_config() -> ProxyConfig {
+        ProxyConfig {
+            upstreams: vec![
+                UpstreamConfig {
+                    addr: "127.0.0.1:3000".to_string(),
+                    weight: 100,
+                },
+                UpstreamConfig {
+                    addr: "127.0.0.1:3001".to_string(),
+                    weight: 100,
+                },
+            ],
+            lb: LbPolicy::RoundRobin,
+            lb_header: None,
+            lb_cookie: None,
+            health_check: None,
+            passive_health: None,
+            headers_up: HashMap::new(),
+            headers_down: HashMap::new(),
+            retries: 0,
+            dynamic_upstreams: None,
+            error_pages: HashMap::new(),
+            headers_up_replace: Vec::new(),
+            tls_skip_verify: false,
+            upstream_http2: false,
+            max_connections: None,
+            keepalive_timeout: None,
+            sanitize_uri: true,
+            srv_upstream: None,
+        }
+    }
+
+    #[test]
+    fn cookie_hash_falls_back_to_remaining_healthy_backend() {
+        let pool = UpstreamPool::from_config(&proxy_config());
+        pool.set_healthy(0, false);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            HeaderValue::from_static("deploy=canary"),
+        );
+
+        let ctx = LbContext {
+            client_addr: "127.0.0.1:1234".parse().unwrap(),
+            uri: "/api".to_string(),
+            headers,
+        };
+
+        let selected = CookieHashLb::new("deploy".to_string())
+            .select(&pool, &ctx)
+            .unwrap();
+
+        assert_eq!(selected, 1);
+    }
 }

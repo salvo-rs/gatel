@@ -10,26 +10,38 @@ use salvo::serve_static::StaticDir;
 use salvo::timeout::Timeout;
 use salvo::trailing_slash::{TrailingSlash, TrailingSlashAction};
 use salvo::{Depot, FlowCtrl, Handler, Request, Response, Router, Service, async_trait};
+use tracing::debug;
 
 use crate::config::{
     AppConfig, HandlerConfig, HoopConfig, RouteCondition, RouteConfig, SiteConfig,
 };
+use crate::hoops::metrics::{Metrics, MetricsHoop};
 use crate::plugin::ModuleRegistry;
 use crate::router::matcher::{RequestMatcher, path_matches, pattern_specificity};
 
-pub fn build_service(config: &AppConfig, modules: &ModuleRegistry) -> Service {
-    Service::new(build_router(config, modules)).hoop(Logger::new())
+pub fn build_service(
+    config: &AppConfig,
+    modules: &ModuleRegistry,
+    metrics: Arc<Metrics>,
+) -> Service {
+    Service::new(build_router(config, modules, &metrics))
+        .hoop(MetricsHoop::new(metrics))
+        .hoop(Logger::new())
 }
 
-fn build_router(config: &AppConfig, modules: &ModuleRegistry) -> Router {
+fn build_router(config: &AppConfig, modules: &ModuleRegistry, metrics: &Arc<Metrics>) -> Router {
     let mut root = Router::new();
     for site in &config.sites {
-        root = root.push(build_site_router(site, modules));
+        root = root.push(build_site_router(site, modules, metrics));
     }
     root
 }
 
-fn build_site_router(site: &SiteConfig, modules: &ModuleRegistry) -> Router {
+fn build_site_router(
+    site: &SiteConfig,
+    modules: &ModuleRegistry,
+    metrics: &Arc<Metrics>,
+) -> Router {
     let mut site_router = if site.host == "*" {
         Router::new()
     } else {
@@ -45,19 +57,39 @@ fn build_site_router(site: &SiteConfig, modules: &ModuleRegistry) -> Router {
     });
 
     for (_, route) in routes {
-        site_router = site_router.push(build_route_router(route, modules));
+        site_router = site_router.push(build_route_router(
+            &site.host,
+            route,
+            modules,
+            Arc::clone(metrics),
+        ));
     }
     site_router
 }
 
-fn build_route_router(route: &RouteConfig, modules: &ModuleRegistry) -> Router {
+fn build_route_router(
+    site_host: &str,
+    route: &RouteConfig,
+    modules: &ModuleRegistry,
+    metrics: Arc<Metrics>,
+) -> Router {
     let mut router = Router::with_path("{**gatel_rest}");
 
+    let site_host = site_host.to_string();
+    let route_site_host = site_host.clone();
     let route_path = route.path.clone();
     let matchers = route.matchers.clone();
     let condition = route.condition.clone();
+    let route_metrics = Arc::clone(&metrics);
     router = router.filter_fn(move |req, _| {
-        route_matches_request(&route_path, &matchers, condition.as_ref(), req)
+        route_matches_request(
+            &route_site_host,
+            &route_path,
+            &matchers,
+            condition.as_ref(),
+            req,
+            &route_metrics,
+        )
     });
 
     // Hoop each middleware individually onto the router.
@@ -284,14 +316,19 @@ fn build_route_router(route: &RouteConfig, modules: &ModuleRegistry) -> Router {
             router.goal(handler)
         }
         HandlerConfig::Redirect { to, permanent } => router.goal(RedirectGoal {
-            target: to.clone(),
+            target_template: to.clone(),
             permanent: *permanent,
         }),
         HandlerConfig::Respond { status, body } => router.goal(RespondGoal {
             status: *status,
             body: body.clone(),
         }),
-        HandlerConfig::Proxy(proxy_cfg) => router.goal(crate::proxy::ReverseProxy::new(proxy_cfg)),
+        HandlerConfig::Proxy(proxy_cfg) => router.goal(crate::proxy::ReverseProxy::new(
+            proxy_cfg,
+            Arc::clone(&metrics),
+            site_host,
+            route.path.clone(),
+        )),
         HandlerConfig::FastCgi(cfg) => router.goal(crate::proxy::fastcgi::FastCgiTransport::new(
             cfg.addr.clone(),
             cfg.script_root.clone(),
@@ -372,10 +409,12 @@ fn site_matches(site_host: &str, req: &Request) -> bool {
 }
 
 fn route_matches_request(
+    site_host: &str,
     route_path: &str,
     matchers: &[RequestMatcher],
     condition: Option<&RouteCondition>,
     req: &Request,
+    metrics: &Metrics,
 ) -> bool {
     let request = request_for_matching(req);
     if !path_matches(route_path, request.uri().path()) {
@@ -396,8 +435,28 @@ fn route_matches_request(
     }
 
     if let Some(condition) = condition {
-        evaluate_condition(condition, &request, client_addr)
+        let matched = evaluate_condition(condition, &request, client_addr);
+        if matched {
+            metrics.record_route_match(site_host, route_path);
+            debug!(
+                route = route_path,
+                request_path = request.uri().path(),
+                host = %extract_host(req),
+                matchers = ?describe_matchers(matchers),
+                condition = %describe_condition(condition),
+                "route matched request"
+            );
+        }
+        matched
     } else {
+        metrics.record_route_match(site_host, route_path);
+        debug!(
+            route = route_path,
+            request_path = request.uri().path(),
+            host = %extract_host(req),
+            matchers = ?describe_matchers(matchers),
+            "route matched request"
+        );
         true
     }
 }
@@ -462,6 +521,54 @@ fn unknown_client_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([0, 0, 0, 0], 0))
 }
 
+fn describe_matchers(matchers: &[RequestMatcher]) -> Vec<String> {
+    matchers.iter().map(describe_matcher).collect()
+}
+
+fn describe_matcher(matcher: &RequestMatcher) -> String {
+    match matcher {
+        RequestMatcher::Path(path) => format!("path={path}"),
+        RequestMatcher::Method(methods) => format!("method={}", methods.join(",")),
+        RequestMatcher::Header { name, pattern } => format!("header:{name}={pattern}"),
+        RequestMatcher::HeaderRegex { name, regex } => format!("header_regex:{name}={regex}"),
+        RequestMatcher::Cookie { name, pattern } => format!("cookie:{name}={pattern}"),
+        RequestMatcher::Query { key, value } => match value {
+            Some(value) => format!("query:{key}={value}"),
+            None => format!("query:{key}=*"),
+        },
+        RequestMatcher::RemoteIp(cidrs) => format!("remote_ip={}", cidrs.join(",")),
+        RequestMatcher::Protocol(protocol) => format!("protocol={protocol}"),
+        RequestMatcher::Expression(expr) => format!("expr={expr}"),
+        RequestMatcher::Not(inner) => format!("not({})", describe_matcher(inner)),
+        RequestMatcher::And(matchers) => format!(
+            "and({})",
+            matchers
+                .iter()
+                .map(describe_matcher)
+                .collect::<Vec<_>>()
+                .join(";")
+        ),
+        RequestMatcher::Or(matchers) => format!(
+            "or({})",
+            matchers
+                .iter()
+                .map(describe_matcher)
+                .collect::<Vec<_>>()
+                .join(";")
+        ),
+        RequestMatcher::Language(langs) => format!("language={}", langs.join(",")),
+    }
+}
+
+fn describe_condition(condition: &RouteCondition) -> String {
+    match condition {
+        RouteCondition::RemoteIp(cidrs) => format!("remote_ip in {}", cidrs.join(",")),
+        RouteCondition::NotRemoteIp(cidrs) => format!("remote_ip not_in {}", cidrs.join(",")),
+        RouteCondition::Header { name, value } => format!("header:{name}={value}"),
+        RouteCondition::NotHeader { name, value } => format!("header:{name}!={value}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wrapper for Arc<dyn salvo::Handler>
 // ---------------------------------------------------------------------------
@@ -486,7 +593,7 @@ impl Handler for SalvoHandlerArc {
 // ---------------------------------------------------------------------------
 
 struct RedirectGoal {
-    target: String,
+    target_template: String,
     permanent: bool,
 }
 
@@ -494,7 +601,7 @@ struct RedirectGoal {
 impl Handler for RedirectGoal {
     async fn handle(
         &self,
-        _req: &mut Request,
+        req: &mut Request,
         _depot: &mut Depot,
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
@@ -504,8 +611,22 @@ impl Handler for RedirectGoal {
         } else {
             salvo::http::StatusCode::TEMPORARY_REDIRECT
         };
+        let path = req.uri().path();
+        let query = req.uri().query().unwrap_or("");
+        let query_suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{query}")
+        };
+        let scheme = req.uri().scheme_str().unwrap_or("http");
+        let location = self
+            .target_template
+            .replace("{scheme}", scheme)
+            .replace("{path}", path)
+            .replace("{query_suffix}", &query_suffix)
+            .replace("{query}", query);
         res.status_code(status);
-        let _ = res.add_header("Location", self.target.clone(), true);
+        let _ = res.add_header("Location", location, true);
     }
 }
 

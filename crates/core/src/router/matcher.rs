@@ -64,7 +64,7 @@ pub fn pattern_specificity(pattern: &str) -> usize {
 
 /// A composable request matcher that can test various aspects of an incoming
 /// HTTP request.  Matchers can be combined with `And`, `Or`, and `Not`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum RequestMatcher {
     /// Match the request path using glob-style patterns.
     Path(String),
@@ -74,6 +74,8 @@ pub enum RequestMatcher {
     Header { name: String, pattern: String },
     /// Match a header value with regex-like glob pattern.
     HeaderRegex { name: String, regex: String },
+    /// Match a cookie value with glob pattern.
+    Cookie { name: String, pattern: String },
     /// Match a query parameter.  If `value` is `None`, just check presence.
     Query { key: String, value: Option<String> },
     /// Match client IP against CIDR ranges (e.g. `["192.168.0.0/16", "10.0.0.0/8"]`).
@@ -130,6 +132,10 @@ impl RequestMatcher {
                     false
                 }
             }
+
+            RequestMatcher::Cookie { name, pattern } => extract_cookie(req.headers(), name)
+                .map(|value| glob_matches(pattern, &value))
+                .unwrap_or(false),
 
             RequestMatcher::Query { key, value } => {
                 let query_str = req.uri().query().unwrap_or("");
@@ -188,6 +194,23 @@ impl RequestMatcher {
 // ---------------------------------------------------------------------------
 // Query parameter matching
 // ---------------------------------------------------------------------------
+
+fn extract_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    for value in headers.get_all(http::header::COOKIE) {
+        let Ok(cookie_str) = value.to_str() else {
+            continue;
+        };
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            if let Some((key, value)) = pair.split_once('=')
+                && key.trim() == name
+            {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
 
 /// Check if a query string contains a parameter with the given key
 /// (and optionally value).
@@ -489,6 +512,28 @@ mod tests {
         let matcher = RequestMatcher::Query {
             key: "missing".into(),
             value: None,
+        };
+        assert!(!matcher.matches(&req, addr));
+    }
+
+    #[test]
+    fn test_request_matcher_cookie() {
+        let req = http::Request::builder()
+            .uri("/test")
+            .header(http::header::COOKIE, "deploy=canary; session=abc123")
+            .body(crate::empty_body())
+            .unwrap();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let matcher = RequestMatcher::Cookie {
+            name: "deploy".into(),
+            pattern: "can*".into(),
+        };
+        assert!(matcher.matches(&req, addr));
+
+        let matcher = RequestMatcher::Cookie {
+            name: "deploy".into(),
+            pattern: "stable".into(),
         };
         assert!(!matcher.matches(&req, addr));
     }

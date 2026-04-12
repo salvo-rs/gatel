@@ -13,6 +13,10 @@ use gatel_core::server::{self, AppState};
 use gatel_core::tls::TlsManager;
 use tracing::{error, info, warn};
 
+fn config_has_tls(config: &gatel_core::config::AppConfig) -> bool {
+    config.tls.is_some() || config.sites.iter().any(|site| site.tls.is_some())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
@@ -82,7 +86,7 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
             );
 
             // Build TlsManager if TLS is configured.
-            let tls_manager = if config.tls.is_some() {
+            let tls_manager = if config_has_tls(&config) {
                 match TlsManager::build(&config).await {
                     Ok(mgr) => {
                         info!(
@@ -297,7 +301,9 @@ async fn reload_config(state: &AppState, config_path: &str) {
         }
     };
 
-    state.reload(new_config).await;
+    if let Err(e) = state.reload(new_config).await {
+        error!("failed to apply reloaded configuration: {e}");
+    }
     gatel_core::sd_notify::sd_notify("READY=1");
 }
 

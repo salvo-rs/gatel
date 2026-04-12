@@ -50,6 +50,12 @@ pub struct GlobalConfig {
     /// requests must include `Authorization: Bearer <token>`.
     #[serde(skip_serializing)]
     pub admin_auth_token: Option<String>,
+    /// Optional bearer token for read-only admin API access.
+    #[serde(skip_serializing)]
+    pub admin_read_token: Option<String>,
+    /// Optional bearer token for mutating admin API access.
+    #[serde(skip_serializing)]
+    pub admin_write_token: Option<String>,
 }
 
 impl Default for GlobalConfig {
@@ -71,6 +77,8 @@ impl Default for GlobalConfig {
             otlp_endpoint: None,
             otlp_service_name: None,
             admin_auth_token: None,
+            admin_read_token: None,
+            admin_write_token: None,
         }
     }
 }
@@ -170,7 +178,7 @@ pub enum ChallengeType {
 }
 
 /// Per-site TLS override (manual cert).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct SiteTlsConfig {
     pub cert: String,
     pub key: String,
@@ -515,7 +523,7 @@ pub struct UpstreamConfig {
     pub weight: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LbPolicy {
     #[default]
     RoundRobin,
