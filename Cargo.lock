@@ -1121,7 +1121,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "kdl",
- "password-hash 0.6.0",
+ "password-hash 0.6.1",
  "pbkdf2",
  "pin-project-lite",
  "quinn",
@@ -2271,9 +2271,9 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccbd25f71dd5249dba9ed843d52500c8757a25511560d01a94f4abf56b52a1d5"
+checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 
 [[package]]
 name = "path-slash"
