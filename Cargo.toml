@@ -95,7 +95,7 @@ opentelemetry_sdk = { version = "0.31", features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.32"
 hickory-resolver = { version = "0.25", features = ["tokio"] }
-salvo = { version = "0.91", default-features = false, features = [
+salvo = { version = "0.92", default-features = false, features = [
     "fix-http1-request-uri",
     "logging",
     "serve-static",
