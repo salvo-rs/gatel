@@ -631,51 +631,6 @@ impl ReverseProxy {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use http::header::{CONNECTION, PROXY_AUTHENTICATE, TE, TRANSFER_ENCODING, UPGRADE};
-
-    use super::*;
-
-    #[test]
-    fn strip_hop_by_hop_headers_removes_standard_and_connection_named_headers() {
-        let mut headers = HeaderMap::new();
-        let keep_alive = HeaderName::from_static("keep-alive");
-        headers.insert(CONNECTION, "keep-alive, x-smuggled".parse().unwrap());
-        headers.insert(keep_alive.clone(), "timeout=5".parse().unwrap());
-        headers.insert(PROXY_AUTHENTICATE, "Basic realm=test".parse().unwrap());
-        headers.insert(TE, "trailers".parse().unwrap());
-        headers.insert(TRANSFER_ENCODING, "chunked".parse().unwrap());
-        headers.insert(UPGRADE, "websocket".parse().unwrap());
-        headers.insert("x-smuggled", "secret".parse().unwrap());
-        headers.insert("x-end-to-end", "ok".parse().unwrap());
-
-        strip_hop_by_hop_headers(&mut headers);
-
-        assert!(!headers.contains_key(CONNECTION));
-        assert!(!headers.contains_key(keep_alive));
-        assert!(!headers.contains_key(PROXY_AUTHENTICATE));
-        assert!(!headers.contains_key(TE));
-        assert!(!headers.contains_key(TRANSFER_ENCODING));
-        assert!(!headers.contains_key(UPGRADE));
-        assert!(!headers.contains_key("x-smuggled"));
-        assert_eq!(headers.get("x-end-to-end").unwrap(), "ok");
-    }
-
-    #[test]
-    fn connection_header_names_reads_all_connection_headers() {
-        let mut headers = HeaderMap::new();
-        headers.append(CONNECTION, "keep-alive".parse().unwrap());
-        headers.append(CONNECTION, "x-one, x-two".parse().unwrap());
-
-        let names = connection_header_names(&headers);
-
-        assert!(names.iter().any(|name| name == "keep-alive"));
-        assert!(names.iter().any(|name| name == "x-one"));
-        assert!(names.iter().any(|name| name == "x-two"));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // URI sanitization helpers
 // ---------------------------------------------------------------------------
@@ -746,4 +701,49 @@ async fn send_via_unix(
         .send_request(request)
         .await
         .map_err(ProxyError::Hyper)
+}
+
+#[cfg(test)]
+mod tests {
+    use http::header::{CONNECTION, PROXY_AUTHENTICATE, TE, TRANSFER_ENCODING, UPGRADE};
+
+    use super::*;
+
+    #[test]
+    fn strip_hop_by_hop_headers_removes_standard_and_connection_named_headers() {
+        let mut headers = HeaderMap::new();
+        let keep_alive = HeaderName::from_static("keep-alive");
+        headers.insert(CONNECTION, "keep-alive, x-smuggled".parse().unwrap());
+        headers.insert(keep_alive.clone(), "timeout=5".parse().unwrap());
+        headers.insert(PROXY_AUTHENTICATE, "Basic realm=test".parse().unwrap());
+        headers.insert(TE, "trailers".parse().unwrap());
+        headers.insert(TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert(UPGRADE, "websocket".parse().unwrap());
+        headers.insert("x-smuggled", "secret".parse().unwrap());
+        headers.insert("x-end-to-end", "ok".parse().unwrap());
+
+        strip_hop_by_hop_headers(&mut headers);
+
+        assert!(!headers.contains_key(CONNECTION));
+        assert!(!headers.contains_key(keep_alive));
+        assert!(!headers.contains_key(PROXY_AUTHENTICATE));
+        assert!(!headers.contains_key(TE));
+        assert!(!headers.contains_key(TRANSFER_ENCODING));
+        assert!(!headers.contains_key(UPGRADE));
+        assert!(!headers.contains_key("x-smuggled"));
+        assert_eq!(headers.get("x-end-to-end").unwrap(), "ok");
+    }
+
+    #[test]
+    fn connection_header_names_reads_all_connection_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(CONNECTION, "keep-alive".parse().unwrap());
+        headers.append(CONNECTION, "x-one, x-two".parse().unwrap());
+
+        let names = connection_header_names(&headers);
+
+        assert!(names.iter().any(|name| name == "keep-alive"));
+        assert!(names.iter().any(|name| name == "x-one"));
+        assert!(names.iter().any(|name| name == "x-two"));
+    }
 }
