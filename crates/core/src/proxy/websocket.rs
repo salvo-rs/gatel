@@ -14,6 +14,7 @@ use tracing::{debug, error, warn};
 
 use super::activity::BackendActivityGuard;
 use super::upstream::ConnGuard;
+use super::{connection_header_names, is_hop_by_hop_header};
 use crate::{Body, ProxyError, empty_body, websocket};
 
 /// Check whether an incoming request is a WebSocket upgrade.
@@ -183,10 +184,12 @@ fn build_raw_upgrade_request<B>(req: &Request<B>, upstream_addr: &str) -> String
 
     let mut raw = format!("{method} {path} HTTP/1.1\r\n");
     raw.push_str(&format!("Host: {upstream_addr}\r\n"));
+    raw.push_str("Connection: Upgrade\r\n");
+    raw.push_str("Upgrade: websocket\r\n");
 
+    let connection_named_headers = connection_header_names(req.headers());
     for (name, value) in req.headers() {
-        // Skip the Host header since we already set it to the upstream.
-        if name == http::header::HOST {
+        if !should_forward_raw_upgrade_header(name, &connection_named_headers) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -196,4 +199,51 @@ fn build_raw_upgrade_request<B>(req: &Request<B>, upstream_addr: &str) -> String
 
     raw.push_str("\r\n");
     raw
+}
+
+fn should_forward_raw_upgrade_header(
+    name: &http::HeaderName,
+    connection_named_headers: &[http::HeaderName],
+) -> bool {
+    name != http::header::HOST
+        && name != http::header::CONNECTION
+        && name != http::header::UPGRADE
+        && !is_hop_by_hop_header(name)
+        && !connection_named_headers.iter().any(|header| header == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use http::header::{CONNECTION, HOST, UPGRADE};
+
+    use super::*;
+
+    #[test]
+    fn build_raw_upgrade_request_normalizes_upgrade_headers() {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/socket?room=1")
+            .body(())
+            .unwrap();
+        let headers = req.headers_mut();
+        headers.insert(HOST, "client.example".parse().unwrap());
+        headers.append(CONNECTION, "keep-alive, x-smuggled".parse().unwrap());
+        headers.append(CONNECTION, "Upgrade".parse().unwrap());
+        headers.insert(UPGRADE, "websocket".parse().unwrap());
+        headers.insert("x-smuggled", "secret".parse().unwrap());
+        headers.insert("sec-websocket-version", "13".parse().unwrap());
+        headers.insert("sec-websocket-key", "test-key".parse().unwrap());
+
+        let raw = build_raw_upgrade_request(&req, "127.0.0.1:3000");
+
+        assert!(raw.starts_with("GET /socket?room=1 HTTP/1.1\r\n"));
+        assert!(raw.contains("Host: 127.0.0.1:3000\r\n"));
+        assert!(raw.contains("Connection: Upgrade\r\n"));
+        assert!(raw.contains("Upgrade: websocket\r\n"));
+        assert!(!raw.contains("client.example"));
+        assert!(!raw.contains("Connection: keep-alive"));
+        assert!(!raw.contains("x-smuggled"));
+        assert!(raw.contains("sec-websocket-version: 13\r\n"));
+        assert!(raw.contains("sec-websocket-key: test-key\r\n"));
+    }
 }

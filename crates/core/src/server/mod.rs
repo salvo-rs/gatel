@@ -1045,6 +1045,102 @@ mod tests {
         (format!("127.0.0.1:{}", addr.port()), release, handle)
     }
 
+    async fn spawn_websocket_echo_backend() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request_head = read_http_head(&mut stream).await;
+            let request_head = String::from_utf8_lossy(&request_head);
+            assert!(request_head.contains("Connection: Upgrade\r\n"));
+            assert!(request_head.contains("Upgrade: websocket\r\n"));
+            assert!(!request_head.to_ascii_lowercase().contains("x-smuggled"));
+            assert!(!request_head.contains("Connection: keep-alive"));
+
+            let response = concat!(
+                "HTTP/1.1 101 Switching Protocols\r\n",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n",
+                "\r\n",
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let text = read_masked_text_frame(&mut stream).await;
+            write_unmasked_text_frame(&mut stream, &text).await;
+        });
+        (format!("127.0.0.1:{}", addr.port()), handle)
+    }
+
+    async fn read_http_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut buffer = [0; 1024];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0, "connection closed before HTTP headers completed");
+            response.extend_from_slice(&buffer[..read]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                return response;
+            }
+        }
+    }
+
+    async fn write_masked_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
+        let mask = [1, 2, 3, 4];
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126);
+        let mut frame = Vec::with_capacity(6 + payload.len());
+        frame.push(0x81);
+        frame.push(0x80 | payload.len() as u8);
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[index % mask.len()]);
+        }
+        stream.write_all(&frame).await.unwrap();
+    }
+
+    async fn read_masked_text_frame(stream: &mut tokio::net::TcpStream) -> String {
+        let mut head = [0; 2];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[0], 0x81);
+        assert_eq!(head[1] & 0x80, 0x80);
+        let len = (head[1] & 0x7f) as usize;
+        assert!(len < 126);
+        let mut mask = [0; 4];
+        stream.read_exact(&mut mask).await.unwrap();
+        let mut payload = vec![0; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+        String::from_utf8(payload).unwrap()
+    }
+
+    async fn write_unmasked_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126);
+        stream
+            .write_all(&[0x81, payload.len() as u8])
+            .await
+            .unwrap();
+        stream.write_all(payload).await.unwrap();
+    }
+
+    async fn read_unmasked_text_frame(stream: &mut tokio::net::TcpStream) -> String {
+        let mut head = [0; 2];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[0], 0x81);
+        assert_eq!(head[1] & 0x80, 0);
+        let len = (head[1] & 0x7f) as usize;
+        assert!(len < 126);
+        let mut payload = vec![0; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        String::from_utf8(payload).unwrap()
+    }
+
     async fn free_http_addr() -> std::net::SocketAddr {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1372,6 +1468,52 @@ mod tests {
         state.shutdown.shutdown();
         proxy_handle.abort();
         backend_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_proxy_tunnels_split_connection_header_upgrade() {
+        let (backend_addr, backend_handle) = spawn_websocket_echo_backend().await;
+        let (state, http_addr, proxy_handle) = spawn_proxy().await;
+
+        let mut service = runtime_service(
+            backend_addr,
+            RuntimeTargetState::Active,
+            Duration::from_secs(1),
+        );
+        service.routes[0].hosts.clear();
+        state
+            .mutate_runtime_state(|runtime| runtime.upsert_service(service, None))
+            .await
+            .unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(http_addr).await.unwrap();
+        let request = concat!(
+            "GET /api/ws HTTP/1.1\r\n",
+            "Host: example.com\r\n",
+            "Connection: keep-alive, x-smuggled\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "X-Smuggled: should-not-forward\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n",
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let response_head = read_http_head(&mut stream).await;
+        let response_head = String::from_utf8_lossy(&response_head);
+        assert!(
+            response_head.starts_with("HTTP/1.1 101"),
+            "unexpected websocket handshake response: {response_head}"
+        );
+
+        write_masked_text_frame(&mut stream, "proxied websocket").await;
+        let echoed = read_unmasked_text_frame(&mut stream).await;
+        assert_eq!(echoed, "proxied websocket");
+
+        state.shutdown.shutdown();
+        proxy_handle.abort();
+        backend_handle.await.unwrap();
     }
 
     #[tokio::test]
