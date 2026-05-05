@@ -11,4 +11,4 @@
 
 ## Follow-up review findings
 
-- [ ] Dynamic DNS/SRV upstreams are parsed and documented, but the current `UpstreamPool` selection path is static. This needs a separate design that reconciles dynamic backend snapshots with health checks, connection counters, weighted policies, and retries.
+- [x] Dynamic DNS/SRV upstreams are parsed and documented, but the current `UpstreamPool` selection path is static. This needs a separate design that reconciles dynamic backend snapshots with health checks, connection counters, weighted policies, and retries.

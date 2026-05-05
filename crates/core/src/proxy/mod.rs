@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 use self::activity::{BackendActivityGuard, BackendActivityTracker};
 use self::health::{HealthChecker, PassiveHealthChecker};
 use self::lb::*;
-use self::upstream::{ConnGuard, UpstreamPool};
+use self::upstream::{BackendSnapshot, ConnGuard, UpstreamPool};
 use crate::config::{LbPolicy, ProxyConfig};
 use crate::hoops::metrics::Metrics;
 use crate::{Body, ProxyError, goals};
@@ -289,22 +289,30 @@ impl ReverseProxy {
                 headers: request.headers().clone(),
             };
 
+            let snapshot = self.pool.snapshot();
             let backend_idx = self
-                .lb
-                .select(&self.pool, &ws_lb_ctx)
+                .select_backend(&snapshot, &ws_lb_ctx, None)
                 .ok_or(ProxyError::NoUpstream)?;
-            let backend = &self.pool.backends[backend_idx];
-            let activity_key = backend.activity_key.as_deref().unwrap_or(&backend.addr);
+            let backend = snapshot
+                .get(backend_idx)
+                .cloned()
+                .ok_or(ProxyError::NoUpstream)?;
+            let backend_addr = backend.backend.addr.clone();
+            let activity_key = backend
+                .backend
+                .activity_key
+                .clone()
+                .unwrap_or_else(|| backend_addr.clone());
             self.metrics.record_backend_selection(
                 &self.site_label,
                 &self.route_label,
-                &backend.addr,
+                &backend_addr,
                 self.lb.name(),
             );
-            let conn_guard = self.pool.acquire_conn(backend_idx);
+            let conn_guard = backend.acquire_conn();
             let activity_guard = self.backend_activity.acquire(activity_key);
 
-            return websocket::proxy_websocket(request, &backend.addr, conn_guard, activity_guard)
+            return websocket::proxy_websocket(request, &backend_addr, conn_guard, activity_guard)
                 .await;
         }
 
@@ -321,7 +329,8 @@ impl ReverseProxy {
 
         // --- Connection limit check ---
         if let Some(max_conns) = self.pool.max_connections {
-            let total = self.pool.total_active_conns();
+            let snapshot = self.pool.snapshot();
+            let total = snapshot.total_active_conns();
             if total >= max_conns {
                 warn!(
                     limit = max_conns,
@@ -352,22 +361,13 @@ impl ReverseProxy {
             .to_bytes();
 
         let max_attempts = 1 + self.retries;
-        let mut last_failed_idx: Option<usize> = None;
+        let mut last_failed_addr: Option<String> = None;
         let mut last_error: Option<ProxyError> = None;
 
         for attempt in 0..max_attempts {
             // --- Select a backend ---
-            let backend_idx = {
-                let idx = self.lb.select(&self.pool, &lb_ctx);
-                match idx {
-                    Some(i) if last_failed_idx == Some(i) && self.pool.len() > 1 => {
-                        // On retry, try to skip the backend that just failed.
-                        self.lb.select(&self.pool, &lb_ctx)
-                    }
-                    other => other,
-                }
-            };
-
+            let snapshot = self.pool.snapshot();
+            let backend_idx = self.select_backend(&snapshot, &lb_ctx, last_failed_addr.as_deref());
             let backend_idx = match backend_idx {
                 Some(i) => i,
                 None => {
@@ -375,17 +375,25 @@ impl ReverseProxy {
                 }
             };
 
-            let backend = &self.pool.backends[backend_idx];
-            let activity_key = backend.activity_key.as_deref().unwrap_or(&backend.addr);
+            let backend = snapshot
+                .get(backend_idx)
+                .cloned()
+                .ok_or(ProxyError::NoUpstream)?;
+            let backend_addr = backend.backend.addr.clone();
+            let activity_key = backend
+                .backend
+                .activity_key
+                .clone()
+                .unwrap_or_else(|| backend_addr.clone());
             self.metrics.record_backend_selection(
                 &self.site_label,
                 &self.route_label,
-                &backend.addr,
+                &backend_addr,
                 self.lb.name(),
             );
             debug!(
                 lb_policy = self.lb.name(),
-                upstream = %backend.addr,
+                upstream = %backend_addr,
                 uri = %lb_ctx.uri,
                 attempt = attempt + 1,
                 "selected upstream backend"
@@ -393,25 +401,25 @@ impl ReverseProxy {
 
             // --- Build the upstream request ---
             let mut req_parts = parts.clone();
-            self.prepare_upstream_parts(&mut req_parts, &backend.addr, client_addr)?;
+            self.prepare_upstream_parts(&mut req_parts, &backend_addr, client_addr)?;
 
             // Replay body from the buffered bytes.
             let req_body = crate::full_body(body_bytes.clone());
             let upstream_req = Request::from_parts(req_parts, req_body);
 
             debug!(
-                upstream = %backend.addr,
+                upstream = %backend_addr,
                 attempt = attempt + 1,
                 "forwarding request"
             );
 
             // --- Track active connections ---
-            let conn_guard = self.pool.acquire_conn(backend_idx);
+            let conn_guard = backend.acquire_conn();
             let activity_guard = self.backend_activity.acquire(activity_key);
 
             // --- Send the request ---
             let result = self
-                .send_upstream_request(&backend.addr, upstream_req)
+                .send_upstream_request(&backend_addr, upstream_req)
                 .await;
 
             match result {
@@ -423,21 +431,21 @@ impl ReverseProxy {
                     if resp_parts.status.is_server_error()
                         && let Some(ref ph) = self.passive_health
                     {
-                        ph.record_failure(backend_idx, &self.pool).await;
+                        ph.record_failure(&backend).await;
                     }
 
                     // If server error and we have retries left, retry.
                     if resp_parts.status.is_server_error() && attempt + 1 < max_attempts {
                         warn!(
-                            upstream = %backend.addr,
+                            upstream = %backend_addr,
                             status = %resp_parts.status,
                             attempt = attempt + 1,
                             "upstream returned server error, retrying"
                         );
-                        last_failed_idx = Some(backend_idx);
+                        last_failed_addr = Some(backend_addr.clone());
                         last_error = Some(ProxyError::Internal(format!(
                             "upstream {} returned {}",
-                            backend.addr, resp_parts.status
+                            backend_addr, resp_parts.status
                         )));
                         continue;
                     }
@@ -460,7 +468,8 @@ impl ReverseProxy {
 
                     // Passive health recovery check.
                     if let Some(ref ph) = self.passive_health {
-                        ph.maybe_recover(&self.pool).await;
+                        let recovery_snapshot = self.pool.snapshot();
+                        ph.maybe_recover(&recovery_snapshot).await;
                     }
 
                     // Error page interception: if the upstream status code has a
@@ -489,17 +498,17 @@ impl ReverseProxy {
                 Err(e) => {
                     // Passive health: record connection failure as well.
                     if let Some(ref ph) = self.passive_health {
-                        ph.record_failure(backend_idx, &self.pool).await;
+                        ph.record_failure(&backend).await;
                     }
 
                     if attempt + 1 < max_attempts {
                         warn!(
-                            upstream = %backend.addr,
+                            upstream = %backend_addr,
                             error = %e,
                             attempt = attempt + 1,
                             "upstream request failed, retrying"
                         );
-                        last_failed_idx = Some(backend_idx);
+                        last_failed_addr = Some(backend_addr);
                         last_error = Some(e);
                         continue;
                     }
@@ -513,46 +522,83 @@ impl ReverseProxy {
         Err(last_error.unwrap_or(ProxyError::NoUpstream))
     }
 
+    fn select_backend(
+        &self,
+        snapshot: &BackendSnapshot,
+        lb_ctx: &LbContext,
+        avoid_addr: Option<&str>,
+    ) -> Option<usize> {
+        let selected = self.lb.select(snapshot, lb_ctx);
+        let Some(avoid_addr) = avoid_addr else {
+            return selected;
+        };
+        let selected_idx = selected?;
+        let selected_is_avoided = snapshot
+            .get(selected_idx)
+            .map(|entry| entry.backend.addr == avoid_addr)
+            .unwrap_or(false);
+
+        if selected_is_avoided && snapshot.len() > 1 {
+            snapshot
+                .entries()
+                .iter()
+                .enumerate()
+                .find(|(_, entry)| entry.is_healthy() && entry.backend.addr != avoid_addr)
+                .map(|(idx, _)| idx)
+                .or(selected)
+        } else {
+            selected
+        }
+    }
+
     async fn proxy_without_retries(
         &self,
         request: Request<Body>,
         lb_ctx: &LbContext,
         client_addr: std::net::SocketAddr,
     ) -> Result<Response<Body>, ProxyError> {
+        let snapshot = self.pool.snapshot();
         let backend_idx = self
-            .lb
-            .select(&self.pool, lb_ctx)
+            .select_backend(&snapshot, lb_ctx, None)
             .ok_or(ProxyError::NoUpstream)?;
-        let backend = &self.pool.backends[backend_idx];
-        let activity_key = backend.activity_key.as_deref().unwrap_or(&backend.addr);
+        let backend = snapshot
+            .get(backend_idx)
+            .cloned()
+            .ok_or(ProxyError::NoUpstream)?;
+        let backend_addr = backend.backend.addr.clone();
+        let activity_key = backend
+            .backend
+            .activity_key
+            .clone()
+            .unwrap_or_else(|| backend_addr.clone());
         self.metrics.record_backend_selection(
             &self.site_label,
             &self.route_label,
-            &backend.addr,
+            &backend_addr,
             self.lb.name(),
         );
         debug!(
             lb_policy = self.lb.name(),
-            upstream = %backend.addr,
+            upstream = %backend_addr,
             uri = %lb_ctx.uri,
             attempt = 1,
             "selected upstream backend"
         );
 
         let (mut req_parts, req_body) = request.into_parts();
-        self.prepare_upstream_parts(&mut req_parts, &backend.addr, client_addr)?;
+        self.prepare_upstream_parts(&mut req_parts, &backend_addr, client_addr)?;
         let upstream_req = Request::from_parts(req_parts, req_body);
 
-        let conn_guard = self.pool.acquire_conn(backend_idx);
+        let conn_guard = backend.acquire_conn();
         let activity_guard = self.backend_activity.acquire(activity_key);
         let resp = match self
-            .send_upstream_request(&backend.addr, upstream_req)
+            .send_upstream_request(&backend_addr, upstream_req)
             .await
         {
             Ok(resp) => resp,
             Err(e) => {
                 if let Some(ref ph) = self.passive_health {
-                    ph.record_failure(backend_idx, &self.pool).await;
+                    ph.record_failure(&backend).await;
                 }
                 return Err(e);
             }
@@ -564,7 +610,7 @@ impl ReverseProxy {
         if resp_parts.status.is_server_error()
             && let Some(ref ph) = self.passive_health
         {
-            ph.record_failure(backend_idx, &self.pool).await;
+            ph.record_failure(&backend).await;
         }
 
         for (name, value) in &self.headers_down {
@@ -581,7 +627,8 @@ impl ReverseProxy {
         }
 
         if let Some(ref ph) = self.passive_health {
-            ph.maybe_recover(&self.pool).await;
+            let recovery_snapshot = self.pool.snapshot();
+            ph.maybe_recover(&recovery_snapshot).await;
         }
 
         let status_code = resp_parts.status.as_u16();
