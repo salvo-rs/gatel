@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
@@ -159,8 +159,12 @@ fn process_template(input: &str, vars: &TemplateVars, root: &Option<PathBuf>) ->
             }
         }
 
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch = input[i..]
+            .chars()
+            .next()
+            .expect("index is always on a UTF-8 character boundary");
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     result
@@ -214,26 +218,10 @@ fn resolve_tag(tag: &str, vars: &TemplateVars, root: &Option<PathBuf>) -> String
 
 /// Read and return the contents of an included file.
 fn resolve_include(path_str: &str, root: &Option<PathBuf>) -> String {
-    let path = Path::new(path_str);
-
-    // If the path is relative and root is set, resolve relative to root.
-    let full_path = if path.is_relative() {
-        match root {
-            Some(root_dir) => root_dir.join(path),
-            None => PathBuf::from(path),
-        }
-    } else {
-        PathBuf::from(path)
+    let Some(full_path) = resolve_include_path(path_str, root) else {
+        debug!(path = path_str, "blocked template include outside root");
+        return String::new();
     };
-
-    // Prevent path traversal in includes.
-    let path_str_normalized = full_path.to_string_lossy().replace('\\', "/");
-    for component in path_str_normalized.split('/') {
-        if component == ".." {
-            debug!(path = %full_path.display(), "blocked include with path traversal");
-            return String::new();
-        }
-    }
 
     match std::fs::read_to_string(&full_path) {
         Ok(contents) => {
@@ -244,5 +232,79 @@ fn resolve_include(path_str: &str, root: &Option<PathBuf>) -> String {
             debug!(path = %full_path.display(), error = %e, "failed to include template file");
             String::new()
         }
+    }
+}
+
+fn resolve_include_path(path_str: &str, root: &Option<PathBuf>) -> Option<PathBuf> {
+    let path = Path::new(path_str);
+    if has_forbidden_path_components(path) {
+        return None;
+    }
+
+    match root {
+        Some(root_dir) => {
+            if path.is_absolute() {
+                return None;
+            }
+            let root = root_dir.canonicalize().ok()?;
+            let candidate = root.join(path).canonicalize().ok()?;
+            if candidate.starts_with(&root) {
+                Some(candidate)
+            } else {
+                None
+            }
+        }
+        None => Some(path.to_path_buf()),
+    }
+}
+
+fn has_forbidden_path_components(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars() -> TemplateVars {
+        TemplateVars {
+            host: "example.com".to_string(),
+            path: "/hello".to_string(),
+            method: "GET".to_string(),
+            scheme: "https".to_string(),
+            client_ip: "127.0.0.1".to_string(),
+            query: "a=1".to_string(),
+            uri: "/hello?a=1".to_string(),
+            remote_addr: "127.0.0.1:1234".to_string(),
+            server_name: "example.com".to_string(),
+        }
+    }
+
+    #[test]
+    fn process_template_preserves_utf8_text() {
+        let rendered = process_template("你好 {{path}}", &vars(), &None);
+
+        assert_eq!(rendered, "你好 /hello");
+    }
+
+    #[test]
+    fn include_path_must_stay_under_configured_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let include = dir.path().join("fragment.html");
+        std::fs::write(&include, "ok").unwrap();
+
+        let root = Some(dir.path().to_path_buf());
+
+        assert_eq!(
+            resolve_include_path("fragment.html", &root),
+            Some(include.canonicalize().unwrap())
+        );
+        assert!(resolve_include_path("../secret.html", &root).is_none());
+        assert!(resolve_include_path(include.to_str().unwrap(), &root).is_none());
     }
 }

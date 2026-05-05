@@ -109,23 +109,9 @@ impl UpstreamPool {
                 .enable_http2()
                 .build()
         } else {
-            // Build a standard rustls ClientConfig with an empty root store.
-            // Upstreams on HTTPS should use certificates trusted by the system,
-            // but since we don't have native-roots or webpki-roots features enabled
-            // here, we use an empty store — suitable for internal/self-signed CAs
-            // when skip-verify is not set. For production use with public CAs,
-            // enable the webpki-roots or native-roots feature on hyper-rustls.
-            let root_store = rustls::RootCertStore::empty();
-            let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("default protocol versions are valid")
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
             hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(tls_config)
+                .with_provider_and_webpki_roots(Arc::new(rustls::crypto::ring::default_provider()))
+                .expect("default protocol versions are valid")
                 .https_or_http()
                 .enable_http1()
                 .enable_http2()

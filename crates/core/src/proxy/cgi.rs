@@ -5,7 +5,7 @@
 //! as a CGI-style response (headers followed by body).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use http::{Response, StatusCode};
@@ -66,13 +66,19 @@ impl CgiHandler {
         client_addr: std::net::SocketAddr,
     ) -> Result<Response<crate::Body>, ProxyError> {
         let path = request.uri().path().to_string();
-        let script_path = self.root.join(path.trim_start_matches('/'));
-
-        if !script_path.exists() {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(full_body("Not Found"))?);
-        }
+        let script_path = match resolve_script_path(&self.root, &path) {
+            Ok(script_path) => script_path,
+            Err(CgiPathError::NotFound) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(full_body("Not Found"))?);
+            }
+            Err(CgiPathError::Forbidden) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(full_body("Forbidden"))?);
+            }
+        };
 
         // Collect the request body before decomposing the request.
         let (parts, body) = request.into_parts();
@@ -160,6 +166,79 @@ impl CgiHandler {
         }
 
         parse_cgi_response(&output.stdout)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CGI path resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgiPathError {
+    NotFound,
+    Forbidden,
+}
+
+fn resolve_script_path(root: &Path, uri_path: &str) -> Result<PathBuf, CgiPathError> {
+    let decoded_path = percent_decode_path(uri_path).ok_or(CgiPathError::Forbidden)?;
+    if has_forbidden_path_components(Path::new(decoded_path.trim_start_matches('/'))) {
+        return Err(CgiPathError::Forbidden);
+    }
+
+    let candidate = root.join(uri_path.trim_start_matches('/'));
+    let root = root.canonicalize().map_err(|_| CgiPathError::NotFound)?;
+    let script = candidate
+        .canonicalize()
+        .map_err(|_| CgiPathError::NotFound)?;
+
+    if !script.starts_with(&root) {
+        return Err(CgiPathError::Forbidden);
+    }
+    if !script.is_file() {
+        return Err(CgiPathError::NotFound);
+    }
+
+    Ok(script)
+}
+
+fn has_forbidden_path_components(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+fn percent_decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            output.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            output.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -267,5 +346,30 @@ mod tests {
         let data = b"just a body with no headers";
         let resp = parse_cgi_response(data).unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn resolve_script_path_allows_files_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("run.cgi");
+        std::fs::write(&script, "echo ok").unwrap();
+
+        let resolved = resolve_script_path(dir.path(), "/run.cgi").unwrap();
+
+        assert_eq!(resolved, script.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_script_path_rejects_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().parent().unwrap().join("outside-gatel-cgi-test");
+        std::fs::write(&outside, "echo outside").unwrap();
+
+        let result = resolve_script_path(dir.path(), "/../outside-gatel-cgi-test");
+        let encoded = resolve_script_path(dir.path(), "/%2e%2e/outside-gatel-cgi-test");
+
+        std::fs::remove_file(&outside).unwrap();
+        assert_eq!(result, Err(CgiPathError::Forbidden));
+        assert_eq!(encoded, Err(CgiPathError::Forbidden));
     }
 }
