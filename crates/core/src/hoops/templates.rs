@@ -7,6 +7,7 @@ use tracing::debug;
 
 /// Maximum response size to process for template substitution (default 1 MB).
 const MAX_TEMPLATE_SIZE: usize = 1024 * 1024;
+const MAX_INCLUDE_SIZE: u64 = 64 * 1024;
 
 /// Server-side template processing middleware.
 ///
@@ -21,18 +22,25 @@ const MAX_TEMPLATE_SIZE: usize = 1024 * 1024;
 /// - `{{uri}}` — full request URI
 /// - `{{remote_addr}}` — full client socket address
 /// - `{{server_name}}` — server hostname (from Host header, without port)
-/// - `{{.Env.VARNAME}}` — environment variable lookup
-/// - `{{include "path"}}` — include another file's contents
+/// - `{{.Env.VARNAME}}` — environment variable lookup when explicitly enabled
+/// - `{{include "path"}}` — include a root-confined file when explicitly enabled
 pub struct TemplatesHoop {
-    /// Root directory for `{{include}}` paths. If `None`, includes are relative to CWD.
+    /// Root directory for explicitly enabled `{{include}}` paths.
     root: Option<PathBuf>,
+    allow_env: bool,
+    allow_include: bool,
 }
 
 impl TemplatesHoop {
-    pub fn new(root: Option<String>) -> Self {
-        debug!(root = root.as_deref(), "templates middleware initialized");
+    pub fn new(root: Option<String>, allow_env: bool, allow_include: bool) -> Self {
+        debug!(
+            root = root.as_deref(),
+            allow_env, allow_include, "templates middleware initialized"
+        );
         Self {
             root: root.map(PathBuf::from),
+            allow_env,
+            allow_include,
         }
     }
 }
@@ -123,7 +131,7 @@ impl salvo::Handler for TemplatesHoop {
         };
 
         // Apply template substitution.
-        let processed = process_template(&html, &vars, &self.root);
+        let processed = process_template(&html, &vars, self);
 
         let processed_bytes = Bytes::from(processed);
 
@@ -138,7 +146,7 @@ impl salvo::Handler for TemplatesHoop {
 }
 
 /// Process template substitution on an HTML string.
-fn process_template(input: &str, vars: &TemplateVars, root: &Option<PathBuf>) -> String {
+fn process_template(input: &str, vars: &TemplateVars, hoop: &TemplatesHoop) -> String {
     let mut result = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let len = bytes.len();
@@ -152,7 +160,7 @@ fn process_template(input: &str, vars: &TemplateVars, root: &Option<PathBuf>) ->
                 let tag_content = &input[i + 2..close_pos];
                 let tag_content = tag_content.trim();
 
-                let replacement = resolve_tag(tag_content, vars, root);
+                let replacement = resolve_tag(tag_content, vars, hoop);
                 result.push_str(&replacement);
                 i = close_pos + 2; // skip past `}}`
                 continue;
@@ -184,7 +192,7 @@ fn find_closing_braces(s: &str, start: usize) -> Option<usize> {
 }
 
 /// Resolve a single template tag to its replacement value.
-fn resolve_tag(tag: &str, vars: &TemplateVars, root: &Option<PathBuf>) -> String {
+fn resolve_tag(tag: &str, vars: &TemplateVars, hoop: &TemplatesHoop) -> String {
     // Simple variable lookups.
     match tag {
         "host" => return vars.host.clone(),
@@ -201,15 +209,23 @@ fn resolve_tag(tag: &str, vars: &TemplateVars, root: &Option<PathBuf>) -> String
 
     // Environment variable: {{.Env.VARNAME}}
     if let Some(var_name) = tag.strip_prefix(".Env.") {
+        if !hoop.allow_env {
+            debug!("blocked template environment variable lookup because allow-env is disabled");
+            return format!("{{{{{tag}}}}}");
+        }
         let var_name = var_name.trim();
         return std::env::var(var_name).unwrap_or_default();
     }
 
     // Include directive: {{include "path"}} or {{include 'path'}}
     if let Some(rest) = tag.strip_prefix("include ") {
+        if !hoop.allow_include {
+            debug!("blocked template include because allow-include is disabled");
+            return format!("{{{{{tag}}}}}");
+        }
         let rest = rest.trim();
         let include_path = rest.trim_matches('"').trim_matches('\'');
-        return resolve_include(include_path, root);
+        return resolve_include(include_path, &hoop.root);
     }
 
     // Unknown tag — return it as-is to avoid data loss.
@@ -218,10 +234,26 @@ fn resolve_tag(tag: &str, vars: &TemplateVars, root: &Option<PathBuf>) -> String
 
 /// Read and return the contents of an included file.
 fn resolve_include(path_str: &str, root: &Option<PathBuf>) -> String {
-    let Some(full_path) = resolve_include_path(path_str, root) else {
-        debug!(path = path_str, "blocked template include outside root");
+    let Some(root) = root else {
+        debug!("blocked include because templates root is not configured");
         return String::new();
     };
+    let Some(full_path) = resolve_include_path(path_str, root) else {
+        debug!(path = path_str, "blocked unsafe template include path");
+        return String::new();
+    };
+
+    match std::fs::metadata(&full_path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_INCLUDE_SIZE => {}
+        Ok(_) => {
+            debug!(path = %full_path.display(), "blocked oversized or non-file template include");
+            return String::new();
+        }
+        Err(e) => {
+            debug!(path = %full_path.display(), error = %e, "failed to inspect template include");
+            return String::new();
+        }
+    }
 
     match std::fs::read_to_string(&full_path) {
         Ok(contents) => {
@@ -235,36 +267,32 @@ fn resolve_include(path_str: &str, root: &Option<PathBuf>) -> String {
     }
 }
 
-fn resolve_include_path(path_str: &str, root: &Option<PathBuf>) -> Option<PathBuf> {
-    let path = Path::new(path_str);
-    if has_forbidden_path_components(path) {
+fn resolve_include_path(path_str: &str, root: &Path) -> Option<PathBuf> {
+    let requested = safe_relative_path(path_str)?;
+    let root = root.canonicalize().ok()?;
+    let full_path = root.join(requested).canonicalize().ok()?;
+    full_path.starts_with(&root).then_some(full_path)
+}
+
+fn safe_relative_path(path_str: &str) -> Option<PathBuf> {
+    if path_str.as_bytes().contains(&0) {
         return None;
     }
 
-    match root {
-        Some(root_dir) => {
-            if path.is_absolute() {
-                return None;
-            }
-            let root = root_dir.canonicalize().ok()?;
-            let candidate = root.join(path).canonicalize().ok()?;
-            if candidate.starts_with(&root) {
-                Some(candidate)
-            } else {
-                None
-            }
-        }
-        None => Some(path.to_path_buf()),
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        return None;
     }
-}
 
-fn has_forbidden_path_components(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    })
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => relative.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(relative)
 }
 
 #[cfg(test)]
@@ -274,37 +302,96 @@ mod tests {
     fn vars() -> TemplateVars {
         TemplateVars {
             host: "example.com".to_string(),
-            path: "/hello".to_string(),
+            path: "/index.html".to_string(),
             method: "GET".to_string(),
             scheme: "https".to_string(),
             client_ip: "127.0.0.1".to_string(),
-            query: "a=1".to_string(),
-            uri: "/hello?a=1".to_string(),
-            remote_addr: "127.0.0.1:1234".to_string(),
+            query: String::new(),
+            uri: "/index.html".to_string(),
+            remote_addr: "127.0.0.1:12345".to_string(),
             server_name: "example.com".to_string(),
         }
     }
 
     #[test]
-    fn process_template_preserves_utf8_text() {
-        let rendered = process_template("你好 {{path}}", &vars(), &None);
+    fn env_lookup_is_disabled_by_default() {
+        let hoop = TemplatesHoop::new(None, false, false);
 
-        assert_eq!(rendered, "你好 /hello");
+        let output = process_template("token={{.Env.PATH}}", &vars(), &hoop);
+
+        assert_eq!(output, "token={{.Env.PATH}}");
     }
 
     #[test]
-    fn include_path_must_stay_under_configured_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let include = dir.path().join("fragment.html");
-        std::fs::write(&include, "ok").unwrap();
-
-        let root = Some(dir.path().to_path_buf());
-
-        assert_eq!(
-            resolve_include_path("fragment.html", &root),
-            Some(include.canonicalize().unwrap())
+    fn include_is_disabled_by_default() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("header.html"), "safe").unwrap();
+        let hoop = TemplatesHoop::new(
+            Some(root.path().to_string_lossy().into_owned()),
+            false,
+            false,
         );
-        assert!(resolve_include_path("../secret.html", &root).is_none());
-        assert!(resolve_include_path(include.to_str().unwrap(), &root).is_none());
+
+        let output = process_template(r#"{{include "header.html"}}"#, &vars(), &hoop);
+
+        assert_eq!(output, r#"{{include "header.html"}}"#);
+    }
+
+    #[test]
+    fn include_reads_root_confined_relative_file_when_enabled() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("partials")).unwrap();
+        std::fs::write(root.path().join("partials/header.html"), "safe").unwrap();
+        let hoop = TemplatesHoop::new(
+            Some(root.path().to_string_lossy().into_owned()),
+            false,
+            true,
+        );
+
+        let output = process_template(r#"{{include "partials/header.html"}}"#, &vars(), &hoop);
+
+        assert_eq!(output, "safe");
+    }
+
+    #[test]
+    fn include_rejects_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        let hoop = TemplatesHoop::new(
+            Some(root.path().to_string_lossy().into_owned()),
+            false,
+            true,
+        );
+
+        let output = process_template(r#"{{include "../secret.txt"}}"#, &vars(), &hoop);
+
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn include_rejects_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "secret").unwrap();
+        let hoop = TemplatesHoop::new(
+            Some(root.path().to_string_lossy().into_owned()),
+            false,
+            true,
+        );
+        let template = format!(r#"{{{{include "{}"}}}}"#, outside.path().display());
+
+        let output = process_template(&template, &vars(), &hoop);
+
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn process_template_preserves_utf8_text() {
+        let hoop = TemplatesHoop::new(None, false, false);
+
+        let rendered = process_template("你好 {{path}}", &vars(), &hoop);
+
+        assert_eq!(rendered, "你好 /index.html");
     }
 }

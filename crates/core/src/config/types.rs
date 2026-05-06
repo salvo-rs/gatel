@@ -346,6 +346,8 @@ pub enum HoopConfig {
     Cache(CacheConfig),
     Templates {
         root: Option<String>,
+        allow_env: bool,
+        allow_include: bool,
     },
     BufferLimit {
         /// Maximum allowed request body size in bytes. Returns 413 when exceeded.

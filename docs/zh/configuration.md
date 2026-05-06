@@ -675,7 +675,7 @@ cache max-entries=1000 max-age="300s"
 ### templates — 模板渲染
 
 ```kdl
-templates root="/templates"
+templates root="/templates" allow-include=true
 ```
 
 ### headers — 请求头/响应头操作

@@ -620,6 +620,9 @@ site "example.com" {
 }
 ```
 
+环境变量读取和文件引入默认禁用；只应在可信模板中显式使用 `allow-env=true`
+或 `allow-include=true`。
+
 ### 属性
 
 | 属性 | 类型 | 必填 | 说明 |
