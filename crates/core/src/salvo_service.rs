@@ -365,9 +365,12 @@ fn build_route_router(
             cfg.split_path.clone(),
             cfg.env.clone(),
         )),
-        HandlerConfig::ForwardProxy(cfg) => router.goal(
-            crate::proxy::forward_proxy::ForwardProxy::new(&cfg.auth_users),
-        ),
+        HandlerConfig::ForwardProxy(cfg) => {
+            router.goal(crate::proxy::forward_proxy::ForwardProxy::new(
+                &cfg.auth_users,
+                cfg.allow_unauthenticated,
+            ))
+        }
         HandlerConfig::Cgi(cfg) => router.goal(crate::proxy::cgi::CgiHandler::new(
             cfg.root.clone(),
             cfg.env.clone(),

@@ -42,6 +42,7 @@ use crate::{Body, ProxyError, empty_body, full_body, goals};
 /// 4. Upgrades the client connection and copies bytes bidirectionally.
 pub struct ForwardProxy {
     auth_users: Vec<ProxyAuthUser>,
+    allow_unauthenticated: bool,
 }
 
 struct ProxyAuthUser {
@@ -51,7 +52,7 @@ struct ProxyAuthUser {
 }
 
 impl ForwardProxy {
-    pub fn new(auth_users: &[BasicAuthUser]) -> Self {
+    pub fn new(auth_users: &[BasicAuthUser], allow_unauthenticated: bool) -> Self {
         let auth_users = auth_users
             .iter()
             .map(|u| {
@@ -65,7 +66,10 @@ impl ForwardProxy {
                 }
             })
             .collect();
-        Self { auth_users }
+        Self {
+            auth_users,
+            allow_unauthenticated,
+        }
     }
 }
 
@@ -108,8 +112,8 @@ impl ForwardProxy {
             ));
         }
 
-        // Enforce proxy authentication when auth_users is configured.
-        if !self.auth_users.is_empty() {
+        // Enforce proxy authentication unless unauthenticated proxying was explicitly enabled.
+        if !self.allow_unauthenticated {
             match extract_proxy_credentials(&request) {
                 Some((username, password)) => {
                     let ok = self
@@ -300,4 +304,52 @@ fn proxy_auth_required_response() -> Response<Body> {
         .header("Proxy-Authenticate", "Basic realm=\"gatel\"")
         .body(full_body("Proxy Authentication Required"))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect_request(auth: Option<&str>) -> http::Request<Body> {
+        let mut builder = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("example.com:443");
+        if let Some(auth) = auth {
+            builder = builder.header("Proxy-Authorization", auth);
+        }
+        builder.body(empty_body()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_proxy_requires_auth_by_default() {
+        let proxy = ForwardProxy::new(&[], false);
+
+        let response = proxy
+            .run(connect_request(None), "127.0.0.1:12345".parse().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn invalid_proxy_credentials_are_rejected_before_connect() {
+        let proxy = ForwardProxy::new(
+            &[BasicAuthUser {
+                username: "alice".to_string(),
+                password_hash: "secret".to_string(),
+            }],
+            false,
+        );
+
+        let response = proxy
+            .run(
+                connect_request(Some("Basic YWxpY2U6d3Jvbmc=")),
+                "127.0.0.1:12345".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    }
 }

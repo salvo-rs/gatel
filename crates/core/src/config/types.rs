@@ -455,10 +455,12 @@ pub enum HandlerConfig {
 /// Forward proxy handler configuration (HTTP CONNECT tunneling).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ForwardProxyConfig {
-    /// Optional list of (username, password_hash) pairs.  When non-empty,
-    /// incoming CONNECT requests must supply a valid `Proxy-Authorization:
-    /// Basic` header or receive a 407 response.
+    /// List of (username, password_hash) pairs. Incoming CONNECT requests must
+    /// supply a valid `Proxy-Authorization: Basic` header unless
+    /// `allow_unauthenticated` is explicitly enabled.
     pub auth_users: Vec<BasicAuthUser>,
+    /// Explicit opt-in for unauthenticated CONNECT proxying.
+    pub allow_unauthenticated: bool,
 }
 
 /// CGI handler configuration.
