@@ -31,8 +31,8 @@ use std::time::Duration;
 /// Spawn a new async task on the current runtime.
 ///
 /// On tokio: delegates to `tokio::spawn`.
-/// On monoio: delegates to `monoio::spawn` (task is !Send, pinned to current thread).
-#[cfg(not(feature = "runtime-monoio"))]
+/// On monoio/Linux: delegates to `monoio::spawn` (task is !Send, pinned to current thread).
+#[cfg(not(all(feature = "runtime-monoio", target_os = "linux")))]
 pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -41,7 +41,7 @@ where
     tokio::spawn(future)
 }
 
-#[cfg(feature = "runtime-monoio")]
+#[cfg(all(feature = "runtime-monoio", target_os = "linux"))]
 pub fn spawn<F>(future: F)
 where
     F: Future + 'static,
@@ -51,18 +51,18 @@ where
 }
 
 /// Sleep for the given duration.
-#[cfg(not(feature = "runtime-monoio"))]
+#[cfg(not(all(feature = "runtime-monoio", target_os = "linux")))]
 pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
-#[cfg(feature = "runtime-monoio")]
+#[cfg(all(feature = "runtime-monoio", target_os = "linux"))]
 pub async fn sleep(duration: Duration) {
     monoio::time::sleep(duration).await;
 }
 
 /// Create a periodic interval timer.
-#[cfg(not(feature = "runtime-monoio"))]
+#[cfg(not(all(feature = "runtime-monoio", target_os = "linux")))]
 pub fn interval(period: Duration) -> tokio::time::Interval {
     tokio::time::interval(period)
 }
@@ -79,7 +79,7 @@ pub struct RuntimeInfo {
 
 /// Get information about the active runtime.
 pub fn info() -> RuntimeInfo {
-    #[cfg(not(feature = "runtime-monoio"))]
+    #[cfg(not(all(feature = "runtime-monoio", target_os = "linux")))]
     {
         RuntimeInfo {
             name: "tokio",
@@ -87,7 +87,7 @@ pub fn info() -> RuntimeInfo {
             send_tasks: true,
         }
     }
-    #[cfg(feature = "runtime-monoio")]
+    #[cfg(all(feature = "runtime-monoio", target_os = "linux"))]
     {
         RuntimeInfo {
             name: "monoio",

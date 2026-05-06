@@ -11,17 +11,16 @@ readme.workspace = true
 [features]
 bcrypt = ["dep:bcrypt"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
-argon2 = ["dep:argon2", "dep:password-hash"]
-scrypt = ["dep:scrypt", "dep:password-hash"]
-pbkdf2 = ["dep:pbkdf2", "dep:password-hash"]
-runtime-monoio = []
+argon2 = ["dep:argon2"]
+scrypt = ["dep:scrypt"]
+pbkdf2 = ["dep:pbkdf2"]
+runtime-monoio = ["dep:monoio"]
 
 [dependencies]
 bcrypt = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
 scrypt = { workspace = true, optional = true }
 pbkdf2 = { workspace = true, optional = true }
-password-hash = { workspace = true, optional = true }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -55,6 +54,9 @@ quinn = { workspace = true, optional = true }
 hickory-resolver = { workspace = true }
 salvo = { workspace = true }
 tower-service = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio = { version = "0.2.4", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
