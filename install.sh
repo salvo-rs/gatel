@@ -45,6 +45,41 @@ detect_arch() {
     esac
 }
 
+detect_target() {
+    local os="$1" arch="$2"
+    case "${os}/${arch}" in
+        linux/x86_64)   echo "x86_64-unknown-linux-gnu" ;;
+        linux/aarch64)  echo "aarch64-unknown-linux-gnu" ;;
+        macos/x86_64)   echo "x86_64-apple-darwin" ;;
+        macos/aarch64)  echo "aarch64-apple-darwin" ;;
+        *)              error "unsupported binary target: ${os}/${arch}" ;;
+    esac
+}
+
+sha256_file() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        error "required command 'sha256sum' or 'shasum' not found"
+    fi
+}
+
+verify_checksum() {
+    local checksums_file="$1" file_path="$2" asset_name="$3"
+    local expected actual
+    expected="$(awk -v name="$asset_name" '$2 == name {print $1}' "$checksums_file" | head -1)"
+    if [[ -z "$expected" ]]; then
+        error "checksum for ${asset_name} not found"
+    fi
+    actual="$(sha256_file "$file_path")"
+    if [[ "$actual" != "$expected" ]]; then
+        error "checksum verification failed for ${asset_name}"
+    fi
+    info "Verified checksum for ${asset_name}"
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -108,9 +143,10 @@ install_from_source() {
 # ---------------------------------------------------------------------------
 
 install_from_binary() {
-    local os arch
+    local os arch target
     os="$(detect_os)"
     arch="$(detect_arch)"
+    target="$(detect_target "$os" "$arch")"
 
     need_cmd curl
     need_cmd tar
@@ -130,8 +166,9 @@ install_from_binary() {
         tag="$VERSION"
     fi
 
-    asset_name="gatel-${tag}-${arch}-${os}.tar.gz"
+    asset_name="gatel-${tag}-${target}.tar.gz"
     download_url="https://github.com/${REPO}/releases/download/${tag}/${asset_name}"
+    checksum_url="https://github.com/${REPO}/releases/download/${tag}/checksums-sha256.txt"
 
     info "Downloading gatel ${tag} for ${os}/${arch}..."
 
@@ -144,6 +181,13 @@ install_from_binary() {
         install_from_source
         return
     fi
+
+    if ! curl -fsSL -o "$tmpdir/checksums-sha256.txt" "$checksum_url"; then
+        warn "Checksum download failed. Falling back to source build."
+        install_from_source
+        return
+    fi
+    verify_checksum "$tmpdir/checksums-sha256.txt" "$tmpdir/gatel.tar.gz" "$asset_name"
 
     info "Extracting..."
     tar -xzf "$tmpdir/gatel.tar.gz" -C "$tmpdir"

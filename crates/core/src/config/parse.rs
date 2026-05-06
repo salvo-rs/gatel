@@ -285,6 +285,9 @@ fn is_glob_pattern(s: &str) -> bool {
 /// - `GATEL_HTTP_ADDR`   — HTTP listen address (default `:80`)
 /// - `GATEL_HTTPS_ADDR`  — HTTPS listen address (default `:443`)
 /// - `GATEL_ADMIN_ADDR`  — admin API listen address
+/// - `GATEL_ADMIN_AUTH_TOKEN`  — bearer token required for all admin API requests
+/// - `GATEL_ADMIN_READ_TOKEN`  — bearer token for read-only admin API requests
+/// - `GATEL_ADMIN_WRITE_TOKEN` — bearer token for mutating admin API requests
 /// - `GATEL_ACME_EMAIL`  — ACME email (enables auto-TLS)
 /// - `GATEL_ACME_CA`     — ACME CA (`letsencrypt`, `letsencrypt-staging`, `zerossl`; default
 ///   `letsencrypt`)
@@ -294,6 +297,9 @@ pub fn auto_config_from_env() -> Option<String> {
     let http_addr = std::env::var("GATEL_HTTP_ADDR").ok();
     let https_addr = std::env::var("GATEL_HTTPS_ADDR").ok();
     let admin_addr = std::env::var("GATEL_ADMIN_ADDR").ok();
+    let admin_auth_token = std::env::var("GATEL_ADMIN_AUTH_TOKEN").ok();
+    let admin_read_token = std::env::var("GATEL_ADMIN_READ_TOKEN").ok();
+    let admin_write_token = std::env::var("GATEL_ADMIN_WRITE_TOKEN").ok();
     let acme_email = std::env::var("GATEL_ACME_EMAIL").ok();
     let acme_ca = std::env::var("GATEL_ACME_CA").unwrap_or_else(|_| "letsencrypt".to_string());
     let host = std::env::var("GATEL_HOST").ok();
@@ -303,6 +309,9 @@ pub fn auto_config_from_env() -> Option<String> {
     if http_addr.is_none()
         && https_addr.is_none()
         && admin_addr.is_none()
+        && admin_auth_token.is_none()
+        && admin_read_token.is_none()
+        && admin_write_token.is_none()
         && acme_email.is_none()
         && host.is_none()
         && upstream.is_none()
@@ -322,6 +331,15 @@ pub fn auto_config_from_env() -> Option<String> {
     }
     if let Some(addr) = &admin_addr {
         out.push_str(&format!("    admin \"{addr}\"\n"));
+    }
+    if let Some(token) = &admin_auth_token {
+        out.push_str(&format!("    admin-auth-token \"{token}\"\n"));
+    }
+    if let Some(token) = &admin_read_token {
+        out.push_str(&format!("    admin-read-token \"{token}\"\n"));
+    }
+    if let Some(token) = &admin_write_token {
+        out.push_str(&format!("    admin-write-token \"{token}\"\n"));
     }
     out.push_str("}\n");
 
@@ -415,6 +433,9 @@ fn parse_global(node: &KdlNode) -> Result<GlobalConfig, ConfigError> {
                     .find(|e| e.name().is_none())
                     .and_then(|e| e.value().as_bool())
                     .unwrap_or(true);
+            }
+            "trusted-proxy" | "trusted-proxies" => {
+                cfg.trusted_proxies.extend(string_args(child));
             }
             "access-log" => {
                 cfg.access_log = Some(parse_log_file_config(child)?);
@@ -854,7 +875,19 @@ fn parse_route(
                         .and_then(|v| v.as_string())
                         .map(|s| s.to_string())
                 });
-                middlewares.push(HoopConfig::Templates { root });
+                let allow_env = child
+                    .get("allow-env")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let allow_include = child
+                    .get("allow-include")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                middlewares.push(HoopConfig::Templates {
+                    root,
+                    allow_env,
+                    allow_include,
+                });
             }
             "header-up" | "header-down" => {
                 // Collect header directives — handled below with the proxy
@@ -1087,31 +1120,70 @@ fn parse_route_condition(node: &KdlNode, negate: bool) -> Result<RouteCondition,
 ///
 /// ```kdl
 /// forward-proxy {
+///     allow-unauthenticated #false
 ///     user "alice" hash="$2b$..."
 ///     user "bob"   hash="plaintext"
 /// }
 /// ```
 fn parse_forward_proxy(node: &KdlNode) -> Result<ForwardProxyConfig, ConfigError> {
     let mut auth_users = Vec::new();
+    let mut allow_unauthenticated = if let Some(value) = node.get("allow-unauthenticated") {
+        value.as_bool().ok_or_else(|| ConfigError::InvalidValue {
+            field: "forward-proxy allow-unauthenticated".into(),
+            detail: "expected boolean value (true or false)".into(),
+        })?
+    } else {
+        false
+    };
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            if child.name().to_string() == "user" {
-                let username = first_string_arg(child).ok_or_else(|| {
-                    ConfigError::MissingField("forward-proxy user username".into())
-                })?;
-                let password_hash = child
-                    .get("hash")
-                    .and_then(|v| v.as_string())
-                    .unwrap_or("")
-                    .to_string();
-                auth_users.push(BasicAuthUser {
-                    username,
-                    password_hash,
-                });
+            match child.name().to_string().as_str() {
+                "allow-unauthenticated" => {
+                    let positional = child.entries().iter().find(|e| e.name().is_none());
+                    allow_unauthenticated =
+                        match positional {
+                            Some(entry) => entry.value().as_bool().ok_or_else(|| {
+                                ConfigError::InvalidValue {
+                                    field: "forward-proxy allow-unauthenticated".into(),
+                                    detail: "expected boolean value (true or false)".into(),
+                                }
+                            })?,
+                            None => {
+                                return Err(ConfigError::InvalidValue {
+                                    field: "forward-proxy allow-unauthenticated".into(),
+                                    detail: "missing boolean value".into(),
+                                });
+                            }
+                        };
+                }
+                "user" => {
+                    let username = first_string_arg(child).ok_or_else(|| {
+                        ConfigError::MissingField("forward-proxy user username".into())
+                    })?;
+                    let password_hash = child
+                        .get("hash")
+                        .and_then(|v| v.as_string())
+                        .unwrap_or("")
+                        .to_string();
+                    auth_users.push(BasicAuthUser {
+                        username,
+                        password_hash,
+                    });
+                }
+                _ => {}
             }
         }
     }
-    Ok(ForwardProxyConfig { auth_users })
+    if auth_users.is_empty() && !allow_unauthenticated {
+        return Err(ConfigError::InvalidValue {
+            field: "forward-proxy".into(),
+            detail: "at least one user is required unless allow-unauthenticated=#true".into(),
+        });
+    }
+    Ok(ForwardProxyConfig {
+        auth_users,
+        allow_unauthenticated,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2164,7 +2236,7 @@ site "app.example.com" {
     fn test_parse_full_config() {
         let input = r#"
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
 }
@@ -2215,7 +2287,7 @@ site "api.example.com" {
         // Global
         assert_eq!(
             config.global.admin_addr,
-            Some("0.0.0.0:2019".parse().unwrap())
+            Some("127.0.0.1:2019".parse().unwrap())
         );
         assert_eq!(config.global.grace_period, Duration::from_secs(30));
 
@@ -2285,6 +2357,82 @@ site "app.example.com" {
             }
             _ => panic!("expected FastCgi handler"),
         }
+    }
+
+    #[test]
+    fn test_forward_proxy_requires_auth_by_default() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
+    }
+
+    #[test]
+    fn test_forward_proxy_allows_explicit_unauthenticated_opt_in() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy allow-unauthenticated=#true
+    }
+}
+"#;
+
+        let config = parse_config(input).unwrap();
+        match &config.sites[0].routes[0].handler {
+            HandlerConfig::ForwardProxy(cfg) => {
+                assert!(cfg.allow_unauthenticated);
+                assert!(cfg.auth_users.is_empty());
+            }
+            _ => panic!("expected forward proxy"),
+        }
+    }
+
+    #[test]
+    fn test_forward_proxy_rejects_non_boolean_unauthenticated_attribute() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy allow-unauthenticated="false"
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
+    }
+
+    #[test]
+    fn test_forward_proxy_rejects_non_boolean_unauthenticated_child() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy {
+            allow-unauthenticated "false"
+        }
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
+    }
+
+    #[test]
+    fn test_forward_proxy_rejects_bare_unauthenticated_child() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy {
+            allow-unauthenticated
+        }
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
     }
 
     #[test]

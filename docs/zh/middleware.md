@@ -452,6 +452,7 @@ route "/" {
 - `deny` — 拒绝匹配的 IP。
 - 规则按声明顺序匹配，第一个匹配的规则生效。
 - 如果没有规则匹配，默认允许。
+- `forwarded-for=true` 只有在直连对端匹配全局 `trusted-proxy` 时才会信任 `X-Forwarded-For`；未配置时只信任 loopback。
 
 ### CIDR 表示法
 
@@ -539,7 +540,9 @@ route "/" {
 
 - 仅缓存 GET 和 HEAD 请求。
 - 仅缓存 2xx 响应。
-- 尊重 `Cache-Control: no-store` 和 `Cache-Control: no-cache` 头。
+- 尊重 `Cache-Control: no-store`、`Cache-Control: no-cache` 和 `Cache-Control: private`。
+- 携带 `Authorization` 或 `Cookie` 的请求默认绕过缓存；只有响应显式 `Cache-Control: public` 时才会写入缓存。
+- `Vary: *` 响应不会被缓存，其他 `Vary` 字段会参与缓存键。
 - 缓存使用 dashmap 实现，支持并发访问。
 
 ### 配置示例
@@ -578,13 +581,18 @@ route "/" {
 
 | 属性 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `root` | string | 是 | 模板文件所在的根目录 |
+| `root` | string | 否 | `include` 文件所在的根目录 |
+| `allow-env` | boolean | 否 | 是否允许 `{{.Env.VARNAME}}` 读取环境变量，默认 `false` |
+| `allow-include` | boolean | 否 | 是否允许 `{{include "path"}}` 引入文件，默认 `false` |
 
 ### 工作原理
 
 1. 当请求的文件是模板文件时，先读取文件内容。
 2. 执行模板渲染，替换模板变量。
 3. 将渲染后的内容作为响应返回。
+
+`{{.Env.*}}` 和 `{{include}}` 默认禁用。启用 `include` 时，路径必须是相对路径，
+并且会被限制在 `root` 目录内；绝对路径、`..` 和符号链接逃逸都会被阻止。
 
 ---
 

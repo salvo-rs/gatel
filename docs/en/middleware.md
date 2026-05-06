@@ -207,6 +207,7 @@ IP filtering is configured as a middleware type in the codebase (`HoopConfig::Ip
 - If an **allow** list is configured, the client IP must match at least one allow entry (deny-by-default).
 - If only a **deny** list is configured, all IPs are allowed except those explicitly denied.
 - IPv4-mapped IPv6 addresses are handled transparently.
+- When `forwarded-for=true` is used, `X-Forwarded-For` is honored only if the direct client matches a global `trusted-proxy` CIDR/IP. With no trusted proxies configured, only loopback peers are trusted.
 
 ### CIDR Format
 
@@ -294,7 +295,7 @@ route "/api/*" {
 
 ### Cacheable Requests
 
-Only `GET` and `HEAD` requests are cached. Requests with `Cache-Control: no-store` bypass the cache entirely.
+Only `GET` and `HEAD` requests are cached. Requests with `Cache-Control: no-store` bypass the cache entirely. Requests carrying `Authorization` or `Cookie` bypass cache lookup and are stored only when the response explicitly includes `Cache-Control: public`.
 
 ### Cacheable Responses
 
@@ -302,7 +303,8 @@ Responses are cached when:
 
 - Status code is 200 (OK), 301 (Moved Permanently), 302 (Found), or 304 (Not Modified).
 - Response does not contain a `Set-Cookie` header.
-- Response does not contain `Cache-Control: no-store`.
+- Response does not contain `Cache-Control: no-store` or `private`.
+- Response does not contain `Vary: *`.
 - Response body size does not exceed `max-entry-size`.
 
 ### TTL Determination
@@ -324,7 +326,7 @@ The cache supports conditional requests:
 
 ### Vary Header
 
-The cache includes `Vary` header values in the cache key. Responses with different `Vary`-referenced header values are stored separately.
+The cache includes `Vary` header values in the cache key. Responses with different `Vary`-referenced header values are stored separately. `Vary: *` responses are not cached.
 
 ### Cache Eviction
 
@@ -349,7 +351,9 @@ route "/*" {
 
 | Property | Type | Default | Description |
 |---|---|---|---|
-| `root` | string | CWD | Root directory for `{{include}}` file paths |
+| `root` | string | unset | Root directory for explicitly enabled `{{include}}` file paths |
+| `allow-env` | boolean | `false` | Enable `{{.Env.VARNAME}}` lookups |
+| `allow-include` | boolean | `false` | Enable `{{include "path"}}` file includes |
 
 ### Supported Placeholders
 
@@ -364,16 +368,17 @@ route "/*" {
 | `{{uri}}` | Full request URI |
 | `{{remote_addr}}` | Full client socket address (IP:port) |
 | `{{server_name}}` | Server hostname (Host header, without port) |
-| `{{.Env.VARNAME}}` | Environment variable lookup |
-| `{{include "path"}}` | Include another file's contents |
+| `{{.Env.VARNAME}}` | Environment variable lookup when `allow-env=true` |
+| `{{include "path"}}` | Include another file's contents when `allow-include=true` |
 
 ### Behavior
 
 - Only processes responses with `Content-Type: text/html`.
 - Maximum response size for template processing: 1 MB. Larger responses pass through unmodified.
 - Non-UTF-8 response bodies pass through unmodified.
-- `{{include}}` paths are resolved relative to the configured `root` directory.
-- Path traversal (`..`) in include paths is blocked for security.
+- `{{.Env.*}}` and `{{include}}` are disabled unless explicitly enabled.
+- `{{include}}` paths must be relative and are resolved under the configured `root` directory.
+- Absolute paths, path traversal (`..`), and symlink escapes in include paths are blocked.
 - Unknown tags are preserved as-is (no data loss).
 - The `Content-Length` header is updated after processing.
 
@@ -385,10 +390,14 @@ route "/*" {
 <head><title>{{server_name}}</title></head>
 <body>
   <p>Welcome, your IP is {{client_ip}}</p>
-  <p>Environment: {{.Env.APP_ENV}}</p>
-  {{include "partials/footer.html"}}
 </body>
 </html>
+```
+
+To enable local file includes, opt in explicitly:
+
+```kdl
+templates root="/templates" allow-include=true
 ```
 
 ---

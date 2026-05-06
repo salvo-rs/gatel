@@ -4,13 +4,14 @@
 // Not meant for production — it is a reference for every directive.
 
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="debug" format="json"
     grace-period "60s"
     http ":80"
     https ":443"
     http3 #true
     proxy-protocol #true
+    trusted-proxy "10.0.0.0/8"
 }
 
 tls {

@@ -385,8 +385,12 @@ PROXY Protocol 允许在代理链中传递真实的客户端连接信息（源 I
 ```kdl
 global {
     proxy-protocol true
+    trusted-proxy "10.0.0.0/8"
 }
 ```
+
+只有匹配 `trusted-proxy` 的负载均衡器或反向代理可以提供 PROXY 头。
+未配置 `trusted-proxy` 时，只信任 loopback 对端。
 
 ### 支持的版本
 
@@ -620,6 +624,9 @@ site "example.com" {
 }
 ```
 
+环境变量读取和文件引入默认禁用；只应在可信模板中显式使用 `allow-env=true`
+或 `allow-include=true`。
+
 ### 属性
 
 | 属性 | 类型 | 必填 | 说明 |
@@ -759,7 +766,7 @@ route "/assets/*" {
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
 }
 ```
 

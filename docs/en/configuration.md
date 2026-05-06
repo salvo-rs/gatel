@@ -69,7 +69,7 @@ Gatel still loads a **single main config file** (by default `gatel.kdl`, or what
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
 }
 
 // Relative to the directory of the file containing this `import`.
@@ -133,7 +133,7 @@ gatel validate --config /etc/gatel/gatel.kdl
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
 }
 
@@ -156,7 +156,7 @@ Controls server-wide behavior. All directives are optional; sensible defaults ar
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="pretty"
     grace-period "30s"
     http ":80"
@@ -169,13 +169,15 @@ global {
 ### admin
 
 ```kdl
-admin ":2019"
+admin "127.0.0.1:2019"
+admin-auth-token "change-this-token"
 ```
 
 Starts the Admin REST API on the given address. When omitted, the admin API is disabled.
 
 - **Type**: address string
 - **Default**: disabled
+- **Security**: bind to loopback unless a trusted network boundary is in front of the listener. If `admin-auth-token`, `admin-read-token`, and `admin-write-token` are all omitted, the admin API accepts unauthenticated requests; Gatel logs a warning when such a listener is exposed on a non-loopback address.
 
 ### log
 
@@ -238,12 +240,16 @@ Enable the HTTP/3 (QUIC) listener on the same address as HTTPS. Requires the `ht
 
 ```kdl
 proxy-protocol true
+trusted-proxy "10.0.0.0/8"
 ```
 
 When enabled, Gatel expects a PROXY protocol v1 (text) or v2 (binary) header on every incoming TCP connection. The real client address from the header is used instead of the TCP peer address.
+PROXY headers are accepted only from configured `trusted-proxy` CIDR/IP ranges. If none are configured, only loopback peers are trusted.
 
 - **Type**: boolean
 - **Default**: `false`
+
+`trusted-proxy` can be repeated to trust multiple load balancer CIDRs.
 
 ---
 
@@ -600,7 +606,7 @@ Listen addresses use the format `"host:port"` or `":port"` (binds to `0.0.0.0`):
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
     http ":80"

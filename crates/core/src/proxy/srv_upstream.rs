@@ -4,15 +4,15 @@
 //! pairs for use as proxy upstream backends. Priority filtering (lowest value
 //! wins) is applied; weight is preserved for future weighted selection.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use super::dns_upstream::DynamicBackends;
+use super::upstream::Backend;
+
 /// A shared, atomically-updated list of resolved SRV backends.
-/// Each entry is `(host, port)`.
-pub type SrvBackends = Arc<RwLock<Vec<(String, u16)>>>;
+pub type SrvBackends = std::sync::Arc<DynamicBackends>;
 
 /// Handle to the background SRV resolver task. Aborting the task on drop
 /// ensures we don't leak spawned work.
@@ -26,21 +26,30 @@ impl SrvResolver {
     /// Start a background task that periodically resolves `service_name` via
     /// DNS SRV records and updates the shared backend list.
     pub fn start(service_name: String, refresh_interval: Duration) -> Self {
-        let backends: SrvBackends = Arc::new(RwLock::new(Vec::new()));
-        let store = Arc::clone(&backends);
+        let backends: SrvBackends = std::sync::Arc::new(DynamicBackends::new());
+        let store = std::sync::Arc::clone(&backends);
         let name = service_name.clone();
 
         let task = tokio::spawn(async move {
             // Build a hickory TokioResolver from system configuration, falling
             // back to a default (Google public DNS) resolver on failure.
-            let dns = hickory_resolver::TokioResolver::builder_tokio()
-                .unwrap_or_else(|_| {
-                    hickory_resolver::TokioResolver::builder_with_config(
-                        hickory_resolver::config::ResolverConfig::default(),
-                        hickory_resolver::name_server::TokioConnectionProvider::default(),
-                    )
-                })
-                .build();
+            let builder = hickory_resolver::TokioResolver::builder_tokio().unwrap_or_else(|_| {
+                hickory_resolver::TokioResolver::builder_with_config(
+                    hickory_resolver::config::ResolverConfig::default(),
+                    hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+                )
+            });
+            let dns = match builder.build() {
+                Ok(dns) => dns,
+                Err(e) => {
+                    warn!(
+                        service = %name,
+                        error = %e,
+                        "failed to build SRV resolver; aborting refresh task"
+                    );
+                    return;
+                }
+            };
 
             // Perform an initial resolution immediately before entering the
             // periodic sleep loop.
@@ -72,23 +81,35 @@ async fn resolve_and_update(
     store: &SrvBackends,
 ) {
     match dns.srv_lookup(service_name).await {
-        Ok(records) => {
-            // Collect (host, port, priority, weight) tuples.
-            let mut entries: Vec<(String, u16, u16, u16)> = records
+        Ok(lookup) => {
+            // Collect (addr, priority, weight) tuples from SRV answer records.
+            let mut entries: Vec<(String, u16, u16)> = lookup
+                .answers()
                 .iter()
-                .map(|r| {
-                    let host = r.target().to_string().trim_end_matches('.').to_string();
-                    (host, r.port(), r.priority(), r.weight())
+                .filter_map(|record| match &record.data {
+                    hickory_resolver::proto::rr::RData::SRV(srv) => {
+                        let host = srv.target.to_string().trim_end_matches('.').to_string();
+                        Some((format!("{host}:{}", srv.port), srv.priority, srv.weight))
+                    }
+                    _ => None,
                 })
                 .collect();
 
             // Keep only the highest-priority (lowest numeric value) records.
-            if let Some(min_priority) = entries.iter().map(|e| e.2).min() {
-                entries.retain(|e| e.2 == min_priority);
+            if let Some(min_priority) = entries.iter().map(|e| e.1).min() {
+                entries.retain(|e| e.1 == min_priority);
             }
 
-            let resolved: Vec<(String, u16)> =
-                entries.into_iter().map(|(h, p, ..)| (h, p)).collect();
+            let mut resolved: Vec<Backend> = entries
+                .into_iter()
+                .map(|(addr, _, weight)| Backend {
+                    addr,
+                    weight: u32::from(weight).max(1),
+                    activity_key: None,
+                })
+                .collect();
+            resolved.sort_by(|a, b| a.addr.cmp(&b.addr));
+            resolved.dedup_by(|a, b| a.addr == b.addr);
 
             if resolved.is_empty() {
                 warn!(
@@ -103,7 +124,7 @@ async fn resolve_and_update(
                 count = resolved.len(),
                 "SRV lookup resolved"
             );
-            *store.write().await = resolved;
+            store.store(resolved);
         }
         Err(e) => {
             warn!(
@@ -123,9 +144,9 @@ mod tests {
     fn srv_backends_starts_empty() {
         // Verify we can construct a SrvBackends and it starts empty without
         // actually spinning up a resolver task (which needs a Tokio runtime).
-        let backends: SrvBackends = Arc::new(RwLock::new(Vec::new()));
-        // Can't easily await in a sync test; just check the Arc round-trips.
-        let cloned = Arc::clone(&backends);
-        assert!(Arc::ptr_eq(&backends, &cloned));
+        let backends: SrvBackends = std::sync::Arc::new(DynamicBackends::new());
+        let cloned = std::sync::Arc::clone(&backends);
+        assert!(std::sync::Arc::ptr_eq(&backends, &cloned));
+        assert!(backends.load().is_empty());
     }
 }

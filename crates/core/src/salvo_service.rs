@@ -39,7 +39,13 @@ fn build_router(
 ) -> Router {
     let mut root = Router::new();
     for site in &config.sites {
-        root = root.push(build_site_router(site, modules, metrics, backend_activity));
+        root = root.push(build_site_router(
+            site,
+            modules,
+            metrics,
+            backend_activity,
+            &config.global.trusted_proxies,
+        ));
     }
     root
 }
@@ -49,6 +55,7 @@ fn build_site_router(
     modules: &ModuleRegistry,
     metrics: &Arc<Metrics>,
     backend_activity: &Arc<BackendActivityTracker>,
+    trusted_proxies: &[String],
 ) -> Router {
     let mut site_router = if site.host == "*" {
         Router::new()
@@ -71,6 +78,7 @@ fn build_site_router(
             modules,
             Arc::clone(metrics),
             Arc::clone(backend_activity),
+            trusted_proxies,
         ));
     }
     site_router
@@ -82,6 +90,7 @@ fn build_route_router(
     modules: &ModuleRegistry,
     metrics: Arc<Metrics>,
     backend_activity: Arc<BackendActivityTracker>,
+    trusted_proxies: &[String],
 ) -> Router {
     let mut router = Router::with_filter_fn(consume_remaining_path);
 
@@ -114,6 +123,7 @@ fn build_route_router(
                     allow,
                     deny,
                     *forwarded_for,
+                    trusted_proxies,
                 ));
             }
             HoopConfig::RateLimit { window, max, burst } => {
@@ -188,8 +198,16 @@ fn build_route_router(
             HoopConfig::Cache(cfg) => {
                 router = router.hoop(crate::hoops::cache::CacheHoop::new(cfg));
             }
-            HoopConfig::Templates { root } => {
-                router = router.hoop(crate::hoops::templates::TemplatesHoop::new(root.clone()));
+            HoopConfig::Templates {
+                root,
+                allow_env,
+                allow_include,
+            } => {
+                router = router.hoop(crate::hoops::templates::TemplatesHoop::new(
+                    root.clone(),
+                    *allow_env,
+                    *allow_include,
+                ));
             }
             HoopConfig::Replace { rules, once } => {
                 router = router.hoop(crate::hoops::replace::ReplaceHoop::new(
@@ -347,9 +365,12 @@ fn build_route_router(
             cfg.split_path.clone(),
             cfg.env.clone(),
         )),
-        HandlerConfig::ForwardProxy(cfg) => router.goal(
-            crate::proxy::forward_proxy::ForwardProxy::new(&cfg.auth_users),
-        ),
+        HandlerConfig::ForwardProxy(cfg) => {
+            router.goal(crate::proxy::forward_proxy::ForwardProxy::new(
+                &cfg.auth_users,
+                cfg.allow_unauthenticated,
+            ))
+        }
         HandlerConfig::Cgi(cfg) => router.goal(crate::proxy::cgi::CgiHandler::new(
             cfg.root.clone(),
             cfg.env.clone(),

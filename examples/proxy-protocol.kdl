@@ -8,6 +8,7 @@ global {
     http ":80"
     https ":443"
     proxy-protocol #true
+    trusted-proxy "10.0.0.0/8"
     log level="info"
 }
 

@@ -2,11 +2,47 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use serde::ser::Serializer;
+use serde::ser::{SerializeMap, Serializer};
 
 /// Serialize a `Duration` as a human-readable seconds string (e.g. `"30s"`).
 fn serialize_duration<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&format!("{}s", d.as_secs()))
+}
+
+fn serialize_redacted_string<S: Serializer>(_: &str, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str("<redacted>")
+}
+
+fn serialize_redacted_option_string<S: Serializer>(
+    value: &Option<String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(_) => s.serialize_some("<redacted>"),
+        None => s.serialize_none(),
+    }
+}
+
+fn serialize_redacted_options<S: Serializer>(
+    options: &HashMap<String, String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let mut map = s.serialize_map(Some(options.len()))?;
+    for (key, value) in options {
+        if is_sensitive_option_key(key) {
+            map.serialize_entry(key, "<redacted>")?;
+        } else {
+            map.serialize_entry(key, value)?;
+        }
+    }
+    map.end()
+}
+
+fn is_sensitive_option_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["token", "secret", "key", "password", "credential", "hmac"]
+        .iter()
+        .any(|part| key.contains(part))
 }
 
 /// Top-level application configuration parsed from KDL.
@@ -33,6 +69,8 @@ pub struct GlobalConfig {
     pub http3: bool,
     /// When true, expect PROXY protocol v1/v2 headers on incoming connections.
     pub proxy_protocol: bool,
+    /// CIDR/IP ranges trusted to supply PROXY protocol or X-Forwarded-For client IPs.
+    pub trusted_proxies: Vec<String>,
     pub access_log: Option<LogFileConfig>,
     pub error_log: Option<LogFileConfig>,
     /// TCP_NODELAY socket option for accepted connections (default: true).
@@ -69,6 +107,7 @@ impl Default for GlobalConfig {
             https_addr: ([0, 0, 0, 0], 443).into(),
             http3: false,
             proxy_protocol: false,
+            trusted_proxies: Vec::new(),
             access_log: None,
             error_log: None,
             tcp_nodelay: true,
@@ -147,6 +186,7 @@ pub struct AcmeConfig {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EabConfig {
     pub kid: String,
+    #[serde(serialize_with = "serialize_redacted_string")]
     pub hmac_key: String,
 }
 
@@ -154,10 +194,14 @@ pub struct EabConfig {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DnsProviderConfig {
     pub provider: String,
+    #[serde(serialize_with = "serialize_redacted_option_string")]
     pub api_token: Option<String>,
+    #[serde(serialize_with = "serialize_redacted_option_string")]
     pub api_key: Option<String>,
+    #[serde(serialize_with = "serialize_redacted_option_string")]
     pub api_secret: Option<String>,
     /// Extra provider-specific key-value options.
+    #[serde(serialize_with = "serialize_redacted_options")]
     pub options: std::collections::HashMap<String, String>,
 }
 
@@ -305,6 +349,8 @@ pub enum HoopConfig {
     Cache(CacheConfig),
     Templates {
         root: Option<String>,
+        allow_env: bool,
+        allow_include: bool,
     },
     BufferLimit {
         /// Maximum allowed request body size in bytes. Returns 413 when exceeded.
@@ -409,10 +455,12 @@ pub enum HandlerConfig {
 /// Forward proxy handler configuration (HTTP CONNECT tunneling).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ForwardProxyConfig {
-    /// Optional list of (username, password_hash) pairs.  When non-empty,
-    /// incoming CONNECT requests must supply a valid `Proxy-Authorization:
-    /// Basic` header or receive a 407 response.
+    /// List of (username, password_hash) pairs. Incoming CONNECT requests must
+    /// supply a valid `Proxy-Authorization: Basic` header unless
+    /// `allow_unauthenticated` is explicitly enabled.
     pub auth_users: Vec<BasicAuthUser>,
+    /// Explicit opt-in for unauthenticated CONNECT proxying.
+    pub allow_unauthenticated: bool,
 }
 
 /// CGI handler configuration.

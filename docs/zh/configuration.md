@@ -99,7 +99,7 @@ Gatel 仍然**只加载一个主配置文件**（默认 `gatel.kdl`，或通过 
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
 }
 
 // 路径相对于包含此 `import` 的文件所在目录。
@@ -163,7 +163,7 @@ gatel validate --config /etc/gatel/gatel.kdl
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
 }
 
@@ -190,7 +190,8 @@ import "conf.d/static.kdl"
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
+    admin-auth-token "change-this-token"
 }
 ```
 
@@ -203,6 +204,8 @@ global {
 | `/health` | GET | 健康状态 |
 | `/upstreams` | GET | 上游后端状态 |
 | `/metrics` | GET | Prometheus 指标 |
+
+安全建议：除非前面有可信网络边界，否则应把 admin API 绑定到 loopback 地址。`admin-auth-token`、`admin-read-token` 和 `admin-write-token` 都未配置时，admin API 会接受未认证请求；如果它监听在非 loopback 地址，Gatel 会打印警告日志。
 
 ### log
 
@@ -263,22 +266,25 @@ global {
 ```kdl
 global {
     proxy-protocol true
+    trusted-proxy "10.0.0.0/8"
 }
 ```
 
 启用后，Gatel 会解析入站连接的 PROXY Protocol 头，提取真实客户端 IP。
+只有匹配 `trusted-proxy` 的直连对端可以提供 PROXY 头；未配置时只信任 loopback。
 
 ### 完整示例
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
     http ":80"
     https ":443"
     http3 true
     proxy-protocol true
+    trusted-proxy "10.0.0.0/8"
 }
 ```
 
@@ -672,7 +678,7 @@ cache max-entries=1000 max-age="300s"
 ### templates — 模板渲染
 
 ```kdl
-templates root="/templates"
+templates root="/templates" allow-include=true
 ```
 
 ### headers — 请求头/响应头操作
@@ -734,7 +740,7 @@ stream {
 ```kdl
 // 全局设置
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
     http ":80"

@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http::{Request, Response, StatusCode};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -26,6 +26,8 @@ use crate::runtime_services::{
 };
 use crate::server::{AppState, RuntimeStateError};
 use crate::{Body, ProxyError, full_body};
+
+const MAX_ADMIN_JSON_BODY_SIZE: usize = 1024 * 1024;
 
 #[derive(serde::Serialize)]
 struct RuntimeTargetView {
@@ -48,7 +50,8 @@ pub async fn start_admin_server(
     metrics: Arc<Metrics>,
 ) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "admin API server listening");
+    let bound_addr = listener.local_addr().unwrap_or(addr);
+    info!(%bound_addr, "admin API server listening");
 
     loop {
         let (stream, _client_addr) = match listener.accept().await {
@@ -67,7 +70,7 @@ pub async fn start_admin_server(
             let service = service_fn(move |req: Request<Incoming>| {
                 let state = Arc::clone(&state);
                 let metrics = Arc::clone(&metrics);
-                async move { handle_admin_request(req, state, &metrics).await }
+                async move { handle_admin_request(req, state, &metrics, bound_addr).await }
             });
 
             if let Err(e) =
@@ -88,6 +91,7 @@ async fn handle_admin_request(
     req: Request<Incoming>,
     state: Arc<AppState>,
     metrics: &Metrics,
+    bound_addr: SocketAddr,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -96,9 +100,13 @@ async fn handle_admin_request(
         .filter(|segment| !segment.is_empty())
         .collect();
     let config = state.config.load();
-    if let Err(response) =
-        authorize_admin_request(&req, &config.global, &method, segments.as_slice())
-    {
+    if let Err(response) = authorize_admin_request(
+        &req,
+        &config.global,
+        &method,
+        segments.as_slice(),
+        bound_addr,
+    ) {
         return Ok(*response);
     }
 
@@ -999,9 +1007,18 @@ async fn json_body<T>(req: Request<Incoming>) -> Result<T, Response<Body>>
 where
     T: serde::de::DeserializeOwned,
 {
-    let body_bytes = match req.into_body().collect().await {
+    let body_bytes = match Limited::new(req.into_body(), MAX_ADMIN_JSON_BODY_SIZE)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
         Err(error) => {
+            if error.downcast_ref::<LengthLimitError>().is_some() {
+                return Err(json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"request body too large"}"#,
+                ));
+            }
             return Err(json_response(
                 StatusCode::BAD_REQUEST,
                 &format!(r#"{{"error":"failed to read body: {error}"}}"#),
@@ -1032,8 +1049,16 @@ fn authorize_admin_request<B>(
     global: &GlobalConfig,
     method: &http::Method,
     segments: &[&str],
+    bound_addr: SocketAddr,
 ) -> AdminAuthorizationResult {
     let needs_write = admin_request_needs_write(method, segments);
+
+    if !admin_tokens_configured(global) && listener_requires_auth(bound_addr) {
+        return Err(Box::new(json_response(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"admin auth token required"}"#,
+        )));
+    }
 
     if let Some(token) = &global.admin_auth_token {
         if check_bearer_auth(req, token) {
@@ -1075,6 +1100,24 @@ fn authorize_admin_request<B>(
     } else {
         Ok(())
     }
+}
+
+fn admin_tokens_configured(global: &GlobalConfig) -> bool {
+    global.admin_auth_token.is_some()
+        || global.admin_read_token.is_some()
+        || global.admin_write_token.is_some()
+}
+
+/// Whether the actual bound listener address requires authentication.
+///
+/// The decision is based on the socket the admin server is currently
+/// accepting connections on, not on the (potentially mutable)
+/// `global.admin_addr` config value. This prevents a hot-reload that
+/// rewrites `admin_addr` to a loopback address (or removes it entirely)
+/// from disabling auth on a non-loopback listener that is still serving
+/// remote clients.
+fn listener_requires_auth(bound_addr: SocketAddr) -> bool {
+    !bound_addr.ip().is_loopback()
 }
 
 fn admin_request_needs_write(method: &http::Method, segments: &[&str]) -> bool {
@@ -1315,7 +1358,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::AppConfig;
+    use crate::config::{
+        AcmeConfig, AppConfig, CertAuthority, ChallengeType, DnsProviderConfig, EabConfig,
+        TlsConfig,
+    };
     use crate::runtime_services::{
         RuntimeRoute, RuntimeService, RuntimeTarget, RuntimeTargetGroup,
     };
@@ -1326,6 +1372,14 @@ mod tests {
             .uri("/services")
             .body(())
             .unwrap()
+    }
+
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:2019".parse().unwrap()
+    }
+
+    fn remote() -> SocketAddr {
+        "0.0.0.0:2019".parse().unwrap()
     }
 
     #[test]
@@ -1342,7 +1396,8 @@ mod tests {
         };
 
         let response =
-            authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap_err();
+            authorize_admin_request(&req, &global, req.method(), &["services"], loopback())
+                .unwrap_err();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
@@ -1358,11 +1413,115 @@ mod tests {
             ..GlobalConfig::default()
         };
 
-        authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap();
+        authorize_admin_request(&req, &global, req.method(), &["services"], loopback()).unwrap();
         assert!(admin_request_needs_write(
             &http::Method::POST,
             &["services"]
         ));
+    }
+
+    #[test]
+    fn remote_admin_requires_configured_token() {
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some(remote()),
+            ..GlobalConfig::default()
+        };
+
+        let response =
+            authorize_admin_request(&req, &global, req.method(), &["services"], remote())
+                .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn loopback_admin_allows_unauthenticated_local_dev() {
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some(loopback()),
+            ..GlobalConfig::default()
+        };
+
+        authorize_admin_request(&req, &global, req.method(), &["services"], loopback()).unwrap();
+    }
+
+    #[test]
+    fn remote_listener_keeps_requiring_auth_after_config_swap_to_loopback() {
+        // After a hot-reload swaps `admin_addr` to a loopback value (or
+        // removes it entirely), the still-running remote listener must
+        // continue requiring authentication.
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some(loopback()),
+            ..GlobalConfig::default()
+        };
+
+        let response =
+            authorize_admin_request(&req, &global, req.method(), &["services"], remote())
+                .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn loopback_listener_allows_unauthenticated_even_if_config_swapped_to_remote() {
+        // Conversely, an active loopback listener must not be locked down
+        // by a stale remote `admin_addr` value in the config.
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some(remote()),
+            ..GlobalConfig::default()
+        };
+
+        authorize_admin_request(&req, &global, req.method(), &["services"], loopback()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_json_redacts_acme_dns_secrets() {
+        let config = AppConfig {
+            tls: Some(TlsConfig {
+                acme: Some(AcmeConfig {
+                    email: "admin@example.com".to_string(),
+                    ca: CertAuthority::ZeroSsl,
+                    challenge: ChallengeType::Dns01,
+                    eab: Some(EabConfig {
+                        kid: "kid".to_string(),
+                        hmac_key: "super-secret-hmac".to_string(),
+                    }),
+                    dns_provider: Some(DnsProviderConfig {
+                        provider: "cloudflare".to_string(),
+                        api_token: Some("dns-token".to_string()),
+                        api_key: Some("dns-key".to_string()),
+                        api_secret: Some("dns-secret".to_string()),
+                        options: BTreeMap::from([
+                            ("region".to_string(), "us".to_string()),
+                            ("account_key".to_string(), "option-key".to_string()),
+                        ])
+                        .into_iter()
+                        .collect(),
+                    }),
+                }),
+                client_auth: None,
+                on_demand: None,
+                min_version: None,
+                max_version: None,
+                cipher_suites: Vec::new(),
+                ocsp_stapling: false,
+                ecdh_curves: Vec::new(),
+            }),
+            ..AppConfig::default()
+        };
+        let state = AppState::new(config, None);
+        let response = handle_get_config(&state);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!json.contains("super-secret-hmac"));
+        assert!(!json.contains("dns-token"));
+        assert!(!json.contains("dns-key"));
+        assert!(!json.contains("dns-secret"));
+        assert!(!json.contains("option-key"));
+        assert!(json.contains("\"region\": \"us\""));
+        assert!(json.contains("<redacted>"));
     }
 
     #[tokio::test]

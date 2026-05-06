@@ -662,6 +662,12 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
 
     // Start the admin API server if configured.
     if let Some(admin_addr) = config.global.admin_addr {
+        if !admin_addr.ip().is_loopback() && !admin_auth_configured(&config.global) {
+            warn!(
+                %admin_addr,
+                "admin API is listening on a non-loopback address without bearer-token authentication"
+            );
+        }
         let admin_state = Arc::clone(&state);
         let admin_metrics = Arc::clone(&state.metrics);
         tokio::spawn(async move {
@@ -749,6 +755,12 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
     Ok(())
 }
 
+fn admin_auth_configured(global: &crate::config::GlobalConfig) -> bool {
+    global.admin_auth_token.is_some()
+        || global.admin_read_token.is_some()
+        || global.admin_write_token.is_some()
+}
+
 /// Accept loop for plain HTTP connections.
 async fn accept_http_loop(
     listener: TcpListener,
@@ -784,6 +796,17 @@ async fn accept_http_loop(
             let _guard = _conn_guard;
 
             if proxy_protocol {
+                let trusted_proxies = {
+                    let cfg = state.config.load();
+                    cfg.global.trusted_proxies.clone()
+                };
+                if !peer_is_trusted_proxy(&peer_addr, &trusted_proxies) {
+                    warn!(
+                        client = %peer_addr,
+                        "rejecting PROXY protocol connection from untrusted peer"
+                    );
+                    return;
+                }
                 // Parse PROXY protocol header to get the real client address.
                 match proxy_protocol::parse_proxy_protocol(&mut stream).await {
                     Ok((header, prefix)) => {
@@ -860,6 +883,17 @@ async fn accept_https_loop(
             let _guard = _conn_guard;
 
             if proxy_protocol {
+                let trusted_proxies = {
+                    let cfg = state.config.load();
+                    cfg.global.trusted_proxies.clone()
+                };
+                if !peer_is_trusted_proxy(&peer_addr, &trusted_proxies) {
+                    warn!(
+                        client = %peer_addr,
+                        "rejecting PROXY protocol connection from untrusted peer"
+                    );
+                    return;
+                }
                 // Parse PROXY protocol header first, then perform TLS handshake.
                 match proxy_protocol::parse_proxy_protocol(&mut stream).await {
                     Ok((header, prefix)) => {
@@ -909,6 +943,15 @@ async fn accept_https_loop(
     Ok(())
 }
 
+fn peer_is_trusted_proxy(peer_addr: &std::net::SocketAddr, trusted_proxies: &[String]) -> bool {
+    if trusted_proxies.is_empty() {
+        return peer_addr.ip().is_loopback();
+    }
+    trusted_proxies
+        .iter()
+        .any(|cidr| crate::router::matcher::match_cidr_pub(cidr, &peer_addr.ip()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -925,6 +968,32 @@ mod tests {
     use crate::runtime_services::{
         RuntimeHealthCheck, RuntimeRoute, RuntimeService, RuntimeTarget, RuntimeTargetGroup,
     };
+
+    #[test]
+    fn proxy_protocol_trust_defaults_to_loopback_only() {
+        assert!(peer_is_trusted_proxy(
+            &"127.0.0.1:5000".parse().unwrap(),
+            &[]
+        ));
+        assert!(!peer_is_trusted_proxy(
+            &"203.0.113.10:5000".parse().unwrap(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn proxy_protocol_trust_honors_configured_cidrs() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+
+        assert!(peer_is_trusted_proxy(
+            &"10.1.2.3:5000".parse().unwrap(),
+            &trusted
+        ));
+        assert!(!peer_is_trusted_proxy(
+            &"192.0.2.10:5000".parse().unwrap(),
+            &trusted
+        ));
+    }
 
     fn runtime_service(
         target_addr: String,
@@ -979,6 +1048,20 @@ mod tests {
             drain_timeout: Duration::from_secs(1),
             last_error: None,
         }
+    }
+
+    #[test]
+    fn admin_auth_configured_detects_any_admin_token() {
+        assert!(!admin_auth_configured(
+            &crate::config::GlobalConfig::default()
+        ));
+
+        let global = crate::config::GlobalConfig {
+            admin_write_token: Some("write-token".to_string()),
+            ..crate::config::GlobalConfig::default()
+        };
+
+        assert!(admin_auth_configured(&global));
     }
 
     async fn spawn_backend(body: &str) -> (String, tokio::task::JoinHandle<()>) {
