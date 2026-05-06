@@ -662,6 +662,12 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
 
     // Start the admin API server if configured.
     if let Some(admin_addr) = config.global.admin_addr {
+        if !admin_addr.ip().is_loopback() && !admin_auth_configured(&config.global) {
+            warn!(
+                %admin_addr,
+                "admin API is listening on a non-loopback address without bearer-token authentication"
+            );
+        }
         let admin_state = Arc::clone(&state);
         let admin_metrics = Arc::clone(&state.metrics);
         tokio::spawn(async move {
@@ -747,6 +753,12 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
     }
 
     Ok(())
+}
+
+fn admin_auth_configured(global: &crate::config::GlobalConfig) -> bool {
+    global.admin_auth_token.is_some()
+        || global.admin_read_token.is_some()
+        || global.admin_write_token.is_some()
 }
 
 /// Accept loop for plain HTTP connections.
@@ -979,6 +991,20 @@ mod tests {
             drain_timeout: Duration::from_secs(1),
             last_error: None,
         }
+    }
+
+    #[test]
+    fn admin_auth_configured_detects_any_admin_token() {
+        assert!(!admin_auth_configured(
+            &crate::config::GlobalConfig::default()
+        ));
+
+        let global = crate::config::GlobalConfig {
+            admin_write_token: Some("write-token".to_string()),
+            ..crate::config::GlobalConfig::default()
+        };
+
+        assert!(admin_auth_configured(&global));
     }
 
     async fn spawn_backend(body: &str) -> (String, tokio::task::JoinHandle<()>) {

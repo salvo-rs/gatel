@@ -1,39 +1,46 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use dashmap::DashMap;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::upstream::UpstreamPool;
+use super::upstream::{BackendEntry, BackendSnapshot, UpstreamPool};
 use crate::config::{HealthCheckConfig, PassiveHealthConfig};
 
 // ---------------------------------------------------------------------------
 // Active health checker
 // ---------------------------------------------------------------------------
 
-/// Performs periodic HTTP health checks against every backend in the pool and
-/// updates the pool's `healthy` flags accordingly.
+#[derive(Default)]
+struct HealthCheckCounters {
+    consecutive_ok: u32,
+    consecutive_fail: u32,
+}
+
+/// Performs periodic HTTP health checks against every current backend snapshot
+/// and updates each backend's shared `healthy` flag.
 pub struct HealthChecker {
     /// Handle to the spawned background task so we can abort on drop.
     _task: tokio::task::JoinHandle<()>,
 }
 
 impl HealthChecker {
-    /// Spawn an active health-check loop.  Returns immediately; the checks
-    /// run on a background Tokio task.
+    /// Spawn an active health-check loop. Returns immediately; the checks run
+    /// on a background Tokio task.
     pub fn start(pool: Arc<UpstreamPool>, config: &HealthCheckConfig) -> Self {
         let uri = config.uri.clone();
         let interval = config.interval;
         let timeout = config.timeout;
         let unhealthy_threshold = config.unhealthy_threshold;
         let healthy_threshold = config.healthy_threshold;
-        let n = pool.len();
 
         let task = tokio::spawn(async move {
-            // Per-backend consecutive success / failure counters.
-            let mut consecutive_ok: Vec<u32> = vec![0; n];
-            let mut consecutive_fail: Vec<u32> = vec![0; n];
+            // Consecutive success/failure counters are keyed by backend address
+            // so dynamic DNS/SRV updates cannot accidentally inherit state by index.
+            let mut counters: HashMap<String, HealthCheckCounters> = HashMap::new();
 
             // Build a lightweight HTTP client for probes.
             let client =
@@ -41,14 +48,22 @@ impl HealthChecker {
                     .build_http::<crate::Body>();
 
             loop {
-                for idx in 0..n {
-                    let addr = &pool.backends[idx].addr;
-                    let check_uri = format!("http://{}{}", addr, uri);
+                let snapshot = pool.snapshot();
+                let active_addrs: HashSet<String> = snapshot
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.backend.addr.clone())
+                    .collect();
+                counters.retain(|addr, _| active_addrs.contains(addr));
+
+                for backend in snapshot.entries().iter().cloned() {
+                    let addr = backend.backend.addr.clone();
+                    let check_uri = health_check_uri(&addr, &uri);
 
                     let result = tokio::time::timeout(timeout, async {
                         let req = http::Request::builder()
                             .method(http::Method::GET)
-                            .uri(&check_uri)
+                            .uri(check_uri.as_str())
                             .body(crate::empty_body())
                             .map_err(|e| e.to_string())?;
 
@@ -62,38 +77,42 @@ impl HealthChecker {
                     })
                     .await;
 
+                    let counts = counters.entry(addr.clone()).or_default();
+
                     match result {
                         Ok(Ok(())) => {
-                            consecutive_fail[idx] = 0;
-                            consecutive_ok[idx] += 1;
-                            if consecutive_ok[idx] >= healthy_threshold && !pool.is_healthy(idx) {
-                                debug!(backend = addr, "active health check: marking healthy");
-                                pool.set_healthy(idx, true);
+                            counts.consecutive_fail = 0;
+                            counts.consecutive_ok += 1;
+                            if counts.consecutive_ok >= healthy_threshold && !backend.is_healthy() {
+                                debug!(backend = %addr, "active health check: marking healthy");
+                                backend.set_healthy(true);
                             }
                         }
                         Ok(Err(e)) => {
-                            consecutive_ok[idx] = 0;
-                            consecutive_fail[idx] += 1;
-                            if consecutive_fail[idx] >= unhealthy_threshold && pool.is_healthy(idx)
+                            counts.consecutive_ok = 0;
+                            counts.consecutive_fail += 1;
+                            if counts.consecutive_fail >= unhealthy_threshold
+                                && backend.is_healthy()
                             {
                                 warn!(
-                                    backend = addr,
+                                    backend = %addr,
                                     error = %e,
                                     "active health check: marking unhealthy"
                                 );
-                                pool.set_healthy(idx, false);
+                                backend.set_healthy(false);
                             }
                         }
                         Err(_elapsed) => {
-                            consecutive_ok[idx] = 0;
-                            consecutive_fail[idx] += 1;
-                            if consecutive_fail[idx] >= unhealthy_threshold && pool.is_healthy(idx)
+                            counts.consecutive_ok = 0;
+                            counts.consecutive_fail += 1;
+                            if counts.consecutive_fail >= unhealthy_threshold
+                                && backend.is_healthy()
                             {
                                 warn!(
-                                    backend = addr,
+                                    backend = %addr,
                                     "active health check: marking unhealthy (timeout)"
                                 );
-                                pool.set_healthy(idx, false);
+                                backend.set_healthy(false);
                             }
                         }
                     }
@@ -113,79 +132,114 @@ impl Drop for HealthChecker {
     }
 }
 
+fn health_check_uri(addr: &str, uri: &str) -> String {
+    let scheme = if addr.starts_with("http://") || addr.starts_with("https://") {
+        ""
+    } else {
+        "http://"
+    };
+    let separator = if uri.starts_with('/') { "" } else { "/" };
+    format!("{scheme}{addr}{separator}{uri}")
+}
+
 // ---------------------------------------------------------------------------
 // Passive health checker
 // ---------------------------------------------------------------------------
 
-/// Tracks 5xx responses per backend and temporarily marks backends unhealthy
-/// when they exceed a failure threshold within a sliding time window.
-/// After a cooldown period the backend is automatically re-enabled.
+/// Tracks failures per backend address and temporarily marks backends unhealthy
+/// when they exceed a failure threshold within a sliding time window. After a
+/// cooldown period the backend is automatically re-enabled.
 pub struct PassiveHealthChecker {
-    entries: Vec<PassiveEntry>,
+    entries: DashMap<String, Arc<PassiveEntry>>,
     config: PassiveHealthConfig,
 }
 
 struct PassiveEntry {
-    /// Ring buffer of timestamps (as millis since an arbitrary epoch) of
-    /// recent failures.  Protected by a mutex because we occasionally compact.
+    /// Recent failure timestamps. Protected by a mutex because we occasionally
+    /// compact the list.
     failures: Mutex<Vec<Instant>>,
     /// Whether the backend has been passively disabled.
     disabled: AtomicBool,
-    /// Timestamp (millis since epoch) when the backend was disabled.
+    /// Timestamp when the backend was disabled.
     disabled_at: Mutex<Option<Instant>>,
 }
 
-impl PassiveHealthChecker {
-    /// Create a new passive health tracker for `n` backends.
-    pub fn new(n: usize, config: &PassiveHealthConfig) -> Self {
-        let entries = (0..n)
-            .map(|_| PassiveEntry {
-                failures: Mutex::new(Vec::new()),
-                disabled: AtomicBool::new(false),
-                disabled_at: Mutex::new(None),
-            })
-            .collect();
+impl PassiveEntry {
+    fn new() -> Self {
         Self {
-            entries,
+            failures: Mutex::new(Vec::new()),
+            disabled: AtomicBool::new(false),
+            disabled_at: Mutex::new(None),
+        }
+    }
+}
+
+impl PassiveHealthChecker {
+    /// Create a new passive health tracker. The backend count is accepted for
+    /// compatibility with older call sites; dynamic backends are tracked by
+    /// address as they appear in snapshots.
+    pub fn new(_n: usize, config: &PassiveHealthConfig) -> Self {
+        Self {
+            entries: DashMap::new(),
             config: config.clone(),
         }
     }
 
-    /// Record a 5xx failure for backend `idx`.  If the number of failures in
-    /// the configured window exceeds `max_fails`, the backend is disabled.
-    pub async fn record_failure(&self, idx: usize, pool: &UpstreamPool) {
-        let Some(entry) = self.entries.get(idx) else {
-            return;
-        };
+    fn entry_for(&self, addr: &str) -> Arc<PassiveEntry> {
+        Arc::clone(
+            self.entries
+                .entry(addr.to_string())
+                .or_insert_with(|| Arc::new(PassiveEntry::new()))
+                .value(),
+        )
+    }
+
+    /// Record a failure for `backend`. If the number of failures in the
+    /// configured window exceeds `max_fails`, the backend is disabled.
+    pub async fn record_failure(&self, backend: &BackendEntry) {
+        let addr = backend.backend.addr.clone();
+        let entry = self.entry_for(&addr);
         let now = Instant::now();
         let window = self.config.fail_window;
 
         let mut failures = entry.failures.lock().await;
         failures.push(now);
-        // Remove failures outside the window.
         failures.retain(|&t| now.duration_since(t) < window);
 
         if failures.len() as u32 >= self.config.max_fails
             && !entry.disabled.swap(true, Ordering::Relaxed)
         {
             warn!(
-                backend = pool.backends[idx].addr,
+                backend = %addr,
                 fails = failures.len(),
                 "passive health: disabling backend"
             );
-            pool.set_healthy(idx, false);
+            backend.set_healthy(false);
             *entry.disabled_at.lock().await = Some(now);
         }
     }
 
     /// Check whether any previously-disabled backend should be re-enabled
-    /// after the cooldown period.  Call this periodically (e.g. after each
-    /// request or on a timer).
-    pub async fn maybe_recover(&self, pool: &UpstreamPool) {
+    /// after the cooldown period.
+    pub async fn maybe_recover(&self, snapshot: &BackendSnapshot) {
         let cooldown = self.config.cooldown;
         let now = Instant::now();
+        let active_addrs: HashSet<String> = snapshot
+            .entries()
+            .iter()
+            .map(|entry| entry.backend.addr.clone())
+            .collect();
+        self.entries.retain(|addr, _| active_addrs.contains(addr));
 
-        for (idx, entry) in self.entries.iter().enumerate() {
+        for backend in snapshot.entries().iter().cloned() {
+            let addr = backend.backend.addr.clone();
+            let Some(entry) = self
+                .entries
+                .get(&addr)
+                .map(|entry| Arc::clone(entry.value()))
+            else {
+                continue;
+            };
             if !entry.disabled.load(Ordering::Relaxed) {
                 continue;
             }
@@ -194,23 +248,90 @@ impl PassiveHealthChecker {
                 && now.duration_since(at) >= cooldown
             {
                 debug!(
-                    backend = pool.backends[idx].addr,
+                    backend = %addr,
                     "passive health: re-enabling backend after cooldown"
                 );
                 entry.disabled.store(false, Ordering::Relaxed);
-                pool.set_healthy(idx, true);
-                // Reset failure history so we start fresh.
+                backend.set_healthy(true);
                 entry.failures.lock().await.clear();
                 *entry.disabled_at.lock().await = None;
             }
         }
     }
 
-    /// Returns `true` if the backend is currently passively disabled.
-    pub fn is_disabled(&self, idx: usize) -> bool {
+    /// Returns `true` if the backend address is currently passively disabled.
+    pub fn is_disabled(&self, addr: &str) -> bool {
         self.entries
-            .get(idx)
+            .get(addr)
             .map(|e| e.disabled.load(Ordering::Relaxed))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::{LbPolicy, ProxyConfig, UpstreamConfig};
+
+    fn proxy_config() -> ProxyConfig {
+        ProxyConfig {
+            upstreams: vec![UpstreamConfig {
+                addr: "127.0.0.1:3000".to_string(),
+                weight: 1,
+                activity_key: None,
+            }],
+            lb: LbPolicy::RoundRobin,
+            lb_header: None,
+            lb_cookie: None,
+            health_check: None,
+            passive_health: None,
+            headers_up: HashMap::new(),
+            headers_down: HashMap::new(),
+            retries: 0,
+            dynamic_upstreams: None,
+            error_pages: HashMap::new(),
+            headers_up_replace: Vec::new(),
+            tls_skip_verify: false,
+            upstream_http2: false,
+            max_connections: None,
+            keepalive_timeout: None,
+            sanitize_uri: true,
+            srv_upstream: None,
+        }
+    }
+
+    #[test]
+    fn health_check_uri_preserves_explicit_backend_scheme() {
+        assert_eq!(
+            health_check_uri("https://example.com", "/health"),
+            "https://example.com/health"
+        );
+        assert_eq!(
+            health_check_uri("127.0.0.1:3000", "health"),
+            "http://127.0.0.1:3000/health"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_health_tracks_backends_by_address() {
+        let pool = UpstreamPool::from_config(&proxy_config());
+        let snapshot = pool.snapshot();
+        let backend = snapshot.get(0).unwrap().clone();
+        let checker = PassiveHealthChecker::new(
+            snapshot.len(),
+            &PassiveHealthConfig {
+                max_fails: 1,
+                fail_window: Duration::from_secs(30),
+                cooldown: Duration::from_secs(60),
+            },
+        );
+
+        checker.record_failure(&backend).await;
+
+        assert!(checker.is_disabled("127.0.0.1:3000"));
+        assert!(!pool.snapshot().is_healthy(0));
     }
 }
