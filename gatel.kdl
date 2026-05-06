@@ -1,5 +1,5 @@
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="pretty"
     grace-period "30s"
     http ":8080"

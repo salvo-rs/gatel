@@ -2,11 +2,47 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use serde::ser::Serializer;
+use serde::ser::{SerializeMap, Serializer};
 
 /// Serialize a `Duration` as a human-readable seconds string (e.g. `"30s"`).
 fn serialize_duration<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&format!("{}s", d.as_secs()))
+}
+
+fn serialize_redacted_string<S: Serializer>(_: &str, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str("<redacted>")
+}
+
+fn serialize_redacted_option_string<S: Serializer>(
+    value: &Option<String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(_) => s.serialize_some("<redacted>"),
+        None => s.serialize_none(),
+    }
+}
+
+fn serialize_redacted_options<S: Serializer>(
+    options: &HashMap<String, String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let mut map = s.serialize_map(Some(options.len()))?;
+    for (key, value) in options {
+        if is_sensitive_option_key(key) {
+            map.serialize_entry(key, "<redacted>")?;
+        } else {
+            map.serialize_entry(key, value)?;
+        }
+    }
+    map.end()
+}
+
+fn is_sensitive_option_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["token", "secret", "key", "password", "credential", "hmac"]
+        .iter()
+        .any(|part| key.contains(part))
 }
 
 /// Top-level application configuration parsed from KDL.
@@ -147,6 +183,7 @@ pub struct AcmeConfig {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EabConfig {
     pub kid: String,
+    #[serde(serialize_with = "serialize_redacted_string")]
     pub hmac_key: String,
 }
 
@@ -154,10 +191,14 @@ pub struct EabConfig {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DnsProviderConfig {
     pub provider: String,
+    #[serde(serialize_with = "serialize_redacted_option_string")]
     pub api_token: Option<String>,
+    #[serde(serialize_with = "serialize_redacted_option_string")]
     pub api_key: Option<String>,
+    #[serde(serialize_with = "serialize_redacted_option_string")]
     pub api_secret: Option<String>,
     /// Extra provider-specific key-value options.
+    #[serde(serialize_with = "serialize_redacted_options")]
     pub options: std::collections::HashMap<String, String>,
 }
 

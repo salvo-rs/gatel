@@ -1035,6 +1035,13 @@ fn authorize_admin_request<B>(
 ) -> AdminAuthorizationResult {
     let needs_write = admin_request_needs_write(method, segments);
 
+    if !admin_tokens_configured(global) && admin_requires_auth(global) {
+        return Err(Box::new(json_response(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"admin auth token required"}"#,
+        )));
+    }
+
     if let Some(token) = &global.admin_auth_token {
         if check_bearer_auth(req, token) {
             return Ok(());
@@ -1075,6 +1082,18 @@ fn authorize_admin_request<B>(
     } else {
         Ok(())
     }
+}
+
+fn admin_tokens_configured(global: &GlobalConfig) -> bool {
+    global.admin_auth_token.is_some()
+        || global.admin_read_token.is_some()
+        || global.admin_write_token.is_some()
+}
+
+fn admin_requires_auth(global: &GlobalConfig) -> bool {
+    global
+        .admin_addr
+        .is_some_and(|addr| !addr.ip().is_loopback())
 }
 
 fn admin_request_needs_write(method: &http::Method, segments: &[&str]) -> bool {
@@ -1315,7 +1334,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::AppConfig;
+    use crate::config::{
+        AcmeConfig, AppConfig, CertAuthority, ChallengeType, DnsProviderConfig, EabConfig,
+        TlsConfig,
+    };
     use crate::runtime_services::{
         RuntimeRoute, RuntimeService, RuntimeTarget, RuntimeTargetGroup,
     };
@@ -1363,6 +1385,79 @@ mod tests {
             &http::Method::POST,
             &["services"]
         ));
+    }
+
+    #[test]
+    fn remote_admin_requires_configured_token() {
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some("0.0.0.0:2019".parse().unwrap()),
+            ..GlobalConfig::default()
+        };
+
+        let response =
+            authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn loopback_admin_allows_unauthenticated_local_dev() {
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some("127.0.0.1:2019".parse().unwrap()),
+            ..GlobalConfig::default()
+        };
+
+        authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_json_redacts_acme_dns_secrets() {
+        let config = AppConfig {
+            tls: Some(TlsConfig {
+                acme: Some(AcmeConfig {
+                    email: "admin@example.com".to_string(),
+                    ca: CertAuthority::ZeroSsl,
+                    challenge: ChallengeType::Dns01,
+                    eab: Some(EabConfig {
+                        kid: "kid".to_string(),
+                        hmac_key: "super-secret-hmac".to_string(),
+                    }),
+                    dns_provider: Some(DnsProviderConfig {
+                        provider: "cloudflare".to_string(),
+                        api_token: Some("dns-token".to_string()),
+                        api_key: Some("dns-key".to_string()),
+                        api_secret: Some("dns-secret".to_string()),
+                        options: BTreeMap::from([
+                            ("region".to_string(), "us".to_string()),
+                            ("account_key".to_string(), "option-key".to_string()),
+                        ])
+                        .into_iter()
+                        .collect(),
+                    }),
+                }),
+                client_auth: None,
+                on_demand: None,
+                min_version: None,
+                max_version: None,
+                cipher_suites: Vec::new(),
+                ocsp_stapling: false,
+                ecdh_curves: Vec::new(),
+            }),
+            ..AppConfig::default()
+        };
+        let state = AppState::new(config, None);
+        let response = handle_get_config(&state);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!json.contains("super-secret-hmac"));
+        assert!(!json.contains("dns-token"));
+        assert!(!json.contains("dns-key"));
+        assert!(!json.contains("dns-secret"));
+        assert!(!json.contains("option-key"));
+        assert!(json.contains("\"region\": \"us\""));
+        assert!(json.contains("<redacted>"));
     }
 
     #[tokio::test]
