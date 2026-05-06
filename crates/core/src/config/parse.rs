@@ -285,6 +285,9 @@ fn is_glob_pattern(s: &str) -> bool {
 /// - `GATEL_HTTP_ADDR`   — HTTP listen address (default `:80`)
 /// - `GATEL_HTTPS_ADDR`  — HTTPS listen address (default `:443`)
 /// - `GATEL_ADMIN_ADDR`  — admin API listen address
+/// - `GATEL_ADMIN_AUTH_TOKEN`  — bearer token required for all admin API requests
+/// - `GATEL_ADMIN_READ_TOKEN`  — bearer token for read-only admin API requests
+/// - `GATEL_ADMIN_WRITE_TOKEN` — bearer token for mutating admin API requests
 /// - `GATEL_ACME_EMAIL`  — ACME email (enables auto-TLS)
 /// - `GATEL_ACME_CA`     — ACME CA (`letsencrypt`, `letsencrypt-staging`, `zerossl`; default
 ///   `letsencrypt`)
@@ -294,6 +297,9 @@ pub fn auto_config_from_env() -> Option<String> {
     let http_addr = std::env::var("GATEL_HTTP_ADDR").ok();
     let https_addr = std::env::var("GATEL_HTTPS_ADDR").ok();
     let admin_addr = std::env::var("GATEL_ADMIN_ADDR").ok();
+    let admin_auth_token = std::env::var("GATEL_ADMIN_AUTH_TOKEN").ok();
+    let admin_read_token = std::env::var("GATEL_ADMIN_READ_TOKEN").ok();
+    let admin_write_token = std::env::var("GATEL_ADMIN_WRITE_TOKEN").ok();
     let acme_email = std::env::var("GATEL_ACME_EMAIL").ok();
     let acme_ca = std::env::var("GATEL_ACME_CA").unwrap_or_else(|_| "letsencrypt".to_string());
     let host = std::env::var("GATEL_HOST").ok();
@@ -303,6 +309,9 @@ pub fn auto_config_from_env() -> Option<String> {
     if http_addr.is_none()
         && https_addr.is_none()
         && admin_addr.is_none()
+        && admin_auth_token.is_none()
+        && admin_read_token.is_none()
+        && admin_write_token.is_none()
         && acme_email.is_none()
         && host.is_none()
         && upstream.is_none()
@@ -322,6 +331,15 @@ pub fn auto_config_from_env() -> Option<String> {
     }
     if let Some(addr) = &admin_addr {
         out.push_str(&format!("    admin \"{addr}\"\n"));
+    }
+    if let Some(token) = &admin_auth_token {
+        out.push_str(&format!("    admin-auth-token \"{token}\"\n"));
+    }
+    if let Some(token) = &admin_read_token {
+        out.push_str(&format!("    admin-read-token \"{token}\"\n"));
+    }
+    if let Some(token) = &admin_write_token {
+        out.push_str(&format!("    admin-write-token \"{token}\"\n"));
     }
     out.push_str("}\n");
 
@@ -2164,7 +2182,7 @@ site "app.example.com" {
     fn test_parse_full_config() {
         let input = r#"
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
 }
@@ -2215,7 +2233,7 @@ site "api.example.com" {
         // Global
         assert_eq!(
             config.global.admin_addr,
-            Some("0.0.0.0:2019".parse().unwrap())
+            Some("127.0.0.1:2019".parse().unwrap())
         );
         assert_eq!(config.global.grace_period, Duration::from_secs(30));
 

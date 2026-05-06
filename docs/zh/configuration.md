@@ -99,7 +99,7 @@ Gatel 仍然**只加载一个主配置文件**（默认 `gatel.kdl`，或通过 
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
 }
 
 // 路径相对于包含此 `import` 的文件所在目录。
@@ -163,7 +163,7 @@ gatel validate --config /etc/gatel/gatel.kdl
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
 }
 
@@ -275,7 +275,7 @@ global {
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
     http ":80"
@@ -737,7 +737,7 @@ stream {
 ```kdl
 // 全局设置
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
     http ":80"

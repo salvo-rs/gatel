@@ -4,7 +4,7 @@
 // middleware, and backend. A single gatel instance serves them all.
 
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     http ":80"
     https ":443"
     log level="info" format="json"

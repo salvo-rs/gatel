@@ -759,7 +759,7 @@ route "/assets/*" {
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
 }
 ```
 

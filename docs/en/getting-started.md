@@ -103,7 +103,7 @@ Create a file named `gatel.kdl`:
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="pretty"
     http ":8080"
 }
@@ -269,7 +269,7 @@ When `admin` is configured, Gatel runs a lightweight REST API on a separate port
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
 }
 ```
 

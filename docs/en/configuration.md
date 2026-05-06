@@ -69,7 +69,7 @@ Gatel still loads a **single main config file** (by default `gatel.kdl`, or what
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
 }
 
 // Relative to the directory of the file containing this `import`.
@@ -133,7 +133,7 @@ gatel validate --config /etc/gatel/gatel.kdl
 global {
     http ":80"
     https ":443"
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
 }
 
@@ -156,7 +156,7 @@ Controls server-wide behavior. All directives are optional; sensible defaults ar
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="pretty"
     grace-period "30s"
     http ":80"
@@ -602,7 +602,7 @@ Listen addresses use the format `"host:port"` or `":port"` (binds to `0.0.0.0`):
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
     log level="info" format="json"
     grace-period "30s"
     http ":80"
