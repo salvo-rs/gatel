@@ -67,8 +67,17 @@ impl CgiHandler {
     ) -> Result<Response<crate::Body>, ProxyError> {
         let path = request.uri().path().to_string();
         let script_path = match resolve_script_path(&self.root, &path) {
-            Ok(path) => path,
-            Err(status) => return status_response(status),
+            Ok(script_path) => script_path,
+            Err(CgiPathError::NotFound) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(full_body("Not Found"))?);
+            }
+            Err(CgiPathError::Forbidden) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(full_body("Forbidden"))?);
+            }
         };
 
         // Collect the request body before decomposing the request.
@@ -160,51 +169,77 @@ impl CgiHandler {
     }
 }
 
-fn resolve_script_path(root: &Path, uri_path: &str) -> Result<PathBuf, StatusCode> {
-    let relative_path = relative_path_from_uri(uri_path).ok_or(StatusCode::FORBIDDEN)?;
-    let candidate = root.join(relative_path);
-    let root = root.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
+// ---------------------------------------------------------------------------
+// CGI path resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgiPathError {
+    NotFound,
+    Forbidden,
+}
+
+fn resolve_script_path(root: &Path, uri_path: &str) -> Result<PathBuf, CgiPathError> {
+    let decoded_path = percent_decode_path(uri_path).ok_or(CgiPathError::Forbidden)?;
+    if has_forbidden_path_components(Path::new(decoded_path.trim_start_matches('/'))) {
+        return Err(CgiPathError::Forbidden);
+    }
+
+    let candidate = root.join(uri_path.trim_start_matches('/'));
+    let root = root.canonicalize().map_err(|_| CgiPathError::NotFound)?;
     let script = candidate
         .canonicalize()
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(|_| CgiPathError::NotFound)?;
 
     if !script.starts_with(&root) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(CgiPathError::Forbidden);
+    }
+    if !script.is_file() {
+        return Err(CgiPathError::NotFound);
     }
 
-    match script.metadata() {
-        Ok(metadata) if metadata.is_file() => Ok(script),
-        Ok(_) => Err(StatusCode::FORBIDDEN),
-        Err(_) => Err(StatusCode::NOT_FOUND),
-    }
+    Ok(script)
 }
 
-fn relative_path_from_uri(uri_path: &str) -> Option<PathBuf> {
-    let decoded = crate::encoding::percent_decode(uri_path);
-    if decoded.as_bytes().contains(&0) {
-        return None;
-    }
+fn has_forbidden_path_components(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
 
-    let mut relative = PathBuf::new();
-    for component in Path::new(decoded.trim_start_matches('/')).components() {
-        match component {
-            Component::Normal(segment) => relative.push(segment),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+fn percent_decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            output.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            output.push(bytes[i]);
+            i += 1;
         }
     }
-    Some(relative)
+
+    String::from_utf8(output).ok()
 }
 
-fn status_response(status: StatusCode) -> Result<Response<crate::Body>, ProxyError> {
-    let message = match status {
-        StatusCode::FORBIDDEN => "Forbidden",
-        StatusCode::NOT_FOUND => "Not Found",
-        _ => "Error",
-    };
-    Ok(Response::builder()
-        .status(status)
-        .body(full_body(message))?)
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,32 +319,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_script_path_rejects_parent_traversal() {
-        let root = tempfile::tempdir().unwrap();
-
-        let err = resolve_script_path(root.path(), "/../outside.sh").unwrap_err();
-        assert_eq!(err, StatusCode::FORBIDDEN);
-    }
-
-    #[test]
-    fn resolve_script_path_rejects_percent_encoded_traversal() {
-        let root = tempfile::tempdir().unwrap();
-
-        let err = resolve_script_path(root.path(), "/%2e%2e/outside.sh").unwrap_err();
-        assert_eq!(err, StatusCode::FORBIDDEN);
-    }
-
-    #[test]
-    fn resolve_script_path_confines_to_root() {
-        let root = tempfile::tempdir().unwrap();
-        let script = root.path().join("app.sh");
-        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
-
-        let resolved = resolve_script_path(root.path(), "/app.sh").unwrap();
-        assert_eq!(resolved, script.canonicalize().unwrap());
-    }
-
-    #[test]
     fn test_parse_cgi_response_with_status() {
         let data = b"Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot here";
         let resp = parse_cgi_response(data).unwrap();
@@ -337,5 +346,30 @@ mod tests {
         let data = b"just a body with no headers";
         let resp = parse_cgi_response(data).unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn resolve_script_path_allows_files_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("run.cgi");
+        std::fs::write(&script, "echo ok").unwrap();
+
+        let resolved = resolve_script_path(dir.path(), "/run.cgi").unwrap();
+
+        assert_eq!(resolved, script.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_script_path_rejects_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().parent().unwrap().join("outside-gatel-cgi-test");
+        std::fs::write(&outside, "echo outside").unwrap();
+
+        let result = resolve_script_path(dir.path(), "/../outside-gatel-cgi-test");
+        let encoded = resolve_script_path(dir.path(), "/%2e%2e/outside-gatel-cgi-test");
+
+        std::fs::remove_file(&outside).unwrap();
+        assert_eq!(result, Err(CgiPathError::Forbidden));
+        assert_eq!(encoded, Err(CgiPathError::Forbidden));
     }
 }

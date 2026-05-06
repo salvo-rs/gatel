@@ -262,11 +262,14 @@ proxy {
 
 **Retry behavior:**
 
-- The request body is buffered in memory so it can be replayed on retries.
+- When `retries` is `0`, the request body streams to the upstream without being buffered by the reverse proxy.
+- When `retries` is greater than `0`, the request body is buffered in memory so it can be replayed on retries.
 - A request is retried when: (a) the upstream connection fails, or (b) the upstream returns a 5xx status code.
 - On retry, the load balancer is called again to select a (potentially different) backend. If there are multiple backends, Gatel tries to avoid the backend that just failed.
 - Total attempts = 1 (initial) + retries.
 - If all attempts fail, the error from the last attempt is returned to the client.
+
+HTTPS upstreams verify certificates against the bundled WebPKI trust roots by default. Use `tls-skip-verify true` only for isolated development or explicitly trusted private networks because it disables upstream certificate verification.
 
 ---
 
@@ -387,7 +390,7 @@ The complete request flow through the reverse proxy:
 3. **WebSocket check**: If the request is a WebSocket upgrade, it takes the dedicated WebSocket path.
 4. **LB context**: The load balancer receives the client address, URI, and request headers.
 5. **Backend selection**: The configured LB strategy picks a healthy backend.
-6. **Body buffering**: The request body is read into memory (needed for retries).
+6. **Body handling**: The request body streams directly unless retries are configured; retryable requests are buffered so they can be replayed.
 7. **Request construction**: The upstream URI is built, the Host header is rewritten, and `header-up` directives are applied.
 8. **Connection tracking**: An atomic counter is incremented (and decremented on drop via `ConnGuard`).
 9. **Forward**: The request is sent to the upstream via the pooled HTTP client.

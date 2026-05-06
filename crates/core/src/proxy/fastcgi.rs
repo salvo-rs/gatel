@@ -518,6 +518,8 @@ fn normalize_uri_path(uri_path: &str) -> Result<String, StatusCode> {
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let trailing_slash = decoded.ends_with('/') && decoded != "/";
+
     let mut segments = Vec::new();
     for segment in decoded.trim_start_matches('/').split('/') {
         match segment {
@@ -529,6 +531,8 @@ fn normalize_uri_path(uri_path: &str) -> Result<String, StatusCode> {
 
     if segments.is_empty() {
         Ok("/".to_string())
+    } else if trailing_slash {
+        Ok(format!("/{}/", segments.join("/")))
     } else {
         Ok(format!("/{}", segments.join("/")))
     }
@@ -674,6 +678,39 @@ mod tests {
         assert_eq!(lookup.get("SCRIPT_NAME").unwrap(), "/app/index.php");
         assert_eq!(lookup.get("PATH_INFO").unwrap(), "/foo");
         assert_eq!(lookup.get("PATH_TRANSLATED").unwrap(), "/srv/www/foo");
+    }
+
+    #[test]
+    fn build_params_appends_index_for_trailing_slash() {
+        let transport = FastCgiTransport::new(
+            "127.0.0.1:9000".into(),
+            "/srv/www".into(),
+            vec!["index.php".into()],
+            Some(".php".into()),
+            HashMap::new(),
+        );
+        let (parts, _) = http::Request::builder()
+            .uri("/admin/")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let params = transport.build_params(&parts, 0).unwrap();
+        let lookup: HashMap<_, _> = params.into_iter().collect();
+
+        assert_eq!(
+            lookup.get("SCRIPT_FILENAME").unwrap(),
+            "/srv/www/admin/index.php"
+        );
+        assert_eq!(lookup.get("SCRIPT_NAME").unwrap(), "/admin/index.php");
+    }
+
+    #[test]
+    fn normalize_uri_path_preserves_trailing_slash() {
+        assert_eq!(normalize_uri_path("/admin/").unwrap(), "/admin/");
+        assert_eq!(normalize_uri_path("/admin/sub/").unwrap(), "/admin/sub/");
+        assert_eq!(normalize_uri_path("/admin").unwrap(), "/admin");
+        assert_eq!(normalize_uri_path("/").unwrap(), "/");
+        assert_eq!(normalize_uri_path("/admin/.//").unwrap(), "/admin/");
     }
 
     #[test]
