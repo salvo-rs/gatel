@@ -215,7 +215,7 @@ fn verify_user(user: &AuthUser, username: &str, password: &str) -> bool {
             #[cfg(feature = "argon2")]
             {
                 use argon2::Argon2;
-                use password_hash::{PasswordHash, PasswordVerifier};
+                use argon2::password_hash::{PasswordHash, PasswordVerifier};
                 let parsed = match PasswordHash::new(&user.password_hash) {
                     Ok(h) => h,
                     Err(_) => return false,
@@ -235,13 +235,16 @@ fn verify_user(user: &AuthUser, username: &str, password: &str) -> bool {
         HashType::Scrypt => {
             #[cfg(feature = "scrypt")]
             {
-                use password_hash::{PasswordHash, PasswordVerifier};
                 use scrypt::Scrypt;
+                use scrypt::password_hash::PasswordVerifier;
+                use scrypt::phc::PasswordHash;
                 let parsed = match PasswordHash::new(&user.password_hash) {
                     Ok(h) => h,
                     Err(_) => return false,
                 };
-                Scrypt.verify_password(password.as_bytes(), &parsed).is_ok()
+                Scrypt::new()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
             }
             #[cfg(not(feature = "scrypt"))]
             {
@@ -254,8 +257,8 @@ fn verify_user(user: &AuthUser, username: &str, password: &str) -> bool {
         HashType::Pbkdf2 => {
             #[cfg(feature = "pbkdf2")]
             {
-                use password_hash::{PasswordHash, PasswordVerifier};
                 use pbkdf2::Pbkdf2;
+                use pbkdf2::password_hash::{PasswordHash, PasswordVerifier};
                 let parsed = match PasswordHash::new(&user.password_hash) {
                     Ok(h) => h,
                     Err(_) => return false,
