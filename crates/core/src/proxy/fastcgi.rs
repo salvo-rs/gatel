@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use bytes::{BufMut, BytesMut};
-use http::Response;
+use http::{Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -78,6 +78,11 @@ impl FastCgiTransport {
         req: &http::request::Parts,
         body: &[u8],
     ) -> Result<Response<Body>, ProxyError> {
+        let params = match self.build_params(req, body.len()) {
+            Ok(params) => params,
+            Err(status) => return status_response(status),
+        };
+
         // Connect to the FastCGI server via TCP.
         let mut stream = TcpStream::connect(&self.addr)
             .await
@@ -91,7 +96,6 @@ impl FastCgiTransport {
         stream.write_all(&begin_record).await?;
 
         // 2. Build and send PARAMS
-        let params = self.build_params(req, body.len());
         let encoded_params = encode_params(&params);
         send_stream_records(&mut stream, FCGI_PARAMS, FCGI_REQUEST_ID, &encoded_params).await?;
         // Empty PARAMS record to signal end of params.
@@ -149,15 +153,16 @@ impl FastCgiTransport {
         &self,
         req: &http::request::Parts,
         content_length: usize,
-    ) -> Vec<(String, String)> {
+    ) -> Result<Vec<(String, String)>, StatusCode> {
         let uri_path = req.uri.path();
         let query = req.uri.query().unwrap_or("");
+        let normalized_path = normalize_uri_path(uri_path)?;
 
         // Determine SCRIPT_NAME and PATH_INFO based on split_path.
         let (script_name, path_info) = if let Some(ref split) = self.split_path {
-            split_script_path(uri_path, split)
+            split_script_path(&normalized_path, split)
         } else {
-            (uri_path.to_string(), String::new())
+            (normalized_path, String::new())
         };
 
         // If the script name ends with '/' or is a directory, try index files.
@@ -167,17 +172,17 @@ impl FastCgiTransport {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "index.php".into());
-            format!("{}/{idx}", script_name.trim_end_matches('/'))
+            append_index_path(&script_name, &idx)?
         } else {
             script_name
         };
 
-        let script_filename = format!("{}{}", self.script_root.trim_end_matches('/'), script_name);
+        let script_filename = join_script_root(&self.script_root, &script_name);
 
         let path_translated = if path_info.is_empty() {
             String::new()
         } else {
-            format!("{}{}", self.script_root.trim_end_matches('/'), path_info)
+            join_script_root(&self.script_root, &path_info)
         };
 
         let server_name = req
@@ -241,7 +246,7 @@ impl FastCgiTransport {
             params.push((k.clone(), v.clone()));
         }
 
-        params
+        Ok(params)
     }
 }
 
@@ -507,6 +512,72 @@ fn split_script_path(path: &str, split: &str) -> (String, String) {
     }
 }
 
+fn normalize_uri_path(uri_path: &str) -> Result<String, StatusCode> {
+    let decoded = crate::encoding::percent_decode(uri_path);
+    if decoded.as_bytes().contains(&0) || decoded.contains('\\') {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let trailing_slash = decoded.ends_with('/') && decoded != "/";
+
+    let mut segments = Vec::new();
+    for segment in decoded.trim_start_matches('/').split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return Err(StatusCode::FORBIDDEN),
+            value => segments.push(value),
+        }
+    }
+
+    if segments.is_empty() {
+        Ok("/".to_string())
+    } else if trailing_slash {
+        Ok(format!("/{}/", segments.join("/")))
+    } else {
+        Ok(format!("/{}", segments.join("/")))
+    }
+}
+
+fn append_index_path(script_name: &str, index: &str) -> Result<String, StatusCode> {
+    if index.is_empty()
+        || index == "."
+        || index == ".."
+        || index.contains('/')
+        || index.contains('\\')
+        || index.as_bytes().contains(&0)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let base = script_name.trim_end_matches('/');
+    if base.is_empty() {
+        Ok(format!("/{index}"))
+    } else {
+        Ok(format!("{base}/{index}"))
+    }
+}
+
+fn join_script_root(script_root: &str, path: &str) -> String {
+    let root = script_root.trim_end_matches(['/', '\\']);
+    let path = path.trim_start_matches('/');
+    if root.is_empty() {
+        format!("/{path}")
+    } else {
+        format!("{root}/{path}")
+    }
+}
+
+fn status_response(status: StatusCode) -> Result<Response<Body>, ProxyError> {
+    let message = match status {
+        StatusCode::FORBIDDEN => "Forbidden",
+        StatusCode::NOT_FOUND => "Not Found",
+        _ => "Error",
+    };
+    Ok(Response::builder()
+        .status(status)
+        .body(full_body(message))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +633,103 @@ mod tests {
         let (script, info) = split_script_path("/app/style.css", ".php");
         assert_eq!(script, "/app/style.css");
         assert_eq!(info, "");
+    }
+
+    #[test]
+    fn build_params_rejects_traversal() {
+        let transport = FastCgiTransport::new(
+            "127.0.0.1:9000".into(),
+            "/srv/www".into(),
+            vec!["index.php".into()],
+            Some(".php".into()),
+            HashMap::new(),
+        );
+        let (parts, _) = http::Request::builder()
+            .uri("/%2e%2e/secret.php")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let err = transport.build_params(&parts, 0).unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn build_params_uses_normalized_script_filename() {
+        let transport = FastCgiTransport::new(
+            "127.0.0.1:9000".into(),
+            "/srv/www".into(),
+            vec!["index.php".into()],
+            Some(".php".into()),
+            HashMap::new(),
+        );
+        let (parts, _) = http::Request::builder()
+            .uri("/app/index.php/foo")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let params = transport.build_params(&parts, 0).unwrap();
+        let lookup: HashMap<_, _> = params.into_iter().collect();
+
+        assert_eq!(
+            lookup.get("SCRIPT_FILENAME").unwrap(),
+            "/srv/www/app/index.php"
+        );
+        assert_eq!(lookup.get("SCRIPT_NAME").unwrap(), "/app/index.php");
+        assert_eq!(lookup.get("PATH_INFO").unwrap(), "/foo");
+        assert_eq!(lookup.get("PATH_TRANSLATED").unwrap(), "/srv/www/foo");
+    }
+
+    #[test]
+    fn build_params_appends_index_for_trailing_slash() {
+        let transport = FastCgiTransport::new(
+            "127.0.0.1:9000".into(),
+            "/srv/www".into(),
+            vec!["index.php".into()],
+            Some(".php".into()),
+            HashMap::new(),
+        );
+        let (parts, _) = http::Request::builder()
+            .uri("/admin/")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let params = transport.build_params(&parts, 0).unwrap();
+        let lookup: HashMap<_, _> = params.into_iter().collect();
+
+        assert_eq!(
+            lookup.get("SCRIPT_FILENAME").unwrap(),
+            "/srv/www/admin/index.php"
+        );
+        assert_eq!(lookup.get("SCRIPT_NAME").unwrap(), "/admin/index.php");
+    }
+
+    #[test]
+    fn normalize_uri_path_preserves_trailing_slash() {
+        assert_eq!(normalize_uri_path("/admin/").unwrap(), "/admin/");
+        assert_eq!(normalize_uri_path("/admin/sub/").unwrap(), "/admin/sub/");
+        assert_eq!(normalize_uri_path("/admin").unwrap(), "/admin");
+        assert_eq!(normalize_uri_path("/").unwrap(), "/");
+        assert_eq!(normalize_uri_path("/admin/.//").unwrap(), "/admin/");
+    }
+
+    #[test]
+    fn build_params_rejects_unsafe_index_name() {
+        let transport = FastCgiTransport::new(
+            "127.0.0.1:9000".into(),
+            "/srv/www".into(),
+            vec!["../index.php".into()],
+            None,
+            HashMap::new(),
+        );
+        let (parts, _) = http::Request::builder()
+            .uri("/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let err = transport.build_params(&parts, 0).unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
     }
 
     #[test]
