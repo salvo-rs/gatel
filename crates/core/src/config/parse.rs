@@ -1087,27 +1087,41 @@ fn parse_route_condition(node: &KdlNode, negate: bool) -> Result<RouteCondition,
 ///
 /// ```kdl
 /// forward-proxy {
-///     allow-unauthenticated false
+///     allow-unauthenticated #false
 ///     user "alice" hash="$2b$..."
 ///     user "bob"   hash="plaintext"
 /// }
 /// ```
 fn parse_forward_proxy(node: &KdlNode) -> Result<ForwardProxyConfig, ConfigError> {
     let mut auth_users = Vec::new();
-    let mut allow_unauthenticated = node
-        .get("allow-unauthenticated")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let mut allow_unauthenticated = if let Some(value) = node.get("allow-unauthenticated") {
+        value.as_bool().ok_or_else(|| ConfigError::InvalidValue {
+            field: "forward-proxy allow-unauthenticated".into(),
+            detail: "expected boolean value (true or false)".into(),
+        })?
+    } else {
+        false
+    };
     if let Some(children) = node.children() {
         for child in children.nodes() {
             match child.name().to_string().as_str() {
                 "allow-unauthenticated" => {
-                    allow_unauthenticated = child
-                        .entries()
-                        .iter()
-                        .find(|e| e.name().is_none())
-                        .and_then(|e| e.value().as_bool())
-                        .unwrap_or(true);
+                    let positional = child.entries().iter().find(|e| e.name().is_none());
+                    allow_unauthenticated =
+                        match positional {
+                            Some(entry) => entry.value().as_bool().ok_or_else(|| {
+                                ConfigError::InvalidValue {
+                                    field: "forward-proxy allow-unauthenticated".into(),
+                                    detail: "expected boolean value (true or false)".into(),
+                                }
+                            })?,
+                            None => {
+                                return Err(ConfigError::InvalidValue {
+                                    field: "forward-proxy allow-unauthenticated".into(),
+                                    detail: "missing boolean value".into(),
+                                });
+                            }
+                        };
                 }
                 "user" => {
                     let username = first_string_arg(child).ok_or_else(|| {
@@ -1130,7 +1144,7 @@ fn parse_forward_proxy(node: &KdlNode) -> Result<ForwardProxyConfig, ConfigError
     if auth_users.is_empty() && !allow_unauthenticated {
         return Err(ConfigError::InvalidValue {
             field: "forward-proxy".into(),
-            detail: "at least one user is required unless allow-unauthenticated=true".into(),
+            detail: "at least one user is required unless allow-unauthenticated=#true".into(),
         });
     }
     Ok(ForwardProxyConfig {
@@ -2330,7 +2344,7 @@ site "proxy.example.com" {
         let input = r#"
 site "proxy.example.com" {
     route "/*" {
-        forward-proxy allow-unauthenticated=true
+        forward-proxy allow-unauthenticated=#true
     }
 }
 "#;
@@ -2343,6 +2357,49 @@ site "proxy.example.com" {
             }
             _ => panic!("expected forward proxy"),
         }
+    }
+
+    #[test]
+    fn test_forward_proxy_rejects_non_boolean_unauthenticated_attribute() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy allow-unauthenticated="false"
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
+    }
+
+    #[test]
+    fn test_forward_proxy_rejects_non_boolean_unauthenticated_child() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy {
+            allow-unauthenticated "false"
+        }
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
+    }
+
+    #[test]
+    fn test_forward_proxy_rejects_bare_unauthenticated_child() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy {
+            allow-unauthenticated
+        }
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
     }
 
     #[test]
