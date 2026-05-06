@@ -48,7 +48,8 @@ pub async fn start_admin_server(
     metrics: Arc<Metrics>,
 ) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "admin API server listening");
+    let bound_addr = listener.local_addr().unwrap_or(addr);
+    info!(%bound_addr, "admin API server listening");
 
     loop {
         let (stream, _client_addr) = match listener.accept().await {
@@ -67,7 +68,7 @@ pub async fn start_admin_server(
             let service = service_fn(move |req: Request<Incoming>| {
                 let state = Arc::clone(&state);
                 let metrics = Arc::clone(&metrics);
-                async move { handle_admin_request(req, state, &metrics).await }
+                async move { handle_admin_request(req, state, &metrics, bound_addr).await }
             });
 
             if let Err(e) =
@@ -88,6 +89,7 @@ async fn handle_admin_request(
     req: Request<Incoming>,
     state: Arc<AppState>,
     metrics: &Metrics,
+    bound_addr: SocketAddr,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -96,9 +98,13 @@ async fn handle_admin_request(
         .filter(|segment| !segment.is_empty())
         .collect();
     let config = state.config.load();
-    if let Err(response) =
-        authorize_admin_request(&req, &config.global, &method, segments.as_slice())
-    {
+    if let Err(response) = authorize_admin_request(
+        &req,
+        &config.global,
+        &method,
+        segments.as_slice(),
+        bound_addr,
+    ) {
         return Ok(*response);
     }
 
@@ -1032,10 +1038,11 @@ fn authorize_admin_request<B>(
     global: &GlobalConfig,
     method: &http::Method,
     segments: &[&str],
+    bound_addr: SocketAddr,
 ) -> AdminAuthorizationResult {
     let needs_write = admin_request_needs_write(method, segments);
 
-    if !admin_tokens_configured(global) && admin_requires_auth(global) {
+    if !admin_tokens_configured(global) && listener_requires_auth(bound_addr) {
         return Err(Box::new(json_response(
             StatusCode::UNAUTHORIZED,
             r#"{"error":"admin auth token required"}"#,
@@ -1090,10 +1097,16 @@ fn admin_tokens_configured(global: &GlobalConfig) -> bool {
         || global.admin_write_token.is_some()
 }
 
-fn admin_requires_auth(global: &GlobalConfig) -> bool {
-    global
-        .admin_addr
-        .is_some_and(|addr| !addr.ip().is_loopback())
+/// Whether the actual bound listener address requires authentication.
+///
+/// The decision is based on the socket the admin server is currently
+/// accepting connections on, not on the (potentially mutable)
+/// `global.admin_addr` config value. This prevents a hot-reload that
+/// rewrites `admin_addr` to a loopback address (or removes it entirely)
+/// from disabling auth on a non-loopback listener that is still serving
+/// remote clients.
+fn listener_requires_auth(bound_addr: SocketAddr) -> bool {
+    !bound_addr.ip().is_loopback()
 }
 
 fn admin_request_needs_write(method: &http::Method, segments: &[&str]) -> bool {
@@ -1350,6 +1363,14 @@ mod tests {
             .unwrap()
     }
 
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:2019".parse().unwrap()
+    }
+
+    fn remote() -> SocketAddr {
+        "0.0.0.0:2019".parse().unwrap()
+    }
+
     #[test]
     fn write_token_denies_mutation_for_read_only_token() {
         let mut req = request(http::Method::POST);
@@ -1364,7 +1385,8 @@ mod tests {
         };
 
         let response =
-            authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap_err();
+            authorize_admin_request(&req, &global, req.method(), &["services"], loopback())
+                .unwrap_err();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
@@ -1380,7 +1402,7 @@ mod tests {
             ..GlobalConfig::default()
         };
 
-        authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap();
+        authorize_admin_request(&req, &global, req.method(), &["services"], loopback()).unwrap();
         assert!(admin_request_needs_write(
             &http::Method::POST,
             &["services"]
@@ -1391,12 +1413,13 @@ mod tests {
     fn remote_admin_requires_configured_token() {
         let req = request(http::Method::GET);
         let global = GlobalConfig {
-            admin_addr: Some("0.0.0.0:2019".parse().unwrap()),
+            admin_addr: Some(remote()),
             ..GlobalConfig::default()
         };
 
         let response =
-            authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap_err();
+            authorize_admin_request(&req, &global, req.method(), &["services"], remote())
+                .unwrap_err();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1404,11 +1427,41 @@ mod tests {
     fn loopback_admin_allows_unauthenticated_local_dev() {
         let req = request(http::Method::GET);
         let global = GlobalConfig {
-            admin_addr: Some("127.0.0.1:2019".parse().unwrap()),
+            admin_addr: Some(loopback()),
             ..GlobalConfig::default()
         };
 
-        authorize_admin_request(&req, &global, req.method(), &["services"]).unwrap();
+        authorize_admin_request(&req, &global, req.method(), &["services"], loopback()).unwrap();
+    }
+
+    #[test]
+    fn remote_listener_keeps_requiring_auth_after_config_swap_to_loopback() {
+        // After a hot-reload swaps `admin_addr` to a loopback value (or
+        // removes it entirely), the still-running remote listener must
+        // continue requiring authentication.
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some(loopback()),
+            ..GlobalConfig::default()
+        };
+
+        let response =
+            authorize_admin_request(&req, &global, req.method(), &["services"], remote())
+                .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn loopback_listener_allows_unauthenticated_even_if_config_swapped_to_remote() {
+        // Conversely, an active loopback listener must not be locked down
+        // by a stale remote `admin_addr` value in the config.
+        let req = request(http::Method::GET);
+        let global = GlobalConfig {
+            admin_addr: Some(remote()),
+            ..GlobalConfig::default()
+        };
+
+        authorize_admin_request(&req, &global, req.method(), &["services"], loopback()).unwrap();
     }
 
     #[tokio::test]
