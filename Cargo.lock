@@ -963,7 +963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2269,7 +2269,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3169,7 +3169,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3237,7 +3237,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3282,9 +3282,9 @@ dependencies = [
 
 [[package]]
 name = "salvo"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f774d127ddc41784189f404d442c6f1aea1ed235bc24707c9fce67a3772867ba"
+checksum = "40cfaf23175e76ad1db0f61cdb1257f1dc5fb829eba958a87e5bc6e7b9ca4709"
 dependencies = [
  "salvo-compression",
  "salvo-cors",
@@ -3295,9 +3295,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-compression"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec53df3c9443a2ffe37ec8f12203306602cd0bf259b102278386fabc449faf41"
+checksum = "bc072c4a45e900c9bd7d772506859585da8c42db81913ecdd17747baf8529680"
 dependencies = [
  "brotli",
  "bytes",
@@ -3313,9 +3313,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-cors"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8607939cad0010ce970c40dfd9a26f038fb9463e7917deeaf70294a73ae23cef"
+checksum = "b979dc2032f6c17f1a4a71a2b44c26492b788b95a913b2d6dfee9e4b92804fe1"
 dependencies = [
  "bytes",
  "salvo_core",
@@ -3324,9 +3324,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-serde-util"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0f193188c58b4ccb58e50aad01ed69fe2d7a16ef7341f8d1a8e1ff12c47d653"
+checksum = "0187d25cd4186a3761560f91f4bbdb0213958164e16aed7ed4f45d9d84e945bd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3335,9 +3335,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-serve-static"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd1b0445b2ed6c0c3a1e7f1ddb4f13863f27d862f85aeb858d6df1e7029356e5"
+checksum = "0ef3a9e6f17195f90cf56bbdaf5d5a50f66fca905c8f72545eebc569774c1734"
 dependencies = [
  "hex",
  "mime",
@@ -3355,9 +3355,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_core"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b120bd530f90764aaef3a0ac1abda37111abbb1c346bd06e4132abff41721127"
+checksum = "7cfdd1110c4b15f0813f461f899d40ea41f090eee0c46cd9ed26887bb4261dc6"
 dependencies = [
  "async-trait",
  "base64",
@@ -3397,9 +3397,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_extra"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9190da345b23b80434c84841149f0cb3abc17cc1250ef1ce675b1387625522d2"
+checksum = "094931f8bdd5dbd459d7034fcfd007ed1f899142a123d83c73de842127acaa5f"
 dependencies = [
  "base64",
  "etag",
@@ -3419,9 +3419,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_macros"
-version = "0.92.2"
+version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22629da234ece928f1501caf6f8da65ba714f8fba56c4a78ec490749f1d92011"
+checksum = "95ba5fc67541cd8e1bb602f7a629a66426323965c3dc0e422f1bb3aebba12813"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3794,7 +3794,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "core-foundation 0.9.4",
  "system-configuration-sys",
 ]
@@ -3825,7 +3825,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4512,7 +4512,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
