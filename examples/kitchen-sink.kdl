@@ -11,6 +11,7 @@ global {
     https ":443"
     http3 #true
     proxy-protocol #true
+    trusted-proxy "10.0.0.0/8"
 }
 
 tls {

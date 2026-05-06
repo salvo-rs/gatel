@@ -452,6 +452,7 @@ route "/" {
 - `deny` — 拒绝匹配的 IP。
 - 规则按声明顺序匹配，第一个匹配的规则生效。
 - 如果没有规则匹配，默认允许。
+- `forwarded-for=true` 只有在直连对端匹配全局 `trusted-proxy` 时才会信任 `X-Forwarded-For`；未配置时只信任 loopback。
 
 ### CIDR 表示法
 
