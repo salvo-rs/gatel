@@ -1,9 +1,9 @@
 //! DNS-based dynamic upstream resolution.
 //!
 //! Periodically resolves a DNS name and updates an `UpstreamPool` with the
-//! resulting addresses.  Currently supports A/AAAA records via
-//! `tokio::net::lookup_host`; SRV record support is planned as a future
-//! extension.
+//! resulting addresses. Currently supports A/AAAA records via
+//! `tokio::net::lookup_host`; DNS SRV records are handled by
+//! `crate::proxy::srv_upstream`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -23,7 +23,7 @@ use super::upstream::Backend;
 pub enum DnsRecordType {
     /// A and AAAA records.  The port is taken from configuration.
     A,
-    /// SRV records (future extension).  Port comes from the SRV record.
+    /// SRV records. Port comes from the SRV record.
     SRV,
 }
 

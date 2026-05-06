@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 use self::activity::{BackendActivityGuard, BackendActivityTracker};
 use self::health::{HealthChecker, PassiveHealthChecker};
 use self::lb::*;
-use self::upstream::{ConnGuard, UpstreamPool};
+use self::upstream::{BackendSnapshot, ConnGuard, UpstreamPool};
 use crate::config::{LbPolicy, ProxyConfig};
 use crate::hoops::metrics::Metrics;
 use crate::{Body, ProxyError, goals};
@@ -289,22 +289,30 @@ impl ReverseProxy {
                 headers: request.headers().clone(),
             };
 
+            let snapshot = self.pool.snapshot();
             let backend_idx = self
-                .lb
-                .select(&self.pool, &ws_lb_ctx)
+                .select_backend(&snapshot, &ws_lb_ctx, None)
                 .ok_or(ProxyError::NoUpstream)?;
-            let backend = &self.pool.backends[backend_idx];
-            let activity_key = backend.activity_key.as_deref().unwrap_or(&backend.addr);
+            let backend = snapshot
+                .get(backend_idx)
+                .cloned()
+                .ok_or(ProxyError::NoUpstream)?;
+            let backend_addr = backend.backend.addr.clone();
+            let activity_key = backend
+                .backend
+                .activity_key
+                .clone()
+                .unwrap_or_else(|| backend_addr.clone());
             self.metrics.record_backend_selection(
                 &self.site_label,
                 &self.route_label,
-                &backend.addr,
+                &backend_addr,
                 self.lb.name(),
             );
-            let conn_guard = self.pool.acquire_conn(backend_idx);
+            let conn_guard = backend.acquire_conn();
             let activity_guard = self.backend_activity.acquire(activity_key);
 
-            return websocket::proxy_websocket(request, &backend.addr, conn_guard, activity_guard)
+            return websocket::proxy_websocket(request, &backend_addr, conn_guard, activity_guard)
                 .await;
         }
 
@@ -321,7 +329,8 @@ impl ReverseProxy {
 
         // --- Connection limit check ---
         if let Some(max_conns) = self.pool.max_connections {
-            let total = self.pool.total_active_conns();
+            let snapshot = self.pool.snapshot();
+            let total = snapshot.total_active_conns();
             if total >= max_conns {
                 warn!(
                     limit = max_conns,
@@ -337,6 +346,12 @@ impl ReverseProxy {
             }
         }
 
+        if self.retries == 0 {
+            return self
+                .proxy_without_retries(request, &lb_ctx, client_addr)
+                .await;
+        }
+
         // Collect the body bytes so we can replay on retries.
         let (parts, body) = request.into_parts();
         let body_bytes = body
@@ -346,22 +361,13 @@ impl ReverseProxy {
             .to_bytes();
 
         let max_attempts = 1 + self.retries;
-        let mut last_failed_idx: Option<usize> = None;
+        let mut last_failed_addr: Option<String> = None;
         let mut last_error: Option<ProxyError> = None;
 
         for attempt in 0..max_attempts {
             // --- Select a backend ---
-            let backend_idx = {
-                let idx = self.lb.select(&self.pool, &lb_ctx);
-                match idx {
-                    Some(i) if last_failed_idx == Some(i) && self.pool.len() > 1 => {
-                        // On retry, try to skip the backend that just failed.
-                        self.lb.select(&self.pool, &lb_ctx)
-                    }
-                    other => other,
-                }
-            };
-
+            let snapshot = self.pool.snapshot();
+            let backend_idx = self.select_backend(&snapshot, &lb_ctx, last_failed_addr.as_deref());
             let backend_idx = match backend_idx {
                 Some(i) => i,
                 None => {
@@ -369,17 +375,25 @@ impl ReverseProxy {
                 }
             };
 
-            let backend = &self.pool.backends[backend_idx];
-            let activity_key = backend.activity_key.as_deref().unwrap_or(&backend.addr);
+            let backend = snapshot
+                .get(backend_idx)
+                .cloned()
+                .ok_or(ProxyError::NoUpstream)?;
+            let backend_addr = backend.backend.addr.clone();
+            let activity_key = backend
+                .backend
+                .activity_key
+                .clone()
+                .unwrap_or_else(|| backend_addr.clone());
             self.metrics.record_backend_selection(
                 &self.site_label,
                 &self.route_label,
-                &backend.addr,
+                &backend_addr,
                 self.lb.name(),
             );
             debug!(
                 lb_policy = self.lb.name(),
-                upstream = %backend.addr,
+                upstream = %backend_addr,
                 uri = %lb_ctx.uri,
                 attempt = attempt + 1,
                 "selected upstream backend"
@@ -387,149 +401,26 @@ impl ReverseProxy {
 
             // --- Build the upstream request ---
             let mut req_parts = parts.clone();
-
-            // Optionally sanitize the URI path before forwarding.
-            if self.sanitize_uri {
-                let raw_pq = req_parts
-                    .uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str().to_string())
-                    .unwrap_or_else(|| "/".to_string());
-                let (raw_path, raw_query) = if let Some(pos) = raw_pq.find('?') {
-                    (&raw_pq[..pos], Some(&raw_pq[pos + 1..]))
-                } else {
-                    (raw_pq.as_str(), None)
-                };
-                let sanitized_path = sanitize_path(raw_path);
-                let sanitized_pq = match raw_query {
-                    Some(q) if !q.is_empty() => format!("{sanitized_path}?{q}"),
-                    _ => sanitized_path,
-                };
-                if let Ok(new_uri) = sanitized_pq.parse::<http::uri::PathAndQuery>() {
-                    // Rebuild the URI with sanitized path-and-query.
-                    let mut builder = Uri::builder();
-                    if let Some(scheme) = req_parts.uri.scheme() {
-                        builder = builder.scheme(scheme.clone());
-                    }
-                    if let Some(authority) = req_parts.uri.authority() {
-                        builder = builder.authority(authority.clone());
-                    }
-                    builder = builder.path_and_query(new_uri);
-                    if let Ok(u) = builder.build() {
-                        req_parts.uri = u;
-                    }
-                }
-            }
-
-            // Use the scheme embedded in the backend address if present,
-            // otherwise default to "http://".
-            let scheme =
-                if backend.addr.starts_with("https://") || backend.addr.starts_with("http://") {
-                    ""
-                } else {
-                    "http://"
-                };
-            let upstream_uri = format!(
-                "{}{}{}",
-                scheme,
-                backend.addr,
-                req_parts
-                    .uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str())
-                    .unwrap_or("/")
-            );
-            req_parts.uri = match upstream_uri.parse::<Uri>() {
-                Ok(u) => u,
-                Err(e) => {
-                    return Err(ProxyError::Internal(format!("invalid upstream URI: {e}")));
-                }
-            };
-
-            strip_hop_by_hop_headers(&mut req_parts.headers);
-
-            // Set the Host header to the upstream.
-            if let Ok(hv) = backend.addr.parse() {
-                req_parts.headers.insert(http::header::HOST, hv);
-            }
-
-            // Apply header-up directives.
-            for (name, value) in &self.headers_up {
-                if let Some(hdr_name) = name.strip_prefix('-') {
-                    if let Ok(hn) = hdr_name.parse::<http::header::HeaderName>() {
-                        req_parts.headers.remove(hn);
-                    }
-                } else {
-                    let expanded = value.replace("{client_ip}", &client_addr.ip().to_string());
-                    if let (Ok(hn), Ok(hv)) = (
-                        name.parse::<http::header::HeaderName>(),
-                        expanded.parse::<http::header::HeaderValue>(),
-                    ) {
-                        req_parts.headers.insert(hn, hv);
-                    }
-                }
-            }
-
-            // Apply header-up-replace directives (regex substitution on existing values).
-            for (name, re, replacement) in &self.headers_up_replace {
-                if let Ok(hn) = name.parse::<http::header::HeaderName>()
-                    && let Some(existing) = req_parts.headers.get(&hn)
-                    && let Ok(existing_str) = existing.to_str()
-                {
-                    let new_value = re.replace_all(existing_str, replacement.as_str());
-                    if let Ok(hv) = new_value.as_ref().parse::<http::header::HeaderValue>() {
-                        req_parts.headers.insert(hn, hv);
-                    }
-                }
-            }
+            self.prepare_upstream_parts(&mut req_parts, &backend_addr, client_addr)?;
 
             // Replay body from the buffered bytes.
             let req_body = crate::full_body(body_bytes.clone());
             let upstream_req = Request::from_parts(req_parts, req_body);
 
             debug!(
-                upstream = %backend.addr,
+                upstream = %backend_addr,
                 attempt = attempt + 1,
                 "forwarding request"
             );
 
             // --- Track active connections ---
-            let conn_guard = self.pool.acquire_conn(backend_idx);
+            let conn_guard = backend.acquire_conn();
             let activity_guard = self.backend_activity.acquire(activity_key);
 
             // --- Send the request ---
-            // Unix socket backends bypass the shared HTTPS connector.
-            let result = if is_unix_socket(&backend.addr) {
-                #[cfg(unix)]
-                {
-                    let path = unix_socket_path(&backend.addr);
-                    send_via_unix(path, upstream_req).await.map(|r| {
-                        r.map(|b| {
-                            let b: Body = b.map_err(|e| -> crate::BoxError { Box::new(e) }).boxed();
-                            b
-                        })
-                    })
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = upstream_req;
-                    Err(ProxyError::Internal(
-                        "Unix domain socket upstreams are not supported on this platform".into(),
-                    ))
-                }
-            } else {
-                self.pool
-                    .client
-                    .request(upstream_req)
-                    .await
-                    .map_err(ProxyError::Client)
-                    .map(|r| {
-                        r.map(|b| {
-                            let b: Body = b.map_err(|e| -> crate::BoxError { Box::new(e) }).boxed();
-                            b
-                        })
-                    })
-            };
+            let result = self
+                .send_upstream_request(&backend_addr, upstream_req)
+                .await;
 
             match result {
                 Ok(resp) => {
@@ -540,21 +431,21 @@ impl ReverseProxy {
                     if resp_parts.status.is_server_error()
                         && let Some(ref ph) = self.passive_health
                     {
-                        ph.record_failure(backend_idx, &self.pool).await;
+                        ph.record_failure(&backend).await;
                     }
 
                     // If server error and we have retries left, retry.
                     if resp_parts.status.is_server_error() && attempt + 1 < max_attempts {
                         warn!(
-                            upstream = %backend.addr,
+                            upstream = %backend_addr,
                             status = %resp_parts.status,
                             attempt = attempt + 1,
                             "upstream returned server error, retrying"
                         );
-                        last_failed_idx = Some(backend_idx);
+                        last_failed_addr = Some(backend_addr.clone());
                         last_error = Some(ProxyError::Internal(format!(
                             "upstream {} returned {}",
-                            backend.addr, resp_parts.status
+                            backend_addr, resp_parts.status
                         )));
                         continue;
                     }
@@ -577,7 +468,8 @@ impl ReverseProxy {
 
                     // Passive health recovery check.
                     if let Some(ref ph) = self.passive_health {
-                        ph.maybe_recover(&self.pool).await;
+                        let recovery_snapshot = self.pool.snapshot();
+                        ph.maybe_recover(&recovery_snapshot).await;
                     }
 
                     // Error page interception: if the upstream status code has a
@@ -606,17 +498,17 @@ impl ReverseProxy {
                 Err(e) => {
                     // Passive health: record connection failure as well.
                     if let Some(ref ph) = self.passive_health {
-                        ph.record_failure(backend_idx, &self.pool).await;
+                        ph.record_failure(&backend).await;
                     }
 
                     if attempt + 1 < max_attempts {
                         warn!(
-                            upstream = %backend.addr,
+                            upstream = %backend_addr,
                             error = %e,
                             attempt = attempt + 1,
                             "upstream request failed, retrying"
                         );
-                        last_failed_idx = Some(backend_idx);
+                        last_failed_addr = Some(backend_addr);
                         last_error = Some(e);
                         continue;
                     }
@@ -629,11 +521,292 @@ impl ReverseProxy {
         // Should not be reached, but just in case:
         Err(last_error.unwrap_or(ProxyError::NoUpstream))
     }
+
+    fn select_backend(
+        &self,
+        snapshot: &BackendSnapshot,
+        lb_ctx: &LbContext,
+        avoid_addr: Option<&str>,
+    ) -> Option<usize> {
+        let selected = self.lb.select(snapshot, lb_ctx);
+        let Some(avoid_addr) = avoid_addr else {
+            return selected;
+        };
+        let selected_idx = selected?;
+        let selected_is_avoided = snapshot
+            .get(selected_idx)
+            .map(|entry| entry.backend.addr == avoid_addr)
+            .unwrap_or(false);
+
+        if selected_is_avoided && snapshot.len() > 1 {
+            snapshot
+                .entries()
+                .iter()
+                .enumerate()
+                .find(|(_, entry)| entry.is_healthy() && entry.backend.addr != avoid_addr)
+                .map(|(idx, _)| idx)
+                .or(selected)
+        } else {
+            selected
+        }
+    }
+
+    async fn proxy_without_retries(
+        &self,
+        request: Request<Body>,
+        lb_ctx: &LbContext,
+        client_addr: std::net::SocketAddr,
+    ) -> Result<Response<Body>, ProxyError> {
+        let snapshot = self.pool.snapshot();
+        let backend_idx = self
+            .select_backend(&snapshot, lb_ctx, None)
+            .ok_or(ProxyError::NoUpstream)?;
+        let backend = snapshot
+            .get(backend_idx)
+            .cloned()
+            .ok_or(ProxyError::NoUpstream)?;
+        let backend_addr = backend.backend.addr.clone();
+        let activity_key = backend
+            .backend
+            .activity_key
+            .clone()
+            .unwrap_or_else(|| backend_addr.clone());
+        self.metrics.record_backend_selection(
+            &self.site_label,
+            &self.route_label,
+            &backend_addr,
+            self.lb.name(),
+        );
+        debug!(
+            lb_policy = self.lb.name(),
+            upstream = %backend_addr,
+            uri = %lb_ctx.uri,
+            attempt = 1,
+            "selected upstream backend"
+        );
+
+        let (mut req_parts, req_body) = request.into_parts();
+        self.prepare_upstream_parts(&mut req_parts, &backend_addr, client_addr)?;
+        let upstream_req = Request::from_parts(req_parts, req_body);
+
+        let conn_guard = backend.acquire_conn();
+        let activity_guard = self.backend_activity.acquire(activity_key);
+        let resp = match self
+            .send_upstream_request(&backend_addr, upstream_req)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                if let Some(ref ph) = self.passive_health {
+                    ph.record_failure(&backend).await;
+                }
+                return Err(e);
+            }
+        };
+
+        let (mut resp_parts, resp_body) = resp.into_parts();
+        strip_hop_by_hop_headers(&mut resp_parts.headers);
+
+        if resp_parts.status.is_server_error()
+            && let Some(ref ph) = self.passive_health
+        {
+            ph.record_failure(&backend).await;
+        }
+
+        for (name, value) in &self.headers_down {
+            if let Some(hdr_name) = name.strip_prefix('-') {
+                if let Ok(hn) = hdr_name.parse::<http::header::HeaderName>() {
+                    resp_parts.headers.remove(hn);
+                }
+            } else if let (Ok(hn), Ok(hv)) = (
+                name.parse::<http::header::HeaderName>(),
+                value.parse::<http::header::HeaderValue>(),
+            ) {
+                resp_parts.headers.insert(hn, hv);
+            }
+        }
+
+        if let Some(ref ph) = self.passive_health {
+            let recovery_snapshot = self.pool.snapshot();
+            ph.maybe_recover(&recovery_snapshot).await;
+        }
+
+        let status_code = resp_parts.status.as_u16();
+        if let Some(error_body) = self.error_pages.get(&status_code) {
+            debug!(
+                status = status_code,
+                "intercepting upstream error with configured error page"
+            );
+            return Ok(Response::from_parts(
+                resp_parts,
+                crate::full_body(error_body.clone()),
+            ));
+        }
+
+        Ok(Response::from_parts(
+            resp_parts,
+            http_body_util::BodyExt::boxed(GuardedBody::new(resp_body, conn_guard, activity_guard)),
+        ))
+    }
+
+    fn prepare_upstream_parts(
+        &self,
+        req_parts: &mut http::request::Parts,
+        backend_addr: &str,
+        client_addr: std::net::SocketAddr,
+    ) -> Result<(), ProxyError> {
+        if self.sanitize_uri {
+            sanitize_request_uri(&mut req_parts.uri);
+        }
+
+        req_parts.uri = build_upstream_uri(backend_addr, &req_parts.uri)?;
+        strip_hop_by_hop_headers(&mut req_parts.headers);
+
+        if let Some(authority) = backend_authority(backend_addr)
+            && let Ok(host) = authority.parse::<http::header::HeaderValue>()
+        {
+            req_parts.headers.insert(http::header::HOST, host);
+        }
+
+        for (name, value) in &self.headers_up {
+            if let Some(hdr_name) = name.strip_prefix('-') {
+                if let Ok(hn) = hdr_name.parse::<http::header::HeaderName>() {
+                    req_parts.headers.remove(hn);
+                }
+            } else {
+                let expanded = value.replace("{client_ip}", &client_addr.ip().to_string());
+                if let (Ok(hn), Ok(hv)) = (
+                    name.parse::<http::header::HeaderName>(),
+                    expanded.parse::<http::header::HeaderValue>(),
+                ) {
+                    req_parts.headers.insert(hn, hv);
+                }
+            }
+        }
+
+        for (name, re, replacement) in &self.headers_up_replace {
+            if let Ok(hn) = name.parse::<http::header::HeaderName>()
+                && let Some(existing) = req_parts.headers.get(&hn)
+                && let Ok(existing_str) = existing.to_str()
+            {
+                let new_value = re.replace_all(existing_str, replacement.as_str());
+                if let Ok(hv) = new_value.as_ref().parse::<http::header::HeaderValue>() {
+                    req_parts.headers.insert(hn, hv);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_upstream_request(
+        &self,
+        backend_addr: &str,
+        upstream_req: Request<Body>,
+    ) -> Result<Response<Body>, ProxyError> {
+        if is_unix_socket(backend_addr) {
+            #[cfg(unix)]
+            {
+                let path = unix_socket_path(backend_addr);
+                send_via_unix(path, upstream_req).await.map(|r| {
+                    r.map(|b| {
+                        let b: Body = b.map_err(|e| -> crate::BoxError { Box::new(e) }).boxed();
+                        b
+                    })
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = upstream_req;
+                Err(ProxyError::Internal(
+                    "Unix domain socket upstreams are not supported on this platform".into(),
+                ))
+            }
+        } else {
+            self.pool
+                .client
+                .request(upstream_req)
+                .await
+                .map_err(ProxyError::Client)
+                .map(|r| {
+                    r.map(|b| {
+                        let b: Body = b.map_err(|e| -> crate::BoxError { Box::new(e) }).boxed();
+                        b
+                    })
+                })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // URI sanitization helpers
 // ---------------------------------------------------------------------------
+
+fn sanitize_request_uri(uri: &mut Uri) {
+    let raw_pq = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let (raw_path, raw_query) = if let Some(pos) = raw_pq.find('?') {
+        (&raw_pq[..pos], Some(&raw_pq[pos + 1..]))
+    } else {
+        (raw_pq.as_str(), None)
+    };
+    let sanitized_path = sanitize_path(raw_path);
+    let sanitized_pq = match raw_query {
+        Some(q) if !q.is_empty() => format!("{sanitized_path}?{q}"),
+        _ => sanitized_path,
+    };
+    if let Ok(new_pq) = sanitized_pq.parse::<http::uri::PathAndQuery>() {
+        let mut builder = Uri::builder();
+        if let Some(scheme) = uri.scheme() {
+            builder = builder.scheme(scheme.clone());
+        }
+        if let Some(authority) = uri.authority() {
+            builder = builder.authority(authority.clone());
+        }
+        builder = builder.path_and_query(new_pq);
+        if let Ok(new_uri) = builder.build() {
+            *uri = new_uri;
+        }
+    }
+}
+
+fn build_upstream_uri(backend_addr: &str, request_uri: &Uri) -> Result<Uri, ProxyError> {
+    let scheme = if backend_addr.starts_with("https://") || backend_addr.starts_with("http://") {
+        ""
+    } else {
+        "http://"
+    };
+    let upstream_uri = format!(
+        "{}{}{}",
+        scheme,
+        backend_addr,
+        request_uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+    );
+    upstream_uri
+        .parse::<Uri>()
+        .map_err(|e| ProxyError::Internal(format!("invalid upstream URI: {e}")))
+}
+
+fn backend_authority(backend_addr: &str) -> Option<String> {
+    if is_unix_socket(backend_addr) {
+        return None;
+    }
+    let normalized = if backend_addr.starts_with("https://") || backend_addr.starts_with("http://")
+    {
+        backend_addr.to_string()
+    } else {
+        format!("http://{backend_addr}")
+    };
+    normalized.parse::<Uri>().ok().and_then(|uri| {
+        uri.authority()
+            .map(|authority| authority.as_str().to_string())
+    })
+}
 
 /// Sanitize a URI path by:
 /// 1. Collapsing consecutive slashes (e.g. `//foo///bar` → `/foo/bar`).
@@ -745,5 +918,40 @@ mod tests {
         assert!(names.iter().any(|name| name == "keep-alive"));
         assert!(names.iter().any(|name| name == "x-one"));
         assert!(names.iter().any(|name| name == "x-two"));
+    }
+
+    #[test]
+    fn backend_authority_strips_scheme_for_host_header() {
+        assert_eq!(
+            backend_authority("https://api.example.com:8443"),
+            Some("api.example.com:8443".to_string())
+        );
+        assert_eq!(
+            backend_authority("127.0.0.1:3000"),
+            Some("127.0.0.1:3000".to_string())
+        );
+    }
+
+    #[test]
+    fn build_upstream_uri_preserves_https_backend_scheme() {
+        let request_uri: Uri = "/v1/users?active=true".parse().unwrap();
+        let upstream_uri = build_upstream_uri("https://api.example.com", &request_uri).unwrap();
+
+        assert_eq!(
+            upstream_uri.to_string(),
+            "https://api.example.com/v1/users?active=true"
+        );
+    }
+
+    #[test]
+    fn sanitize_request_uri_collapses_parent_segments() {
+        let mut uri: Uri = "/api/../admin//users?debug=true".parse().unwrap();
+
+        sanitize_request_uri(&mut uri);
+
+        assert_eq!(
+            uri.path_and_query().unwrap().as_str(),
+            "/admin/users?debug=true"
+        );
     }
 }

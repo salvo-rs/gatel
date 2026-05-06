@@ -170,12 +170,14 @@ global {
 
 ```kdl
 admin "127.0.0.1:2019"
+admin-auth-token "change-this-token"
 ```
 
 Starts the Admin REST API on the given address. When omitted, the admin API is disabled.
 
 - **Type**: address string
 - **Default**: disabled
+- **Security**: bind to loopback unless a trusted network boundary is in front of the listener. If `admin-auth-token`, `admin-read-token`, and `admin-write-token` are all omitted, the admin API accepts unauthenticated requests; Gatel logs a warning when such a listener is exposed on a non-loopback address.
 
 ### log
 
