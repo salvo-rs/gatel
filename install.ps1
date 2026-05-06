@@ -57,6 +57,32 @@ function Get-Arch {
     }
 }
 
+function Get-Target([string]$Arch) {
+    switch ($Arch) {
+        "x86_64" { return "x86_64-pc-windows-msvc" }
+        default  { throw "Unsupported prebuilt Windows target: windows/$Arch" }
+    }
+}
+
+function Verify-Checksum([string]$FilePath, [string]$ChecksumsPath, [string]$AssetName) {
+    $line = Get-Content $ChecksumsPath | Where-Object {
+        $parts = $_ -split '\s+', 2
+        $parts.Count -eq 2 -and $parts[1] -eq $AssetName
+    } | Select-Object -First 1
+
+    if (-not $line) {
+        throw "Checksum for $AssetName not found"
+    }
+
+    $expected = (($line -split '\s+', 2)[0]).ToLowerInvariant()
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $FilePath).Hash.ToLowerInvariant()
+    if ($expected -ne $actual) {
+        throw "Checksum verification failed for $AssetName"
+    }
+
+    Write-Info "Verified checksum for $AssetName"
+}
+
 # ---------------------------------------------------------------------------
 # Install from source
 # ---------------------------------------------------------------------------
@@ -104,6 +130,7 @@ function Install-FromSource {
 
 function Install-FromBinary {
     $arch = Get-Arch
+    $target = Get-Target $arch
     Write-Info "Detected: windows/$arch"
 
     $tag = $Version
@@ -118,8 +145,9 @@ function Install-FromBinary {
         }
     }
 
-    $assetName = "gatel-$tag-$arch-windows.zip"
+    $assetName = "gatel-$tag-$target.zip"
     $downloadUrl = "https://github.com/$Repo/releases/download/$tag/$assetName"
+    $checksumUrl = "https://github.com/$Repo/releases/download/$tag/checksums-sha256.txt"
 
     Write-Info "Downloading gatel $tag for windows/$arch..."
 
@@ -135,6 +163,16 @@ function Install-FromBinary {
             Install-FromSource
             return
         }
+
+        $checksumsPath = Join-Path $tmpDir "checksums-sha256.txt"
+        try {
+            Invoke-WebRequest -Uri $checksumUrl -OutFile $checksumsPath -ErrorAction Stop
+        } catch {
+            Write-Warn "Checksum download failed. Falling back to source build."
+            Install-FromSource
+            return
+        }
+        Verify-Checksum -FilePath $zipPath -ChecksumsPath $checksumsPath -AssetName $assetName
 
         Write-Info "Extracting..."
         Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
