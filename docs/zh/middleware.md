@@ -539,7 +539,9 @@ route "/" {
 
 - 仅缓存 GET 和 HEAD 请求。
 - 仅缓存 2xx 响应。
-- 尊重 `Cache-Control: no-store` 和 `Cache-Control: no-cache` 头。
+- 尊重 `Cache-Control: no-store`、`Cache-Control: no-cache` 和 `Cache-Control: private`。
+- 携带 `Authorization` 或 `Cookie` 的请求默认绕过缓存；只有响应显式 `Cache-Control: public` 时才会写入缓存。
+- `Vary: *` 响应不会被缓存，其他 `Vary` 字段会参与缓存键。
 - 缓存使用 dashmap 实现，支持并发访问。
 
 ### 配置示例
