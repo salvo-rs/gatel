@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http::{Request, Response, StatusCode};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -26,6 +26,8 @@ use crate::runtime_services::{
 };
 use crate::server::{AppState, RuntimeStateError};
 use crate::{Body, ProxyError, full_body};
+
+const MAX_ADMIN_JSON_BODY_SIZE: usize = 1024 * 1024;
 
 #[derive(serde::Serialize)]
 struct RuntimeTargetView {
@@ -999,9 +1001,18 @@ async fn json_body<T>(req: Request<Incoming>) -> Result<T, Response<Body>>
 where
     T: serde::de::DeserializeOwned,
 {
-    let body_bytes = match req.into_body().collect().await {
+    let body_bytes = match Limited::new(req.into_body(), MAX_ADMIN_JSON_BODY_SIZE)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
         Err(error) => {
+            if error.downcast_ref::<LengthLimitError>().is_some() {
+                return Err(json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"request body too large"}"#,
+                ));
+            }
             return Err(json_response(
                 StatusCode::BAD_REQUEST,
                 &format!(r#"{{"error":"failed to read body: {error}"}}"#),
