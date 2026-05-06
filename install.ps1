@@ -60,7 +60,7 @@ function Get-Arch {
 function Get-Target([string]$Arch) {
     switch ($Arch) {
         "x86_64" { return "x86_64-pc-windows-msvc" }
-        default  { throw "Unsupported prebuilt Windows target: windows/$Arch" }
+        default  { return $null }
     }
 }
 
@@ -131,6 +131,11 @@ function Install-FromSource {
 function Install-FromBinary {
     $arch = Get-Arch
     $target = Get-Target $arch
+    if (-not $target) {
+        Write-Warn "No prebuilt binary available for windows/$arch. Falling back to source build."
+        Install-FromSource
+        return
+    }
     Write-Info "Detected: windows/$arch"
 
     $tag = $Version
