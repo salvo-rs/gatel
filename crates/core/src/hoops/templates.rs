@@ -167,8 +167,12 @@ fn process_template(input: &str, vars: &TemplateVars, hoop: &TemplatesHoop) -> S
             }
         }
 
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch = input[i..]
+            .chars()
+            .next()
+            .expect("index is always on a UTF-8 character boundary");
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     result
@@ -380,5 +384,14 @@ mod tests {
         let output = process_template(&template, &vars(), &hoop);
 
         assert_eq!(output, "");
+    }
+
+    #[test]
+    fn process_template_preserves_utf8_text() {
+        let hoop = TemplatesHoop::new(None, false, false);
+
+        let rendered = process_template("你好 {{path}}", &vars(), &hoop);
+
+        assert_eq!(rendered, "你好 /index.html");
     }
 }

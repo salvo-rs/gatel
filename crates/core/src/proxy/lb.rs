@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Mutex;
@@ -6,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use http::HeaderMap;
 
-use super::upstream::UpstreamPool;
+use super::upstream::BackendSnapshot;
 
 // ---------------------------------------------------------------------------
 // Context passed to load balancers that need request-level information
@@ -32,7 +33,7 @@ pub trait LoadBalancer: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Choose a backend index.  Returns `None` when no backend is available.
-    fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize>;
+    fn select(&self, backends: &BackendSnapshot, ctx: &LbContext) -> Option<usize>;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,15 +64,15 @@ impl LoadBalancer for RoundRobinLb {
         "round_robin"
     }
 
-    fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
-        let n = pool.len();
+    fn select(&self, backends: &BackendSnapshot, _ctx: &LbContext) -> Option<usize> {
+        let n = backends.len();
         if n == 0 {
             return None;
         }
         // Try up to `n` times to find a healthy backend.
         for _ in 0..n {
             let idx = self.counter.fetch_add(1, Ordering::Relaxed) % n;
-            if pool.is_healthy(idx) {
+            if backends.is_healthy(idx) {
                 return Some(idx);
             }
         }
@@ -103,10 +104,12 @@ impl LoadBalancer for RandomLb {
         "random"
     }
 
-    fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
+    fn select(&self, backends: &BackendSnapshot, _ctx: &LbContext) -> Option<usize> {
         use rand::prelude::IndexedRandom;
 
-        let healthy_indices: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
+        let healthy_indices: Vec<usize> = (0..backends.len())
+            .filter(|&i| backends.is_healthy(i))
+            .collect();
         if healthy_indices.is_empty() {
             return None;
         }
@@ -127,7 +130,7 @@ impl LoadBalancer for RandomLb {
 ///   - `current_weight` (accumulates each round; the backend with the highest current_weight is
 ///     selected, then has total_weight subtracted).
 pub struct WeightedRoundRobinLb {
-    state: Mutex<Vec<WrrEntry>>,
+    state: Mutex<HashMap<String, WrrEntry>>,
 }
 
 struct WrrEntry {
@@ -136,16 +139,9 @@ struct WrrEntry {
 }
 
 impl WeightedRoundRobinLb {
-    pub fn new(weights: &[u32]) -> Self {
-        let state = weights
-            .iter()
-            .map(|&w| WrrEntry {
-                effective_weight: w as i64,
-                current_weight: 0,
-            })
-            .collect();
+    pub fn new(_weights: &[u32]) -> Self {
         Self {
-            state: Mutex::new(state),
+            state: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -155,20 +151,33 @@ impl LoadBalancer for WeightedRoundRobinLb {
         "weighted_round_robin"
     }
 
-    fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
-        let mut entries = self.state.lock().ok()?;
-        if entries.is_empty() {
+    fn select(&self, backends: &BackendSnapshot, _ctx: &LbContext) -> Option<usize> {
+        if backends.is_empty() {
             return None;
         }
+        let mut state = self.state.lock().ok()?;
+        let active_addrs: HashSet<&str> = backends
+            .entries()
+            .iter()
+            .map(|entry| entry.backend.addr.as_str())
+            .collect();
+        state.retain(|addr, _| active_addrs.contains(addr.as_str()));
 
         let mut total: i64 = 0;
         let mut best_idx: Option<usize> = None;
         let mut best_weight: i64 = i64::MIN;
 
-        for (i, entry) in entries.iter_mut().enumerate() {
-            if !pool.is_healthy(i) {
+        for (i, backend) in backends.entries().iter().enumerate() {
+            if !backend.is_healthy() {
                 continue;
             }
+            let entry = state
+                .entry(backend.backend.addr.clone())
+                .or_insert_with(|| WrrEntry {
+                    effective_weight: i64::from(backend.backend.weight.max(1)),
+                    current_weight: 0,
+                });
+            entry.effective_weight = i64::from(backend.backend.weight.max(1));
             entry.current_weight += entry.effective_weight;
             total += entry.effective_weight;
 
@@ -178,8 +187,11 @@ impl LoadBalancer for WeightedRoundRobinLb {
             }
         }
 
-        if let Some(idx) = best_idx {
-            entries[idx].current_weight -= total;
+        if let Some(idx) = best_idx
+            && let Some(backend) = backends.get(idx)
+            && let Some(entry) = state.get_mut(&backend.backend.addr)
+        {
+            entry.current_weight -= total;
         }
 
         best_idx
@@ -210,8 +222,10 @@ impl LoadBalancer for IpHashLb {
         "ip_hash"
     }
 
-    fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
-        let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
+    fn select(&self, backends: &BackendSnapshot, ctx: &LbContext) -> Option<usize> {
+        let healthy: Vec<usize> = (0..backends.len())
+            .filter(|&i| backends.is_healthy(i))
+            .collect();
         if healthy.is_empty() {
             return None;
         }
@@ -244,15 +258,15 @@ impl LoadBalancer for LeastConnLb {
         "least_conn"
     }
 
-    fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
+    fn select(&self, backends: &BackendSnapshot, _ctx: &LbContext) -> Option<usize> {
         let mut best_idx: Option<usize> = None;
         let mut best_count = usize::MAX;
 
-        for i in 0..pool.len() {
-            if !pool.is_healthy(i) {
+        for i in 0..backends.len() {
+            if !backends.is_healthy(i) {
                 continue;
             }
-            let count = pool.conn_count(i);
+            let count = backends.conn_count(i);
             if count < best_count {
                 best_count = count;
                 best_idx = Some(i);
@@ -288,8 +302,10 @@ impl LoadBalancer for UriHashLb {
         "uri_hash"
     }
 
-    fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
-        let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
+    fn select(&self, backends: &BackendSnapshot, ctx: &LbContext) -> Option<usize> {
+        let healthy: Vec<usize> = (0..backends.len())
+            .filter(|&i| backends.is_healthy(i))
+            .collect();
         if healthy.is_empty() {
             return None;
         }
@@ -318,8 +334,10 @@ impl LoadBalancer for HeaderHashLb {
         "header_hash"
     }
 
-    fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
-        let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
+    fn select(&self, backends: &BackendSnapshot, ctx: &LbContext) -> Option<usize> {
+        let healthy: Vec<usize> = (0..backends.len())
+            .filter(|&i| backends.is_healthy(i))
+            .collect();
         if healthy.is_empty() {
             return None;
         }
@@ -355,8 +373,10 @@ impl LoadBalancer for CookieHashLb {
         "cookie_hash"
     }
 
-    fn select(&self, pool: &UpstreamPool, ctx: &LbContext) -> Option<usize> {
-        let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
+    fn select(&self, backends: &BackendSnapshot, ctx: &LbContext) -> Option<usize> {
+        let healthy: Vec<usize> = (0..backends.len())
+            .filter(|&i| backends.is_healthy(i))
+            .collect();
         if healthy.is_empty() {
             return None;
         }
@@ -391,8 +411,8 @@ impl LoadBalancer for FirstLb {
         "first"
     }
 
-    fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
-        (0..pool.len()).find(|&i| pool.is_healthy(i))
+    fn select(&self, backends: &BackendSnapshot, _ctx: &LbContext) -> Option<usize> {
+        (0..backends.len()).find(|&i| backends.is_healthy(i))
     }
 }
 
@@ -428,10 +448,12 @@ impl LoadBalancer for TwoRandomChoicesLb {
         "two_random_choices"
     }
 
-    fn select(&self, pool: &UpstreamPool, _ctx: &LbContext) -> Option<usize> {
+    fn select(&self, backends: &BackendSnapshot, _ctx: &LbContext) -> Option<usize> {
         use rand::prelude::IndexedRandom;
 
-        let healthy: Vec<usize> = (0..pool.len()).filter(|&i| pool.is_healthy(i)).collect();
+        let healthy: Vec<usize> = (0..backends.len())
+            .filter(|&i| backends.is_healthy(i))
+            .collect();
         match healthy.len() {
             0 => None,
             1 => Some(healthy[0]),
@@ -442,7 +464,7 @@ impl LoadBalancer for TwoRandomChoicesLb {
                 let a = candidates[0];
                 let b = candidates[1];
                 // Pick the backend with fewer active connections.
-                if pool.conn_count(a) <= pool.conn_count(b) {
+                if backends.conn_count(a) <= backends.conn_count(b) {
                     Some(a)
                 } else {
                     Some(b)
@@ -489,6 +511,7 @@ mod tests {
 
     use super::*;
     use crate::config::{LbPolicy, ProxyConfig, UpstreamConfig};
+    use crate::proxy::upstream::UpstreamPool;
 
     fn proxy_config() -> ProxyConfig {
         ProxyConfig {
@@ -528,6 +551,7 @@ mod tests {
     fn cookie_hash_falls_back_to_remaining_healthy_backend() {
         let pool = UpstreamPool::from_config(&proxy_config());
         pool.set_healthy(0, false);
+        let snapshot = pool.snapshot();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -542,9 +566,32 @@ mod tests {
         };
 
         let selected = CookieHashLb::new("deploy".to_string())
-            .select(&pool, &ctx)
+            .select(&snapshot, &ctx)
             .unwrap();
 
         assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn weighted_round_robin_reads_weights_from_snapshot() {
+        let mut config = proxy_config();
+        config.upstreams[0].weight = 3;
+        config.upstreams[1].weight = 1;
+        let pool = UpstreamPool::from_config(&config);
+        let snapshot = pool.snapshot();
+        let ctx = LbContext {
+            client_addr: "127.0.0.1:1234".parse().unwrap(),
+            uri: "/api".to_string(),
+            headers: HeaderMap::new(),
+        };
+        let lb = WeightedRoundRobinLb::new(&[]);
+
+        let mut selections = [0usize; 2];
+        for _ in 0..4 {
+            let selected = lb.select(&snapshot, &ctx).unwrap();
+            selections[selected] += 1;
+        }
+
+        assert_eq!(selections, [3, 1]);
     }
 }

@@ -190,7 +190,8 @@ import "conf.d/static.kdl"
 
 ```kdl
 global {
-    admin ":2019"
+    admin "127.0.0.1:2019"
+    admin-auth-token "change-this-token"
 }
 ```
 
@@ -203,6 +204,8 @@ global {
 | `/health` | GET | 健康状态 |
 | `/upstreams` | GET | 上游后端状态 |
 | `/metrics` | GET | Prometheus 指标 |
+
+安全建议：除非前面有可信网络边界，否则应把 admin API 绑定到 loopback 地址。`admin-auth-token`、`admin-read-token` 和 `admin-write-token` 都未配置时，admin API 会接受未认证请求；如果它监听在非 loopback 地址，Gatel 会打印警告日志。
 
 ### log
 
