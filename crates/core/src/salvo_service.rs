@@ -188,8 +188,16 @@ fn build_route_router(
             HoopConfig::Cache(cfg) => {
                 router = router.hoop(crate::hoops::cache::CacheHoop::new(cfg));
             }
-            HoopConfig::Templates { root } => {
-                router = router.hoop(crate::hoops::templates::TemplatesHoop::new(root.clone()));
+            HoopConfig::Templates {
+                root,
+                allow_env,
+                allow_include,
+            } => {
+                router = router.hoop(crate::hoops::templates::TemplatesHoop::new(
+                    root.clone(),
+                    *allow_env,
+                    *allow_include,
+                ));
             }
             HoopConfig::Replace { rules, once } => {
                 router = router.hoop(crate::hoops::replace::ReplaceHoop::new(

@@ -349,7 +349,9 @@ route "/*" {
 
 | Property | Type | Default | Description |
 |---|---|---|---|
-| `root` | string | CWD | Root directory for `{{include}}` file paths |
+| `root` | string | unset | Root directory for explicitly enabled `{{include}}` file paths |
+| `allow-env` | boolean | `false` | Enable `{{.Env.VARNAME}}` lookups |
+| `allow-include` | boolean | `false` | Enable `{{include "path"}}` file includes |
 
 ### Supported Placeholders
 
@@ -364,16 +366,17 @@ route "/*" {
 | `{{uri}}` | Full request URI |
 | `{{remote_addr}}` | Full client socket address (IP:port) |
 | `{{server_name}}` | Server hostname (Host header, without port) |
-| `{{.Env.VARNAME}}` | Environment variable lookup |
-| `{{include "path"}}` | Include another file's contents |
+| `{{.Env.VARNAME}}` | Environment variable lookup when `allow-env=true` |
+| `{{include "path"}}` | Include another file's contents when `allow-include=true` |
 
 ### Behavior
 
 - Only processes responses with `Content-Type: text/html`.
 - Maximum response size for template processing: 1 MB. Larger responses pass through unmodified.
 - Non-UTF-8 response bodies pass through unmodified.
-- `{{include}}` paths are resolved relative to the configured `root` directory.
-- Path traversal (`..`) in include paths is blocked for security.
+- `{{.Env.*}}` and `{{include}}` are disabled unless explicitly enabled.
+- `{{include}}` paths must be relative and are resolved under the configured `root` directory.
+- Absolute paths, path traversal (`..`), and symlink escapes in include paths are blocked.
 - Unknown tags are preserved as-is (no data loss).
 - The `Content-Length` header is updated after processing.
 
@@ -385,10 +388,14 @@ route "/*" {
 <head><title>{{server_name}}</title></head>
 <body>
   <p>Welcome, your IP is {{client_ip}}</p>
-  <p>Environment: {{.Env.APP_ENV}}</p>
-  {{include "partials/footer.html"}}
 </body>
 </html>
+```
+
+To enable local file includes, opt in explicitly:
+
+```kdl
+templates root="/templates" allow-include=true
 ```
 
 ---

@@ -514,6 +514,9 @@ route "/*" {
 }
 ```
 
+Environment lookups and file includes are disabled by default. Use `allow-env=true`
+or `allow-include=true` only for trusted templates.
+
 ---
 
 ## Response Caching

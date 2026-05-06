@@ -854,7 +854,19 @@ fn parse_route(
                         .and_then(|v| v.as_string())
                         .map(|s| s.to_string())
                 });
-                middlewares.push(HoopConfig::Templates { root });
+                let allow_env = child
+                    .get("allow-env")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let allow_include = child
+                    .get("allow-include")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                middlewares.push(HoopConfig::Templates {
+                    root,
+                    allow_env,
+                    allow_include,
+                });
             }
             "header-up" | "header-down" => {
                 // Collect header directives — handled below with the proxy
