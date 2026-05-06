@@ -64,7 +64,7 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Build
         run: |
@@ -253,28 +253,24 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish gatel-core
-        run: cargo publish -p gatel-core --no-verify
+        run: cargo publish -p gatel-core
         env:
-          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        continue-on-error: true
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
 
       - name: Wait for crates.io index
         run: sleep 30
 
       - name: Publish gatel-passwd
-        run: cargo publish -p gatel-passwd --no-verify
+        run: cargo publish -p gatel-passwd
         env:
-          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        continue-on-error: true
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
 
       - name: Publish gatel-precompress
-        run: cargo publish -p gatel-precompress --no-verify
+        run: cargo publish -p gatel-precompress
         env:
-          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        continue-on-error: true
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
 
       - name: Publish gatel
-        run: cargo publish -p gatel --no-verify
+        run: cargo publish -p gatel
         env:
-          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        continue-on-error: true
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
