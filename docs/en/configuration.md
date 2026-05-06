@@ -240,12 +240,16 @@ Enable the HTTP/3 (QUIC) listener on the same address as HTTPS. Requires the `ht
 
 ```kdl
 proxy-protocol true
+trusted-proxy "10.0.0.0/8"
 ```
 
 When enabled, Gatel expects a PROXY protocol v1 (text) or v2 (binary) header on every incoming TCP connection. The real client address from the header is used instead of the TCP peer address.
+PROXY headers are accepted only from configured `trusted-proxy` CIDR/IP ranges. If none are configured, only loopback peers are trusted.
 
 - **Type**: boolean
 - **Default**: `false`
+
+`trusted-proxy` can be repeated to trust multiple load balancer CIDRs.
 
 ---
 

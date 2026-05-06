@@ -207,6 +207,7 @@ IP filtering is configured as a middleware type in the codebase (`HoopConfig::Ip
 - If an **allow** list is configured, the client IP must match at least one allow entry (deny-by-default).
 - If only a **deny** list is configured, all IPs are allowed except those explicitly denied.
 - IPv4-mapped IPv6 addresses are handled transparently.
+- When `forwarded-for=true` is used, `X-Forwarded-For` is honored only if the direct client matches a global `trusted-proxy` CIDR/IP. With no trusted proxies configured, only loopback peers are trusted.
 
 ### CIDR Format
 

@@ -287,10 +287,12 @@ Commands: `PROXY` (0x01, with addresses) and `LOCAL` (0x00, health check, no add
 ```kdl
 global {
     proxy-protocol true
+    trusted-proxy "10.0.0.0/8"
 }
 ```
 
 When enabled, Gatel expects a PROXY protocol header on **every** incoming TCP connection (both HTTP and HTTPS listeners).
+Only peers matching `trusted-proxy` are allowed to supply PROXY protocol headers. Without `trusted-proxy`, only loopback peers are trusted.
 
 ### How PROXY Protocol Works
 
@@ -298,8 +300,9 @@ When enabled, Gatel expects a PROXY protocol header on **every** incoming TCP co
 2. **v2 detection**: The first 12 bytes are compared against the v2 binary signature (`\r\n\r\n\0\r\nQUIT\n`).
 3. **v1 detection**: If the data starts with `PROXY `, it is parsed as a v1 text header.
 4. **Fallback**: If neither is detected, the buffered bytes are prepended to the stream and processing continues without PROXY protocol.
-5. The real client address from the header replaces the TCP peer address for all downstream processing.
-6. A `PrefixedStream` wrapper ensures that any leftover bytes after the PROXY header are seamlessly fed into the HTTP/TLS parsing layer.
+5. The direct TCP peer is checked against `trusted-proxy` before the header is parsed.
+6. The real client address from the header replaces the TCP peer address for all downstream processing.
+7. A `PrefixedStream` wrapper ensures that any leftover bytes after the PROXY header are seamlessly fed into the HTTP/TLS parsing layer.
 
 For HTTPS connections, the PROXY protocol header is parsed **before** the TLS handshake.
 

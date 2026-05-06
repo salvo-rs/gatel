@@ -266,10 +266,12 @@ global {
 ```kdl
 global {
     proxy-protocol true
+    trusted-proxy "10.0.0.0/8"
 }
 ```
 
 启用后，Gatel 会解析入站连接的 PROXY Protocol 头，提取真实客户端 IP。
+只有匹配 `trusted-proxy` 的直连对端可以提供 PROXY 头；未配置时只信任 loopback。
 
 ### 完整示例
 
@@ -282,6 +284,7 @@ global {
     https ":443"
     http3 true
     proxy-protocol true
+    trusted-proxy "10.0.0.0/8"
 }
 ```
 

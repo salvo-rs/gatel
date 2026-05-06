@@ -796,6 +796,17 @@ async fn accept_http_loop(
             let _guard = _conn_guard;
 
             if proxy_protocol {
+                let trusted_proxies = {
+                    let cfg = state.config.load();
+                    cfg.global.trusted_proxies.clone()
+                };
+                if !peer_is_trusted_proxy(&peer_addr, &trusted_proxies) {
+                    warn!(
+                        client = %peer_addr,
+                        "rejecting PROXY protocol connection from untrusted peer"
+                    );
+                    return;
+                }
                 // Parse PROXY protocol header to get the real client address.
                 match proxy_protocol::parse_proxy_protocol(&mut stream).await {
                     Ok((header, prefix)) => {
@@ -872,6 +883,17 @@ async fn accept_https_loop(
             let _guard = _conn_guard;
 
             if proxy_protocol {
+                let trusted_proxies = {
+                    let cfg = state.config.load();
+                    cfg.global.trusted_proxies.clone()
+                };
+                if !peer_is_trusted_proxy(&peer_addr, &trusted_proxies) {
+                    warn!(
+                        client = %peer_addr,
+                        "rejecting PROXY protocol connection from untrusted peer"
+                    );
+                    return;
+                }
                 // Parse PROXY protocol header first, then perform TLS handshake.
                 match proxy_protocol::parse_proxy_protocol(&mut stream).await {
                     Ok((header, prefix)) => {
@@ -921,6 +943,15 @@ async fn accept_https_loop(
     Ok(())
 }
 
+fn peer_is_trusted_proxy(peer_addr: &std::net::SocketAddr, trusted_proxies: &[String]) -> bool {
+    if trusted_proxies.is_empty() {
+        return peer_addr.ip().is_loopback();
+    }
+    trusted_proxies
+        .iter()
+        .any(|cidr| crate::router::matcher::match_cidr_pub(cidr, &peer_addr.ip()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -937,6 +968,32 @@ mod tests {
     use crate::runtime_services::{
         RuntimeHealthCheck, RuntimeRoute, RuntimeService, RuntimeTarget, RuntimeTargetGroup,
     };
+
+    #[test]
+    fn proxy_protocol_trust_defaults_to_loopback_only() {
+        assert!(peer_is_trusted_proxy(
+            &"127.0.0.1:5000".parse().unwrap(),
+            &[]
+        ));
+        assert!(!peer_is_trusted_proxy(
+            &"203.0.113.10:5000".parse().unwrap(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn proxy_protocol_trust_honors_configured_cidrs() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+
+        assert!(peer_is_trusted_proxy(
+            &"10.1.2.3:5000".parse().unwrap(),
+            &trusted
+        ));
+        assert!(!peer_is_trusted_proxy(
+            &"192.0.2.10:5000".parse().unwrap(),
+            &trusted
+        ));
+    }
 
     fn runtime_service(
         target_addr: String,

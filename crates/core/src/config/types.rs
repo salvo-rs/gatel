@@ -69,6 +69,8 @@ pub struct GlobalConfig {
     pub http3: bool,
     /// When true, expect PROXY protocol v1/v2 headers on incoming connections.
     pub proxy_protocol: bool,
+    /// CIDR/IP ranges trusted to supply PROXY protocol or X-Forwarded-For client IPs.
+    pub trusted_proxies: Vec<String>,
     pub access_log: Option<LogFileConfig>,
     pub error_log: Option<LogFileConfig>,
     /// TCP_NODELAY socket option for accepted connections (default: true).
@@ -105,6 +107,7 @@ impl Default for GlobalConfig {
             https_addr: ([0, 0, 0, 0], 443).into(),
             http3: false,
             proxy_protocol: false,
+            trusted_proxies: Vec::new(),
             access_log: None,
             error_log: None,
             tcp_nodelay: true,

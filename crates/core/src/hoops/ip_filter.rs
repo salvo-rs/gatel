@@ -93,11 +93,17 @@ impl CidrRange {
 pub struct IpFilterHoop {
     allow: Vec<CidrRange>,
     deny: Vec<CidrRange>,
+    trusted_proxies: Vec<CidrRange>,
     use_forwarded_for: bool,
 }
 
 impl IpFilterHoop {
-    pub fn new(allow: &[String], deny: &[String], use_forwarded_for: bool) -> Self {
+    pub fn new(
+        allow: &[String],
+        deny: &[String],
+        use_forwarded_for: bool,
+        trusted_proxies: &[String],
+    ) -> Self {
         let allow: Vec<CidrRange> = allow
             .iter()
             .filter_map(|s| {
@@ -120,9 +126,24 @@ impl IpFilterHoop {
             })
             .collect();
 
+        let trusted_proxies: Vec<CidrRange> = trusted_proxies
+            .iter()
+            .filter_map(|s| {
+                let parsed = CidrRange::parse(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        cidr = s.as_str(),
+                        "failed to parse trusted proxy CIDR, skipping"
+                    );
+                }
+                parsed
+            })
+            .collect();
+
         debug!(
             allow_count = allow.len(),
             deny_count = deny.len(),
+            trusted_proxy_count = trusted_proxies.len(),
             use_forwarded_for,
             "IP filter configured"
         );
@@ -130,6 +151,7 @@ impl IpFilterHoop {
         Self {
             allow,
             deny,
+            trusted_proxies,
             use_forwarded_for,
         }
     }
@@ -151,6 +173,13 @@ impl IpFilterHoop {
         // No allow list — permit by default (only deny list applies).
         true
     }
+
+    fn is_trusted_forwarder(&self, ip: &IpAddr) -> bool {
+        if self.trusted_proxies.is_empty() {
+            return ip.is_loopback();
+        }
+        self.trusted_proxies.iter().any(|cidr| cidr.contains(ip))
+    }
 }
 
 #[async_trait]
@@ -165,7 +194,7 @@ impl salvo::Handler for IpFilterHoop {
         let client = super::client_addr(req);
 
         // Determine the effective client IP.
-        let ip = if self.use_forwarded_for {
+        let ip = if self.use_forwarded_for && self.is_trusted_forwarder(&client.ip()) {
             req.headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
@@ -173,6 +202,12 @@ impl salvo::Handler for IpFilterHoop {
                 .and_then(|s| s.trim().parse::<IpAddr>().ok())
                 .unwrap_or_else(|| client.ip())
         } else {
+            if self.use_forwarded_for {
+                debug!(
+                    client_ip = %client.ip(),
+                    "ignoring X-Forwarded-For from untrusted direct client"
+                );
+            }
             client.ip()
         };
 
@@ -185,5 +220,26 @@ impl salvo::Handler for IpFilterHoop {
         }
 
         ctrl.call_next(req, depot, res).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_for_defaults_to_loopback_trust_only() {
+        let hoop = IpFilterHoop::new(&[], &[], true, &[]);
+
+        assert!(hoop.is_trusted_forwarder(&"127.0.0.1".parse().unwrap()));
+        assert!(!hoop.is_trusted_forwarder(&"203.0.113.10".parse().unwrap()));
+    }
+
+    #[test]
+    fn forwarded_for_honors_configured_trusted_proxy_cidrs() {
+        let hoop = IpFilterHoop::new(&[], &[], true, &["10.0.0.0/8".to_string()]);
+
+        assert!(hoop.is_trusted_forwarder(&"10.1.2.3".parse().unwrap()));
+        assert!(!hoop.is_trusted_forwarder(&"192.0.2.10".parse().unwrap()));
     }
 }

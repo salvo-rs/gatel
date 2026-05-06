@@ -434,6 +434,9 @@ fn parse_global(node: &KdlNode) -> Result<GlobalConfig, ConfigError> {
                     .and_then(|e| e.value().as_bool())
                     .unwrap_or(true);
             }
+            "trusted-proxy" | "trusted-proxies" => {
+                cfg.trusted_proxies.extend(string_args(child));
+            }
             "access-log" => {
                 cfg.access_log = Some(parse_log_file_config(child)?);
             }
