@@ -5,7 +5,7 @@
 //! as a CGI-style response (headers followed by body).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use http::{Response, StatusCode};
@@ -66,13 +66,10 @@ impl CgiHandler {
         client_addr: std::net::SocketAddr,
     ) -> Result<Response<crate::Body>, ProxyError> {
         let path = request.uri().path().to_string();
-        let script_path = self.root.join(path.trim_start_matches('/'));
-
-        if !script_path.exists() {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(full_body("Not Found"))?);
-        }
+        let script_path = match resolve_script_path(&self.root, &path) {
+            Ok(path) => path,
+            Err(status) => return status_response(status),
+        };
 
         // Collect the request body before decomposing the request.
         let (parts, body) = request.into_parts();
@@ -163,6 +160,53 @@ impl CgiHandler {
     }
 }
 
+fn resolve_script_path(root: &Path, uri_path: &str) -> Result<PathBuf, StatusCode> {
+    let relative_path = relative_path_from_uri(uri_path).ok_or(StatusCode::FORBIDDEN)?;
+    let candidate = root.join(relative_path);
+    let root = root.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
+    let script = candidate
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    if !script.starts_with(&root) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    match script.metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(script),
+        Ok(_) => Err(StatusCode::FORBIDDEN),
+        Err(_) => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+fn relative_path_from_uri(uri_path: &str) -> Option<PathBuf> {
+    let decoded = crate::encoding::percent_decode(uri_path);
+    if decoded.as_bytes().contains(&0) {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in Path::new(decoded.trim_start_matches('/')).components() {
+        match component {
+            Component::Normal(segment) => relative.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(relative)
+}
+
+fn status_response(status: StatusCode) -> Result<Response<crate::Body>, ProxyError> {
+    let message = match status {
+        StatusCode::FORBIDDEN => "Forbidden",
+        StatusCode::NOT_FOUND => "Not Found",
+        _ => "Error",
+    };
+    Ok(Response::builder()
+        .status(status)
+        .body(full_body(message))?)
+}
+
 // ---------------------------------------------------------------------------
 // CGI response parsing (shared with SCGI)
 // ---------------------------------------------------------------------------
@@ -238,6 +282,32 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_script_path_rejects_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+
+        let err = resolve_script_path(root.path(), "/../outside.sh").unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn resolve_script_path_rejects_percent_encoded_traversal() {
+        let root = tempfile::tempdir().unwrap();
+
+        let err = resolve_script_path(root.path(), "/%2e%2e/outside.sh").unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn resolve_script_path_confines_to_root() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("app.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+
+        let resolved = resolve_script_path(root.path(), "/app.sh").unwrap();
+        assert_eq!(resolved, script.canonicalize().unwrap());
+    }
 
     #[test]
     fn test_parse_cgi_response_with_status() {
