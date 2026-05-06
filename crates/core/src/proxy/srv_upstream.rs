@@ -33,14 +33,23 @@ impl SrvResolver {
         let task = tokio::spawn(async move {
             // Build a hickory TokioResolver from system configuration, falling
             // back to a default (Google public DNS) resolver on failure.
-            let dns = hickory_resolver::TokioResolver::builder_tokio()
-                .unwrap_or_else(|_| {
-                    hickory_resolver::TokioResolver::builder_with_config(
-                        hickory_resolver::config::ResolverConfig::default(),
-                        hickory_resolver::name_server::TokioConnectionProvider::default(),
-                    )
-                })
-                .build();
+            let builder = hickory_resolver::TokioResolver::builder_tokio().unwrap_or_else(|_| {
+                hickory_resolver::TokioResolver::builder_with_config(
+                    hickory_resolver::config::ResolverConfig::default(),
+                    hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+                )
+            });
+            let dns = match builder.build() {
+                Ok(dns) => dns,
+                Err(e) => {
+                    warn!(
+                        service = %name,
+                        error = %e,
+                        "failed to build SRV resolver; aborting refresh task"
+                    );
+                    return;
+                }
+            };
 
             // Perform an initial resolution immediately before entering the
             // periodic sleep loop.
@@ -72,13 +81,17 @@ async fn resolve_and_update(
     store: &SrvBackends,
 ) {
     match dns.srv_lookup(service_name).await {
-        Ok(records) => {
-            // Collect (addr, priority, weight) tuples.
-            let mut entries: Vec<(String, u16, u16)> = records
+        Ok(lookup) => {
+            // Collect (addr, priority, weight) tuples from SRV answer records.
+            let mut entries: Vec<(String, u16, u16)> = lookup
+                .answers()
                 .iter()
-                .map(|r| {
-                    let host = r.target().to_string().trim_end_matches('.').to_string();
-                    (format!("{host}:{}", r.port()), r.priority(), r.weight())
+                .filter_map(|record| match &record.data {
+                    hickory_resolver::proto::rr::RData::SRV(srv) => {
+                        let host = srv.target.to_string().trim_end_matches('.').to_string();
+                        Some((format!("{host}:{}", srv.port), srv.priority, srv.weight))
+                    }
+                    _ => None,
                 })
                 .collect();
 
