@@ -294,7 +294,7 @@ route "/api/*" {
 
 ### Cacheable Requests
 
-Only `GET` and `HEAD` requests are cached. Requests with `Cache-Control: no-store` bypass the cache entirely.
+Only `GET` and `HEAD` requests are cached. Requests with `Cache-Control: no-store` bypass the cache entirely. Requests carrying `Authorization` or `Cookie` bypass cache lookup and are stored only when the response explicitly includes `Cache-Control: public`.
 
 ### Cacheable Responses
 
@@ -302,7 +302,8 @@ Responses are cached when:
 
 - Status code is 200 (OK), 301 (Moved Permanently), 302 (Found), or 304 (Not Modified).
 - Response does not contain a `Set-Cookie` header.
-- Response does not contain `Cache-Control: no-store`.
+- Response does not contain `Cache-Control: no-store` or `private`.
+- Response does not contain `Vary: *`.
 - Response body size does not exceed `max-entry-size`.
 
 ### TTL Determination
@@ -324,7 +325,7 @@ The cache supports conditional requests:
 
 ### Vary Header
 
-The cache includes `Vary` header values in the cache key. Responses with different `Vary`-referenced header values are stored separately.
+The cache includes `Vary` header values in the cache key. Responses with different `Vary`-referenced header values are stored separately. `Vary: *` responses are not cached.
 
 ### Cache Eviction
 

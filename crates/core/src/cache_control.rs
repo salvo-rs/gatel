@@ -9,6 +9,8 @@ use http::HeaderMap;
 pub struct CacheControlDirectives {
     pub no_store: bool,
     pub no_cache: bool,
+    pub private: bool,
+    pub public: bool,
     pub max_age: Option<Duration>,
     pub s_maxage: Option<Duration>,
 }
@@ -23,6 +25,10 @@ pub fn parse_cache_control(value: &str) -> CacheControlDirectives {
             directives.no_store = true;
         } else if part == "no-cache" {
             directives.no_cache = true;
+        } else if part == "private" || part.starts_with("private=") {
+            directives.private = true;
+        } else if part == "public" {
+            directives.public = true;
         } else if let Some(value) = part.strip_prefix("max-age=") {
             if let Ok(seconds) = value.trim().parse::<u64>() {
                 directives.max_age = Some(Duration::from_secs(seconds));
@@ -47,13 +53,12 @@ pub fn build_vary_key(response_headers: &HeaderMap, request_headers: &HeaderMap)
         None => return String::new(),
     };
 
-    if vary == "*" {
-        return "*".to_string();
-    }
-
     let mut parts = Vec::new();
     for field_name in vary.split(',') {
         let field_name = field_name.trim().to_ascii_lowercase();
+        if field_name == "*" {
+            return "*".to_string();
+        }
         let value = request_headers
             .get(field_name.as_str())
             .and_then(|value| value.to_str().ok())
@@ -83,6 +88,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_private_and_public() {
+        let directives = parse_cache_control("private, public");
+        assert!(directives.private);
+        assert!(directives.public);
+    }
+
+    #[test]
     fn parse_max_age() {
         let directives = parse_cache_control("max-age=3600");
         assert_eq!(directives.max_age, Some(Duration::from_secs(3600)));
@@ -102,5 +114,13 @@ mod tests {
         let key = build_vary_key(&response_headers, &request_headers);
         assert!(key.contains("accept-encoding=gzip"));
         assert!(key.contains("accept-language=en-US"));
+    }
+
+    #[test]
+    fn build_vary_key_star_is_uncacheable() {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(http::header::VARY, "Accept-Encoding, *".parse().unwrap());
+        let key = build_vary_key(&response_headers, &HeaderMap::new());
+        assert_eq!(key, "*");
     }
 }

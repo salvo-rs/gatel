@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::header::{
-    AGE, CACHE_CONTROL, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, SET_COOKIE,
+    AGE, AUTHORIZATION, CACHE_CONTROL, COOKIE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    LAST_MODIFIED, SET_COOKIE,
 };
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use salvo::{Depot, FlowCtrl, Request, Response, async_trait};
@@ -166,6 +167,7 @@ impl salvo::Handler for CacheHoop {
             .path_and_query()
             .map(|pq| pq.to_string())
             .unwrap_or_else(|| req.uri().path().to_string());
+        let credentialed_request = request_has_credentials(req.headers());
 
         // Build a preliminary cache key (without vary — we check multiple vary keys).
         let base_key = CacheKey {
@@ -176,7 +178,13 @@ impl salvo::Handler for CacheHoop {
         };
 
         // Attempt cache lookup.
-        let cached = {
+        let cached = if credentialed_request {
+            debug!(
+                path = path.as_str(),
+                "credentialed request bypasses cache lookup"
+            );
+            None
+        } else {
             let mut store = self.store.lock().unwrap();
             if let Some(entry) = store.get(&base_key) {
                 Some((base_key.clone(), entry))
@@ -290,7 +298,23 @@ impl salvo::Handler for CacheHoop {
                 .unwrap_or(""),
         );
 
-        if resp_cache_control.no_store {
+        if resp_cache_control.no_store || resp_cache_control.private {
+            let _ = res.add_header("X-Cache", "BYPASS", true);
+            return;
+        }
+
+        if credentialed_request && !resp_cache_control.public {
+            debug!(
+                path = path.as_str(),
+                "credentialed response is not explicitly public, not caching"
+            );
+            let _ = res.add_header("X-Cache", "BYPASS", true);
+            return;
+        }
+
+        let vary_key = build_vary_key(res.headers(), req.headers());
+        if vary_key == "*" {
+            debug!(path = path.as_str(), "Vary: * response is not cacheable");
             let _ = res.add_header("X-Cache", "BYPASS", true);
             return;
         }
@@ -340,8 +364,6 @@ impl salvo::Handler for CacheHoop {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let vary_key = String::new();
-
         let entry = CacheEntry {
             status,
             headers: res.headers().clone(),
@@ -373,5 +395,54 @@ impl salvo::Handler for CacheHoop {
 
         let _ = res.add_header("X-Cache", "MISS", true);
         res.body(body_bytes.to_vec());
+    }
+}
+
+fn request_has_credentials(headers: &HeaderMap) -> bool {
+    headers.contains_key(AUTHORIZATION) || headers.contains_key(COOKIE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_credentials_are_detected() {
+        let mut headers = HeaderMap::new();
+        assert!(!request_has_credentials(&headers));
+
+        headers.insert(AUTHORIZATION, "Bearer token".parse().unwrap());
+        assert!(request_has_credentials(&headers));
+    }
+
+    #[test]
+    fn cache_store_uses_vary_key_as_part_of_identity() {
+        let mut store = CacheStore::new(10);
+        let key_a = CacheKey {
+            host: "example.com".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            vary_key: "accept-language=en".to_string(),
+        };
+        let key_b = CacheKey {
+            vary_key: "accept-language=fr".to_string(),
+            ..key_a.clone()
+        };
+        let entry = CacheEntry {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+            inserted_at: Instant::now(),
+            max_age: Duration::from_secs(60),
+            etag: None,
+            last_modified: None,
+        };
+
+        store.insert(key_a.clone(), entry.clone());
+        store.insert(key_b.clone(), entry);
+
+        assert!(store.get(&key_a).is_some());
+        assert!(store.get(&key_b).is_some());
+        assert_eq!(store.entries.len(), 2);
     }
 }
