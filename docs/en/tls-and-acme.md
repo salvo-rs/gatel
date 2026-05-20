@@ -385,8 +385,9 @@ When a configuration reload is triggered (via SIGHUP or the admin API), the TLS 
 
 1. **Manual certificates**: All per-site PEM files are re-read from disk. If any file fails to load, the reload is aborted and the old config remains active.
 2. **ACME domains**: Newly added sites are enrolled in ACME management. Removed sites stop being managed.
-3. **mTLS verifier**: The client certificate verifier is rebuilt with the updated CA certificates.
-4. **ServerConfig swap**: A new `rustls::ServerConfig` is built and atomically swapped in via `ArcSwap`.
+3. **Local CA (`tls internal`)**: The set of internal hosts is re-partitioned from the new config, and the global-internal fallback flag is re-evaluated (still gated by ACME presence). If a site flips to `tls internal` and the local CA isn't running yet, it is bootstrapped during the reload — no process restart is required to switch a site onto the local CA. Existing root + intermediate keys on disk are reused. Switching a site back off `tls internal` simply removes it from the internal-host set; the on-disk CA is left in place for future use.
+4. **mTLS verifier**: The client certificate verifier is rebuilt with the updated CA certificates.
+5. **ServerConfig swap**: A new `rustls::ServerConfig` is built and atomically swapped in via `ArcSwap`.
 
 In-flight connections are not affected -- they continue using the `ServerConfig` snapshot from when they were accepted.
 

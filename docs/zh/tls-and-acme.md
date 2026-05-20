@@ -322,6 +322,15 @@ gatel untrust
 
 如遇权限问题，在 Linux/macOS 上请用 `sudo` 重新运行。
 
+### 热重载行为
+
+通过 SIGHUP / `gatel reload` / 管理 API 触发配置热重载时，本地 CA 相关状态会被一并更新：
+
+- 启用 `tls internal` 的站点列表会按新配置重新分区。
+- 全局 `tls { internal }` 兜底标志会重新计算（仍受 ACME 存在与否的门控约束 —— 同时配置 ACME 时不启用兜底）。
+- 如果某个站点新切换到 `tls internal` 而本地 CA 此前未运行，则会在 reload 过程中**首次启动**本地 CA，**无需重启进程**。磁盘上已有的 root / intermediate 密钥会被直接复用。
+- 取消 `tls internal` 只会把站点移出 internal 列表，磁盘上的 CA 文件保留以备后用。
+
 ---
 
 ## 双向 TLS (mTLS)
