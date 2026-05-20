@@ -130,18 +130,18 @@ impl LocalCa {
     pub async fn certificate_for(&self, hostname: &str) -> Result<Arc<CertifiedKey>, LocalCaError> {
         let normalized = hostname.to_ascii_lowercase();
 
-        if let Some(entry) = self.cache.read().await.get(&normalized).cloned() {
-            if !leaf_needs_renew(&entry) {
-                return Ok(entry.certified_key);
-            }
+        if let Some(entry) = self.cache.read().await.get(&normalized).cloned()
+            && !leaf_needs_renew(&entry)
+        {
+            return Ok(entry.certified_key);
         }
 
         let mut cache = self.cache.write().await;
         // Double-check after acquiring the write lock.
-        if let Some(entry) = cache.get(&normalized).cloned() {
-            if !leaf_needs_renew(&entry) {
-                return Ok(entry.certified_key);
-            }
+        if let Some(entry) = cache.get(&normalized).cloned()
+            && !leaf_needs_renew(&entry)
+        {
+            return Ok(entry.certified_key);
         }
 
         debug!(hostname = %normalized, "issuing local CA leaf certificate");

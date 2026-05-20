@@ -77,12 +77,12 @@ mod platform {
 
         let mut removed = 0usize;
         for cert in store.certs() {
-            if let Ok(fp) = cert.fingerprint(HashAlgorithm::sha256()) {
-                if fp == target_fp {
-                    cert.delete()
-                        .map_err(|e| TrustError::Platform(format!("delete cert: {e}")))?;
-                    removed += 1;
-                }
+            if let Ok(fp) = cert.fingerprint(HashAlgorithm::sha256())
+                && fp == target_fp
+            {
+                cert.delete()
+                    .map_err(|e| TrustError::Platform(format!("delete cert: {e}")))?;
+                removed += 1;
             }
         }
         Ok(TrustOutcome {
