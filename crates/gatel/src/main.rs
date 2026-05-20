@@ -199,6 +199,14 @@ site "*" {{
             let state = AppState::new(config, None);
             server::run(state).await?;
         }
+        cli::Commands::Trust { storage_dir } => {
+            init_tracing("info", "pretty", None, None);
+            trust_install(storage_dir.as_deref())?;
+        }
+        cli::Commands::Untrust { storage_dir } => {
+            init_tracing("info", "pretty", None, None);
+            trust_uninstall(storage_dir.as_deref())?;
+        }
         cli::Commands::Completions { shell } => {
             cli::generate_completions(shell);
         }
@@ -351,6 +359,40 @@ fn admin_reload_request(addr: &str, auth_token: Option<&str>) -> Result<String, 
     } else {
         Err(anyhow::anyhow!("{body}"))
     }
+}
+
+fn trust_install(storage_dir: Option<&str>) -> anyhow::Result<()> {
+    let (ca, dir) = open_local_ca(storage_dir)?;
+    info!(root_cert = %ca.root_cert_path().display(), "installing local CA root");
+    let outcome =
+        gatel_core::tls::trust_store::install(ca.root_cert_pem(), ca.root_cert_der().as_ref())?;
+    println!("Local CA root from {} installed.", dir.display());
+    println!("{}", outcome.message);
+    if let Some(path) = outcome.installed_path {
+        println!("Source PEM available at: {}", path.display());
+    }
+    Ok(())
+}
+
+fn trust_uninstall(storage_dir: Option<&str>) -> anyhow::Result<()> {
+    let (ca, dir) = open_local_ca(storage_dir)?;
+    info!(root_cert = %ca.root_cert_path().display(), "removing local CA root");
+    let outcome =
+        gatel_core::tls::trust_store::uninstall(ca.root_cert_pem(), ca.root_cert_der().as_ref())?;
+    println!("Local CA root for {} removed.", dir.display());
+    println!("{}", outcome.message);
+    Ok(())
+}
+
+fn open_local_ca(
+    storage_dir: Option<&str>,
+) -> anyhow::Result<(gatel_core::tls::LocalCa, std::path::PathBuf)> {
+    let dir = storage_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(gatel_core::tls::default_local_ca_dir);
+    let ca = gatel_core::tls::LocalCa::load_or_create(&dir)
+        .map_err(|e| anyhow::anyhow!("failed to load local CA at {}: {e}", dir.display()))?;
+    Ok((ca, dir))
 }
 
 fn reload_auth_token(global: &GlobalConfig) -> Option<&str> {

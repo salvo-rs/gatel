@@ -137,6 +137,11 @@ pub struct TlsConfig {
     pub acme: Option<AcmeConfig>,
     pub client_auth: Option<ClientAuthConfig>,
     pub on_demand: Option<OnDemandTlsConfig>,
+    /// Global opt-in for the Caddy-style `tls internal` local CA. When set,
+    /// sites without manual certs and without ACME enrollment will be served
+    /// certificates signed by a locally generated CA. Per-site `tls internal`
+    /// always takes precedence over ACME.
+    pub internal: Option<InternalCaConfig>,
     pub min_version: Option<String>,
     pub max_version: Option<String>,
     pub cipher_suites: Vec<String>,
@@ -148,6 +153,15 @@ pub struct TlsConfig {
     /// ECDH key-exchange curves to enable. Supported values: "x25519",
     /// "secp256r1", "secp384r1". Empty means use rustls defaults.
     pub ecdh_curves: Vec<String>,
+}
+
+/// Settings for the local CA used by `tls internal`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InternalCaConfig {
+    /// Custom storage directory for the root + intermediate. Defaults to the
+    /// platform user-data dir (`~/.local/share/gatel/pki/authorities/local` on
+    /// Linux, `%LOCALAPPDATA%\gatel\pki\authorities\local` on Windows).
+    pub storage_dir: Option<String>,
 }
 
 /// mTLS (mutual TLS) client certificate verification configuration.
@@ -221,11 +235,19 @@ pub enum ChallengeType {
     Dns01,
 }
 
-/// Per-site TLS override (manual cert).
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+/// Per-site TLS override.
+///
+/// One of two modes:
+/// - **Manual cert**: `cert` and `key` point at PEM files on disk. Used as-is.
+/// - **Internal**: `internal == true` tells gatel to serve a leaf certificate signed by the local
+///   CA (see [`InternalCaConfig`]). `cert` / `key` are ignored in this mode.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq, Default)]
 pub struct SiteTlsConfig {
     pub cert: String,
     pub key: String,
+    /// Use the local CA (`tls internal`) for this site.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
 }
 
 /// A virtual host (site) configuration.

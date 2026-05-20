@@ -32,6 +32,9 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 hyper-rustls = { workspace = true }
 certon = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
+dirs = { workspace = true }
 kdl = { workspace = true }
 glob = { workspace = true }
 arc-swap = { workspace = true }
@@ -57,6 +60,9 @@ tower-service = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 monoio = { version = "0.2.4", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+schannel = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

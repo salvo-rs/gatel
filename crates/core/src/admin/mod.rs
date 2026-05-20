@@ -1502,6 +1502,7 @@ mod tests {
                 }),
                 client_auth: None,
                 on_demand: None,
+                internal: None,
                 min_version: None,
                 max_version: None,
                 cipher_suites: Vec::new(),

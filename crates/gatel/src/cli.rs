@@ -45,6 +45,25 @@ pub enum Commands {
         #[arg(short, long)]
         browse: bool,
     },
+    /// Install the local CA root certificate into the OS trust store.
+    ///
+    /// Mirrors `caddy trust`. Use this after configuring `tls internal` so
+    /// browsers and clients accept the locally-issued certificates without
+    /// warnings. On Windows the root is installed into the current user's
+    /// `Root` store (no elevation); on macOS/Linux you may need `sudo`.
+    Trust {
+        /// Custom CA storage directory. Defaults to the platform user-data
+        /// directory used by `tls internal`.
+        #[arg(long)]
+        storage_dir: Option<String>,
+    },
+    /// Remove the local CA root certificate from the OS trust store.
+    Untrust {
+        /// Custom CA storage directory. Defaults to the platform user-data
+        /// directory used by `tls internal`.
+        #[arg(long)]
+        storage_dir: Option<String>,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for

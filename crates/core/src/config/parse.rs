@@ -539,6 +539,7 @@ fn parse_tls(node: &KdlNode) -> Result<TlsConfig, ConfigError> {
         acme: None,
         client_auth: None,
         on_demand: None,
+        internal: None,
         min_version: None,
         max_version: None,
         cipher_suites: Vec::new(),
@@ -551,6 +552,17 @@ fn parse_tls(node: &KdlNode) -> Result<TlsConfig, ConfigError> {
     for child in children.nodes() {
         match child.name().to_string().as_str() {
             "acme" => tls.acme = Some(parse_acme(child)?),
+            "internal" => {
+                let mut cfg = InternalCaConfig::default();
+                if let Some(cc) = child.children() {
+                    for n in cc.nodes() {
+                        if n.name().to_string() == "storage-dir" {
+                            cfg.storage_dir = first_string_arg(n);
+                        }
+                    }
+                }
+                tls.internal = Some(cfg);
+            }
             "client-auth" => {
                 let mut ca_certs = Vec::new();
                 let required = child
@@ -765,28 +777,58 @@ fn parse_site(
 }
 
 fn parse_site_tls(node: &KdlNode) -> Result<SiteTlsConfig, ConfigError> {
+    // Two shapes are accepted:
+    //   tls internal
+    //   tls { cert "..."; key "..." }
+    //
+    // The first form is the Caddy-style local-CA opt-in.
     let mut cert = String::new();
     let mut key = String::new();
-    let Some(children) = node.children() else {
-        return Err(ConfigError::MissingField("tls cert/key".into()));
-    };
-    for child in children.nodes() {
-        match child.name().to_string().as_str() {
-            "cert" => {
-                cert = first_string_arg(child)
-                    .ok_or_else(|| ConfigError::MissingField("tls cert path".into()))?;
+    let mut internal = false;
+
+    if let Some(arg) = first_string_arg(node)
+        && arg == "internal"
+    {
+        internal = true;
+    }
+
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            match child.name().to_string().as_str() {
+                "internal" => internal = true,
+                "cert" => {
+                    cert = first_string_arg(child)
+                        .ok_or_else(|| ConfigError::MissingField("tls cert path".into()))?;
+                }
+                "key" => {
+                    key = first_string_arg(child)
+                        .ok_or_else(|| ConfigError::MissingField("tls key path".into()))?;
+                }
+                other => return Err(ConfigError::UnknownDirective(other.into())),
             }
-            "key" => {
-                key = first_string_arg(child)
-                    .ok_or_else(|| ConfigError::MissingField("tls key path".into()))?;
-            }
-            other => return Err(ConfigError::UnknownDirective(other.into())),
         }
     }
-    if cert.is_empty() || key.is_empty() {
-        return Err(ConfigError::MissingField("tls cert and key".into()));
+
+    if internal {
+        // `tls internal` short-circuits any cert/key. We still accept them being
+        // present (ignored) for forward compat, but they're not required.
+        return Ok(SiteTlsConfig {
+            cert: String::new(),
+            key: String::new(),
+            internal: true,
+        });
     }
-    Ok(SiteTlsConfig { cert, key })
+
+    if cert.is_empty() || key.is_empty() {
+        return Err(ConfigError::MissingField(
+            "tls cert and key (or `tls internal` for local CA)".into(),
+        ));
+    }
+    Ok(SiteTlsConfig {
+        cert,
+        key,
+        internal: false,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # TLS 与 ACME
 
-本文档详细介绍 Gatel 的 TLS 配置，包括自动证书管理 (ACME)、手动证书、双向 TLS (mTLS) 和按需 TLS。
+本文档详细介绍 Gatel 的 TLS 配置，包括自动证书管理 (ACME)、手动证书、本地 CA（Caddy 风格的 `tls internal`）、双向 TLS (mTLS) 和按需 TLS。
 
 ---
 
@@ -9,6 +9,7 @@
 - [TLS 概述](#tls-概述)
 - [自动 HTTPS (ACME)](#自动-https-acme)
 - [手动证书](#手动证书)
+- [本地 CA（`tls internal`）](#本地-catls-internal)
 - [双向 TLS (mTLS)](#双向-tls-mtls)
 - [按需 TLS (On-Demand TLS)](#按需-tls-on-demand-tls)
 - [TLS 协议细节](#tls-协议细节)
@@ -229,6 +230,97 @@ gatel reload
 # 或
 curl -X POST http://localhost:2019/config/reload
 ```
+
+---
+
+## 本地 CA（`tls internal`）
+
+对应 Caddy 的 `tls internal`，用于本地开发或内部服务。Gatel 首次启动时自动生成一个长效根 CA 和短效中间 CA，并在 TLS 握手时按需为请求的 SNI 签发 12 小时有效期的叶子证书。无需 ACME，无需手动管理 PEM 文件。
+
+### 快速开始
+
+**单个站点启用**：
+
+```kdl
+global {
+    http  ":80"
+    https ":443"
+}
+
+tls {}
+
+site "localhost" {
+    tls internal
+    route "/*" {
+        respond "本地受信任的 HTTPS" status=200
+    }
+}
+```
+
+**全局启用作为兜底**（仅当未配置 ACME 时生效；优先级低于站点级 `tls internal`）：
+
+```kdl
+tls {
+    internal
+}
+
+site "dev.local" {
+    route "/*" { proxy "127.0.0.1:3000" }
+}
+```
+
+### 存储位置与有效期
+
+首次启动时，根 CA 与中间 CA 会被持久化到平台数据目录：
+
+| 系统 | 路径 |
+|---|---|
+| Linux | `~/.local/share/gatel/pki/authorities/local` |
+| macOS | `~/Library/Application Support/gatel/pki/authorities/local` |
+| Windows | `%LOCALAPPDATA%\gatel\pki\authorities\local` |
+
+可通过 `storage-dir` 自定义：
+
+```kdl
+tls {
+    internal {
+        storage-dir "/var/lib/gatel/pki"
+    }
+}
+```
+
+| 证书 | 默认有效期 |
+|---|---|
+| 根 CA | 10 年 |
+| 中间 CA | 7 天（到达 80% 寿命自动轮换） |
+| 叶子 | 12 小时（剩余 ≤20% 自动重新签发） |
+
+叶子证书由中间 CA 签发，与中间一起作为链发送给客户端；根证书**不会**通过网络下发，必须事先安装到客户端的信任库。
+
+### 用 `gatel trust` 安装根证书
+
+为避免浏览器警告，安装根证书到操作系统信任库：
+
+```sh
+# 安装
+gatel trust
+
+# 自定义存储目录时
+gatel trust --storage-dir /var/lib/gatel/pki
+
+# 卸载
+gatel untrust
+```
+
+各平台行为：
+
+| 系统 | 实现 | 权限 |
+|---|---|---|
+| Windows | 通过 `CertAddCertificateContextToStore` 写入当前用户的 `Root` 存储（无需 UAC） | 普通用户 |
+| macOS | 调用 `security add-trusted-cert -k login.keychain-db` | 可能要求输入密码 |
+| Linux | 复制到发行版的 CA 锚点目录并执行 `update-ca-certificates` / `update-ca-trust extract` | 通常需要 root |
+
+如遇权限问题，在 Linux/macOS 上请用 `sudo` 重新运行。
 
 ---
 

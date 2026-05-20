@@ -1415,6 +1415,7 @@ fn service_site_tls_config(service: &RuntimeService) -> Option<SiteTlsConfig> {
             (Some(cert), Some(key)) => Some(SiteTlsConfig {
                 cert: cert.clone(),
                 key: key.clone(),
+                internal: false,
             }),
             _ => None,
         })
@@ -2413,6 +2414,7 @@ mod tests {
             tls: Some(SiteTlsConfig {
                 cert: "static-cert.pem".to_string(),
                 key: "static-key.pem".to_string(),
+                internal: false,
             }),
             routes: Vec::new(),
         });
@@ -2452,6 +2454,7 @@ mod tests {
             Some(SiteTlsConfig {
                 cert: "runtime-cert.pem".to_string(),
                 key: "runtime-key.pem".to_string(),
+                internal: false,
             })
         );
 

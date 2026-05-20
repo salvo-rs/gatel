@@ -8,7 +8,7 @@ Gatel is a modern reverse proxy and web server inspired by Caddy, powered by Hyp
 
 - **KDL Configuration** — Human-friendly config format with intuitive nesting
 - **Reverse Proxy** — Weighted load balancing, health checks, passive health monitoring, and automatic retries
-- **TLS / ACME** — Automatic HTTPS via ACME (Let's Encrypt), manual certificate support, and mTLS
+- **TLS / ACME / Local CA** — Automatic HTTPS via ACME (Let's Encrypt), manual certificates, mTLS, and a Caddy-style local CA (`tls internal`) for development with `gatel trust` to install the root into your OS trust store
 - **HTTP/1.1, HTTP/2, HTTP/3** — Full protocol support including QUIC-based HTTP/3
 - **Compression** — Gzip, Zstd, and Brotli encoding
 - **Static File Serving** — Efficient file server with configurable root directories
