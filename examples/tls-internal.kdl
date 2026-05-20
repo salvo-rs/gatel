@@ -1,0 +1,43 @@
+// HTTPS with a locally-generated CA — Caddy-style `tls internal`.
+//
+// Useful for local development on `localhost` (or any internal hostname
+// resolvable from the dev machine) without dealing with ACME, Let's Encrypt
+// rate limits, or your browser's "Not secure" warning.
+//
+// On first start, gatel generates a root + intermediate CA under the platform
+// user-data dir (e.g. on Windows: `%LOCALAPPDATA%\gatel\pki\authorities\local`)
+// and issues 12-hour leaf certs on demand at TLS handshake time.
+//
+// Run `gatel trust` once to install the root into your OS trust store so
+// browsers and HTTP clients trust the issued certs without warnings. On
+// Windows this writes to the current-user `Root` store (no UAC); on
+// macOS/Linux you may need `sudo`.
+
+global {
+    http ":80"
+    https ":443"
+}
+
+// A minimal TLS block is required to enable the HTTPS listener. Setting
+// `internal` here also lets sites without their own `tls` block fall back to
+// the local CA — but you can omit it and use per-site `tls internal` only.
+tls {
+    internal
+}
+
+site "localhost" {
+    // Caddy-style short form: `tls internal` opts this site into the local CA.
+    tls internal
+
+    route "/*" {
+        respond "Hello over locally-trusted HTTPS!" status=200
+    }
+}
+
+site "dev.local" {
+    tls internal
+
+    route "/*" {
+        proxy "127.0.0.1:8698"
+    }
+}

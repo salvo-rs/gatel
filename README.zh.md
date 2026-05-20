@@ -8,7 +8,7 @@ Gatel 是一个受 Caddy 启发的现代反向代理和 Web 服务器，基于 H
 
 - **KDL 配置** — 人类友好的配置格式，支持直观的嵌套结构
 - **反向代理** — 加权负载均衡、健康检查、被动健康监测和自动重试
-- **TLS / ACME** — 通过 ACME（Let's Encrypt）自动 HTTPS、手动证书配置和 mTLS
+- **TLS / ACME / 本地 CA** — 通过 ACME（Let's Encrypt）自动 HTTPS、手动证书、mTLS，以及 Caddy 风格的本地 CA（`tls internal`），可用 `gatel trust` 一键安装根证书到系统信任库
 - **HTTP/1.1、HTTP/2、HTTP/3** — 完整协议支持，包括基于 QUIC 的 HTTP/3
 - **压缩** — 支持 Gzip、Zstd 和 Brotli 编码
 - **静态文件服务** — 高效的文件服务器，支持可配置的根目录

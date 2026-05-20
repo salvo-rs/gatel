@@ -1,6 +1,6 @@
 # TLS and ACME
 
-Gatel provides comprehensive TLS support including automatic certificate management via ACME, manual PEM certificates, mutual TLS (mTLS) client verification, and on-demand TLS for dynamic domains.
+Gatel provides comprehensive TLS support including automatic certificate management via ACME, manual PEM certificates, a built-in local CA for development (Caddy-style `tls internal`), mutual TLS (mTLS) client verification, and on-demand TLS for dynamic domains.
 
 ## Table of Contents
 
@@ -11,6 +11,10 @@ Gatel provides comprehensive TLS support including automatic certificate managem
   - [Certificate Storage](#certificate-storage)
   - [Certificate Renewal](#certificate-renewal)
 - [Manual Certificates](#manual-certificates)
+- [Local CA (`tls internal`)](#local-ca-tls-internal)
+  - [Quick Start](#quick-start)
+  - [Storage Layout and Lifetimes](#storage-layout-and-lifetimes)
+  - [Installing the Root with `gatel trust`](#installing-the-root-with-gatel-trust)
 - [Certificate Resolution Order](#certificate-resolution-order)
 - [Mutual TLS (mTLS)](#mutual-tls-mtls)
   - [Required Mode](#required-mode)
@@ -117,13 +121,105 @@ Manual certificates are loaded at startup (and on reload) using `certon::Certifi
 
 ---
 
+## Local CA (`tls internal`)
+
+For local development, internal services, or any other scenario where you want HTTPS without ACME and without managing your own PEM files, gatel can generate its own self-signed root CA on first start and sign 12-hour leaf certificates on demand at TLS handshake time. This mirrors Caddy's `tls internal`.
+
+### Quick Start
+
+Opt a site in with the short form:
+
+```kdl
+global {
+    http  ":80"
+    https ":443"
+}
+
+tls {}
+
+site "localhost" {
+    tls internal
+    route "/*" {
+        respond "hello over locally-trusted HTTPS" status=200
+    }
+}
+```
+
+Or enable it globally as a fallback for every site without manual certs and without ACME:
+
+```kdl
+tls {
+    internal
+}
+
+site "dev.local" {
+    route "/*" { proxy "127.0.0.1:3000" }
+}
+```
+
+The global form *only* takes effect when ACME is not configured. Per-site `tls internal` always wins, even when ACME is present.
+
+### Storage Layout and Lifetimes
+
+On first start, gatel generates a root + intermediate under the platform user-data directory:
+
+| OS | Path |
+|---|---|
+| Linux | `~/.local/share/gatel/pki/authorities/local` |
+| macOS | `~/Library/Application Support/gatel/pki/authorities/local` |
+| Windows | `%LOCALAPPDATA%\gatel\pki\authorities\local` |
+
+Override the location with:
+
+```kdl
+tls {
+    internal {
+        storage-dir "/var/lib/gatel/pki"
+    }
+}
+```
+
+| Cert | Default lifetime |
+|---|---|
+| Root CA | 10 years |
+| Intermediate CA | 7 days (rotated automatically when ≥80% elapsed) |
+| Leaf | 12 hours (re-issued when ≤20% remaining) |
+
+Leaves are signed by the intermediate, served with the intermediate in the chain, and cached in memory keyed by SNI hostname. The root is **never** sent over the wire — clients must trust it via their OS trust store.
+
+### Installing the Root with `gatel trust`
+
+To avoid certificate warnings, install the root into your OS trust store:
+
+```sh
+# Install
+gatel trust
+
+# Override storage-dir if you set one in the config
+gatel trust --storage-dir /var/lib/gatel/pki
+
+# Remove
+gatel untrust
+```
+
+Behaviour by platform:
+
+| OS | Implementation | Privileges |
+|---|---|---|
+| Windows | Writes the root into the current-user `Root` store via `CertAddCertificateContextToStore` (no UAC) | none |
+| macOS | Shells out to `security add-trusted-cert -k login.keychain-db` | may prompt for password |
+| Linux | Copies the PEM into the distro's CA-anchors dir and runs `update-ca-certificates` / `update-ca-trust extract` | typically root |
+
+On Linux/macOS, run with `sudo` if the trust install reports a permissions error.
+
 ## Certificate Resolution Order
 
 When a TLS handshake arrives with an SNI hostname, Gatel resolves the certificate in this order:
 
 1. **Manual certificates**: The `CompositeResolver` checks the per-site manual certificate map first. If a match is found, it is served immediately.
-2. **ACME resolver**: If no manual certificate matches, the certon `CertResolver` is consulted. This serves certificates from the certificate cache.
-3. **On-demand (if configured)**: If the certon resolver does not have a certificate and on-demand TLS is enabled, a new certificate is obtained in the background.
+2. **Local CA**: If the SNI matches a site marked `tls internal` (or the global `tls { internal }` fallback applies), a fresh 12-hour leaf is signed on demand.
+3. **ACME resolver**: If neither of the above matches, the certon `CertResolver` is consulted. This serves certificates from the certificate cache.
+4. **On-demand (if configured)**: If the certon resolver does not have a certificate and on-demand TLS is enabled, a new certificate is obtained in the background.
 
 ---
 

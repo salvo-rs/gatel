@@ -26,8 +26,9 @@ use tracing::{debug, error, info, warn};
 use crate::ProxyError;
 use crate::config::{
     AcmeConfig, AppConfig, CertAuthority, ChallengeType, ClientAuthConfig, DnsProviderConfig,
-    OnDemandTlsConfig, SiteTlsConfig, TlsConfig,
+    InternalCaConfig, OnDemandTlsConfig, SiteTlsConfig, TlsConfig,
 };
+use crate::tls::local_ca::{LocalCa, default_storage_dir as default_local_ca_dir};
 
 // ---------------------------------------------------------------------------
 // TlsManager
@@ -68,6 +69,9 @@ pub struct TlsManager {
     /// Shared challenge map for the HTTP-01 solver. The ACME challenge
     /// middleware reads from this map to serve challenge responses.
     challenge_map: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+
+    /// Local CA used to serve `tls internal` sites, if any are configured.
+    local_ca: Option<Arc<LocalCa>>,
 }
 
 impl TlsManager {
@@ -89,13 +93,21 @@ impl TlsManager {
         let challenge_map: Arc<tokio::sync::RwLock<HashMap<String, String>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
-        // Partition sites into manual-cert and ACME-managed.
+        // Partition sites into manual-cert, internal-CA, and ACME-managed.
         let mut manual_certs: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
         let mut acme_domains: Vec<String> = Vec::new();
+        let mut internal_hosts: HashSet<String> = HashSet::new();
+
+        let global_internal = config.tls.as_ref().and_then(|t| t.internal.as_ref());
+        let global_acme = config.tls.as_ref().and_then(|t| t.acme.as_ref());
 
         for site in &config.sites {
-            if let Some(ref site_tls) = site.tls {
-                match load_manual_cert(site_tls) {
+            match &site.tls {
+                Some(site_tls) if site_tls.internal => {
+                    internal_hosts.insert(site.host.to_ascii_lowercase());
+                    info!(host = %site.host, "site enrolled in local CA (tls internal)");
+                }
+                Some(site_tls) => match load_manual_cert(site_tls) {
                     Ok(certified_key) => {
                         info!(
                             host = %site.host,
@@ -117,12 +129,29 @@ impl TlsManager {
                             site.host
                         )));
                     }
+                },
+                None => {
+                    if global_acme.is_some() {
+                        acme_domains.push(site.host.clone());
+                    } else if global_internal.is_some() {
+                        // Sites without explicit TLS fall back to the local CA
+                        // when `tls { internal }` is set in the global block.
+                        internal_hosts.insert(site.host.to_ascii_lowercase());
+                        info!(
+                            host = %site.host,
+                            "site enrolled in local CA via global `tls internal` fallback"
+                        );
+                    }
                 }
-            } else if config.tls.is_some() {
-                // Only enroll in ACME if global TLS/ACME is configured.
-                acme_domains.push(site.host.clone());
             }
         }
+
+        // Bootstrap the local CA if anyone needs it.
+        let local_ca = if !internal_hosts.is_empty() || global_internal.is_some() {
+            Some(build_local_ca(global_internal)?)
+        } else {
+            None
+        };
 
         // Build certon config and resolver (if ACME is enabled).
         let (certon_config, cert_resolver, maintenance_handle) =
@@ -148,6 +177,9 @@ impl TlsManager {
         let composite = Arc::new(CompositeResolver {
             manual_certs: tokio::sync::RwLock::new(manual_certs),
             acme_resolver: cert_resolver,
+            local_ca: local_ca.clone(),
+            internal_hosts: tokio::sync::RwLock::new(internal_hosts),
+            global_internal: global_internal.is_some(),
         });
 
         // Build the optional client certificate verifier for mTLS.
@@ -184,7 +216,13 @@ impl TlsManager {
             server_config: ArcSwap::from_pointee(rustls_config),
             maintenance_handle,
             challenge_map,
+            local_ca,
         })
+    }
+
+    /// Access the local CA used for `tls internal`, if one was configured.
+    pub fn local_ca(&self) -> Option<Arc<LocalCa>> {
+        self.local_ca.clone()
     }
 
     /// Get a `TlsAcceptor` for use with tokio-rustls.
@@ -225,10 +263,21 @@ impl TlsManager {
         // Reload manual certificates.
         let mut new_manual: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
         let mut acme_domains: Vec<String> = Vec::new();
+        let mut new_internal: HashSet<String> = HashSet::new();
+
+        let global_internal = config
+            .tls
+            .as_ref()
+            .and_then(|t| t.internal.as_ref())
+            .is_some();
+        let global_acme = config.tls.as_ref().and_then(|t| t.acme.as_ref()).is_some();
 
         for site in &config.sites {
-            if let Some(ref site_tls) = site.tls {
-                match load_manual_cert(site_tls) {
+            match &site.tls {
+                Some(site_tls) if site_tls.internal => {
+                    new_internal.insert(site.host.to_ascii_lowercase());
+                }
+                Some(site_tls) => match load_manual_cert(site_tls) {
                     Ok(certified_key) => {
                         info!(
                             host = %site.host,
@@ -248,9 +297,14 @@ impl TlsManager {
                             site.host
                         )));
                     }
+                },
+                None => {
+                    if global_acme {
+                        acme_domains.push(site.host.clone());
+                    } else if global_internal {
+                        new_internal.insert(site.host.to_ascii_lowercase());
+                    }
                 }
-            } else if config.tls.is_some() {
-                acme_domains.push(site.host.clone());
             }
         }
 
@@ -258,6 +312,10 @@ impl TlsManager {
         {
             let mut guard = self.resolver.manual_certs.write().await;
             *guard = new_manual;
+        }
+        {
+            let mut guard = self.resolver.internal_hosts.write().await;
+            *guard = new_internal;
         }
 
         // Re-enroll new ACME domains (if any new ones appeared).
@@ -340,6 +398,12 @@ struct CompositeResolver {
     manual_certs: tokio::sync::RwLock<HashMap<String, Arc<CertifiedKey>>>,
     /// The certon-backed resolver for ACME-managed domains.
     acme_resolver: Option<Arc<CertResolver>>,
+    /// Local CA used to satisfy `tls internal` sites.
+    local_ca: Option<Arc<LocalCa>>,
+    /// Hostnames explicitly enrolled in the local CA via `tls internal`.
+    internal_hosts: tokio::sync::RwLock<HashSet<String>>,
+    /// When true, sites without explicit TLS fall back to the local CA.
+    global_internal: bool,
 }
 
 impl std::fmt::Debug for CompositeResolver {
@@ -347,14 +411,18 @@ impl std::fmt::Debug for CompositeResolver {
         f.debug_struct("CompositeResolver")
             .field("manual_certs", &"<RwLock<HashMap>>")
             .field("acme_resolver", &self.acme_resolver.as_ref().map(|_| "..."))
+            .field("local_ca", &self.local_ca.as_ref().map(|_| "..."))
+            .field("global_internal", &self.global_internal)
             .finish()
     }
 }
 
 impl ResolvesServerCert for CompositeResolver {
     fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // Try manual certificates first (by SNI).
-        if let Some(sni) = client_hello.server_name()
+        let sni = client_hello.server_name();
+
+        // 1. Manual certificates (highest priority, by SNI).
+        if let Some(sni) = sni
             && let Ok(guard) = self.manual_certs.try_read()
             && let Some(ck) = guard.get(sni)
         {
@@ -362,13 +430,70 @@ impl ResolvesServerCert for CompositeResolver {
             return Some(ck.clone());
         }
 
-        // Fall back to the certon resolver.
+        // 2. Local CA — for SNI that opted in (or global_internal fallback).
+        if let (Some(sni), Some(local_ca)) = (sni, self.local_ca.as_ref()) {
+            let normalized = sni.to_ascii_lowercase();
+            let opted_in = self
+                .internal_hosts
+                .try_read()
+                .map(|g| g.contains(&normalized))
+                .unwrap_or(false);
+            if opted_in || self.global_internal {
+                return resolve_local_ca(local_ca, &normalized);
+            }
+        }
+
+        // 3. Fall back to the certon resolver (ACME / on-demand).
         if let Some(ref resolver) = self.acme_resolver {
             return resolver.resolve(client_hello);
         }
 
         None
     }
+}
+
+/// Synchronously issue (or fetch from cache) a local-CA leaf for the given
+/// SNI. Called from rustls' resolve hook, which is synchronous, so we hop into
+/// a short-lived block-on against the current tokio runtime.
+fn resolve_local_ca(local_ca: &Arc<LocalCa>, sni: &str) -> Option<Arc<CertifiedKey>> {
+    let ca = local_ca.clone();
+    let sni_owned = sni.to_string();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { ca.certificate_for(&sni_owned).await })
+        })
+    }));
+    match result {
+        Ok(Ok(ck)) => Some(ck),
+        Ok(Err(e)) => {
+            warn!(sni = %sni, error = %e, "local CA failed to issue leaf");
+            None
+        }
+        Err(_) => {
+            warn!(sni = %sni, "local CA resolve panicked");
+            None
+        }
+    }
+}
+
+/// Bootstrap the local CA, honouring the optional config-supplied storage dir.
+fn build_local_ca(cfg: Option<&InternalCaConfig>) -> Result<Arc<LocalCa>, ProxyError> {
+    let dir = cfg
+        .and_then(|c| c.storage_dir.clone())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(default_local_ca_dir);
+    let ca = LocalCa::load_or_create(&dir).map_err(|e| {
+        ProxyError::Internal(format!(
+            "failed to initialise local CA at {}: {e}",
+            dir.display()
+        ))
+    })?;
+    info!(
+        root_cert = %ca.root_cert_path().display(),
+        "local CA initialised; run `gatel trust` to install the root into the OS trust store"
+    );
+    Ok(Arc::new(ca))
 }
 
 // ---------------------------------------------------------------------------
