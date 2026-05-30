@@ -1,5 +1,7 @@
 /target
 /dist
+__pycache__/
+*.pyc
 
 .claude
 .tmp*

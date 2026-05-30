@@ -19,8 +19,6 @@ use crate::{Body, ProxyError, full_body, goals};
 
 const FCGI_VERSION_1: u8 = 1;
 const FCGI_BEGIN_REQUEST: u8 = 1;
-#[allow(dead_code)]
-const FCGI_ABORT_REQUEST: u8 = 2;
 const FCGI_END_REQUEST: u8 = 3;
 const FCGI_PARAMS: u8 = 4;
 const FCGI_STDIN: u8 = 5;
@@ -390,11 +388,7 @@ async fn send_stream_records(
 // ---------------------------------------------------------------------------
 
 struct RecordHeader {
-    #[allow(dead_code)]
-    version: u8,
     record_type: u8,
-    #[allow(dead_code)]
-    request_id: u16,
     content_length: u16,
     padding_length: u8,
 }
@@ -406,10 +400,26 @@ async fn read_record_header(stream: &mut TcpStream) -> Result<RecordHeader, Prox
         .await
         .map_err(|e| ProxyError::Internal(format!("failed to read FastCGI record header: {e}")))?;
 
+    parse_record_header(buf)
+}
+
+fn parse_record_header(buf: [u8; FCGI_HEADER_LEN]) -> Result<RecordHeader, ProxyError> {
+    let version = buf[0];
+    let request_id = u16::from_be_bytes([buf[2], buf[3]]);
+
+    if version != FCGI_VERSION_1 {
+        return Err(ProxyError::Internal(format!(
+            "invalid FastCGI record version: {version}"
+        )));
+    }
+    if request_id != FCGI_REQUEST_ID {
+        return Err(ProxyError::Internal(format!(
+            "unexpected FastCGI request id: {request_id}"
+        )));
+    }
+
     Ok(RecordHeader {
-        version: buf[0],
         record_type: buf[1],
-        request_id: u16::from_be_bytes([buf[2], buf[3]]),
         content_length: u16::from_be_bytes([buf[4], buf[5]]),
         padding_length: buf[6],
     })
@@ -588,6 +598,24 @@ mod tests {
         assert_eq!(record[0], FCGI_VERSION_1);
         assert_eq!(record[1], FCGI_BEGIN_REQUEST);
         assert_eq!(record.len(), FCGI_HEADER_LEN + 8); // 8 content, 0 padding
+    }
+
+    #[test]
+    fn parse_record_header_rejects_wrong_version() {
+        let mut buf = [0u8; FCGI_HEADER_LEN];
+        buf[0] = 2;
+        buf[2..4].copy_from_slice(&FCGI_REQUEST_ID.to_be_bytes());
+
+        assert!(parse_record_header(buf).is_err());
+    }
+
+    #[test]
+    fn parse_record_header_rejects_wrong_request_id() {
+        let mut buf = [0u8; FCGI_HEADER_LEN];
+        buf[0] = FCGI_VERSION_1;
+        buf[2..4].copy_from_slice(&2u16.to_be_bytes());
+
+        assert!(parse_record_header(buf).is_err());
     }
 
     #[test]

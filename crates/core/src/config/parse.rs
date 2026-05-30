@@ -324,22 +324,22 @@ pub fn auto_config_from_env() -> Option<String> {
     // Global block.
     out.push_str("global {\n");
     if let Some(addr) = &http_addr {
-        out.push_str(&format!("    http \"{addr}\"\n"));
+        out.push_str(&format!("    http {}\n", kdl_string(addr)));
     }
     if let Some(addr) = &https_addr {
-        out.push_str(&format!("    https \"{addr}\"\n"));
+        out.push_str(&format!("    https {}\n", kdl_string(addr)));
     }
     if let Some(addr) = &admin_addr {
-        out.push_str(&format!("    admin \"{addr}\"\n"));
+        out.push_str(&format!("    admin {}\n", kdl_string(addr)));
     }
     if let Some(token) = &admin_auth_token {
-        out.push_str(&format!("    admin-auth-token \"{token}\"\n"));
+        out.push_str(&format!("    admin-auth-token {}\n", kdl_string(token)));
     }
     if let Some(token) = &admin_read_token {
-        out.push_str(&format!("    admin-read-token \"{token}\"\n"));
+        out.push_str(&format!("    admin-read-token {}\n", kdl_string(token)));
     }
     if let Some(token) = &admin_write_token {
-        out.push_str(&format!("    admin-write-token \"{token}\"\n"));
+        out.push_str(&format!("    admin-write-token {}\n", kdl_string(token)));
     }
     out.push_str("}\n");
 
@@ -347,8 +347,8 @@ pub fn auto_config_from_env() -> Option<String> {
     if let Some(email) = &acme_email {
         out.push_str("tls {\n");
         out.push_str("    acme {\n");
-        out.push_str(&format!("        email \"{email}\"\n"));
-        out.push_str(&format!("        ca \"{acme_ca}\"\n"));
+        out.push_str(&format!("        email {}\n", kdl_string(email)));
+        out.push_str(&format!("        ca {}\n", kdl_string(&acme_ca)));
         out.push_str("    }\n");
         out.push_str("}\n");
     }
@@ -356,14 +356,19 @@ pub fn auto_config_from_env() -> Option<String> {
     // Site / proxy block (only when an upstream is provided).
     if let Some(upstream_addr) = &upstream {
         let site_host = host.as_deref().unwrap_or("*");
-        out.push_str(&format!("site \"{site_host}\" {{\n"));
+        out.push_str(&format!("site {} {{\n", kdl_string(site_host)));
         out.push_str("    route \"/*\" {\n");
-        out.push_str(&format!("        proxy \"{upstream_addr}\"\n"));
+        out.push_str(&format!("        proxy {}\n", kdl_string(upstream_addr)));
         out.push_str("    }\n");
         out.push_str("}\n");
     }
 
     Some(out)
+}
+
+/// Quote a string for use as a KDL string literal.
+pub fn kdl_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
 // ---------------------------------------------------------------------------
@@ -2370,6 +2375,24 @@ site "api.example.com" {
             parse_listen_addr("127.0.0.1:3000").unwrap(),
             "127.0.0.1:3000".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn kdl_string_escapes_quotes_and_control_chars() {
+        let input = format!(
+            "site {} {{ route \"/*\" {{ proxy {} }} }}",
+            kdl_string("app\"demo\n.example.com"),
+            kdl_string("http://127.0.0.1:3000/a\"b")
+        );
+        let config = parse_config(&input).unwrap();
+
+        assert_eq!(config.sites[0].host, "app\"demo\n.example.com");
+        match &config.sites[0].routes[0].handler {
+            HandlerConfig::Proxy(proxy) => {
+                assert_eq!(proxy.upstreams[0].addr, "http://127.0.0.1:3000/a\"b");
+            }
+            _ => panic!("expected proxy handler"),
+        }
     }
 
     #[test]

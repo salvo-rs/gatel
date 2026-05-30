@@ -667,6 +667,11 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
                 %admin_addr,
                 "admin API is listening on a non-loopback address without bearer-token authentication"
             );
+        } else if admin_addr.ip().is_loopback() && !admin_auth_configured(&config.global) {
+            warn!(
+                %admin_addr,
+                "admin API is listening on loopback without bearer-token authentication; configure a token for production or forwarded/containerized deployments"
+            );
         }
         let admin_state = Arc::clone(&state);
         let admin_metrics = Arc::clone(&state.metrics);
