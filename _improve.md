@@ -48,8 +48,8 @@
 
 - [x] `rustfmt.toml` 包含多项 nightly-only 配置。
   - 位置：`rustfmt.toml`。
-  - 影响：stable rustfmt 每次都会输出 warnings，容易掩盖真正格式化问题，也影响 CI 日志可读性。
-  - 改进：移除 stable rustfmt 不支持的 nightly-only 配置，保留稳定配置项。
+  - 影响：stable rustfmt 每次都会输出 warnings；但这些配置是项目选择 nightly rustfmt 时才生效的格式策略。
+  - 改进：保留原配置，不作为代码改动处理；验证时如需无 warning 应使用 `cargo +nightly fmt`。
 
 - [x] `benchmarks/http-servers/__pycache__` 被纳入版本控制。
   - 位置：`benchmarks/http-servers/__pycache__/run.cpython-314.pyc`。
