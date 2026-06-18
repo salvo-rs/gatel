@@ -397,23 +397,23 @@ fn reload_target(
     config_path: &str,
     address: Option<String>,
 ) -> Result<(String, Option<String>), anyhow::Error> {
+    if let Some(addr) = address {
+        let auth_token = parse_config_file(config_path)
+            .ok()
+            .and_then(|config| reload_auth_token(&config.global).map(str::to_owned));
+        return Ok((addr, auth_token));
+    }
+
     let config = parse_config_file(config_path)?;
     let auth_token = reload_auth_token(&config.global).map(str::to_owned);
-
-    let admin_addr = match address {
-        Some(addr) => addr,
-        None => match config.global.admin_addr {
-            Some(addr) => addr.to_string(),
-            None => {
-                return Err(anyhow::anyhow!(
-                    "admin API not configured in '{config_path}'; \
-                     set 'admin' in the global block or use --address"
-                ));
-            }
-        },
+    let Some(admin_addr) = config.global.admin_addr else {
+        return Err(anyhow::anyhow!(
+            "admin API not configured in '{config_path}'; \
+             set 'admin' in the global block or use --address"
+        ));
     };
 
-    Ok((admin_addr, auth_token))
+    Ok((admin_addr.to_string(), auth_token))
 }
 
 fn init_tracing(
@@ -540,6 +540,35 @@ global {
 
         assert_eq!(addr, "127.0.0.1:2020");
         assert_eq!(token.as_deref(), Some("admin-token"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_target_allows_explicit_address_when_config_is_unavailable() {
+        let dir = unique_temp_dir();
+        let missing_config = dir.join("missing.kdl");
+
+        let (addr, token) = reload_target(
+            missing_config.to_str().unwrap(),
+            Some("127.0.0.1:2020".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(addr, "127.0.0.1:2020");
+        assert_eq!(token, None);
+
+        let invalid_config = dir.join("invalid.kdl");
+        std::fs::write(&invalid_config, "global { admin ").unwrap();
+
+        let (addr, token) = reload_target(
+            invalid_config.to_str().unwrap(),
+            Some("127.0.0.1:2021".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(addr, "127.0.0.1:2021");
+        assert_eq!(token, None);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
