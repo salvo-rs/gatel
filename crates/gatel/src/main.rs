@@ -494,7 +494,11 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn reload_auth_token_prefers_admin_auth_token() {
@@ -575,12 +579,13 @@ global {
 
     fn unique_temp_dir() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "gatel-main-test-{}-{}",
+            "gatel-main-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
         path

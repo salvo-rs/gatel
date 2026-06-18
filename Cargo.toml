@@ -97,10 +97,10 @@ mimalloc = { version = "0.1", default-features = false }
 argon2 = "0.5"
 scrypt = { version = "0.12", features = ["phc"] }
 pbkdf2 = { version = "0.12", features = ["simple"] }
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["trace"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 salvo = { version = "0.93", default-features = false, features = [
     "fix-http1-request-uri",
