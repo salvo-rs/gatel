@@ -658,15 +658,21 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
         .restore_runtime_state()
         .await
         .map_err(|error| crate::ProxyError::Internal(error.to_string()))?;
-    let config = state.config.load();
-    let http_listener = TcpListener::bind(config.global.http_addr).await?;
 
-    run_with_http_listener(state, http_listener).await
+    run_server(state, None).await
 }
 
+#[cfg(test)]
 async fn run_with_http_listener(
     state: Arc<AppState>,
     http_listener: TcpListener,
+) -> Result<(), crate::ProxyError> {
+    run_server(state, Some(http_listener)).await
+}
+
+async fn run_server(
+    state: Arc<AppState>,
+    http_listener: Option<TcpListener>,
 ) -> Result<(), crate::ProxyError> {
     let config = state.config.load();
 
@@ -706,6 +712,10 @@ async fn run_with_http_listener(
         }
     }
 
+    let http_listener = match http_listener {
+        Some(listener) => listener,
+        None => TcpListener::bind(config.global.http_addr).await?,
+    };
     let http_addr = http_listener.local_addr()?;
     let proxy_protocol_enabled = config.global.proxy_protocol;
 
