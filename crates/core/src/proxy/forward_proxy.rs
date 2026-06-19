@@ -31,6 +31,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
 use crate::config::BasicAuthUser;
+use crate::encoding::base64_decode;
 use crate::{Body, ProxyError, empty_body, full_body, goals};
 
 /// Forward proxy handler: supports HTTP CONNECT tunneling.
@@ -223,45 +224,6 @@ fn extract_proxy_credentials(req: &http::Request<Body>) -> Option<(String, Strin
     let decoded = String::from_utf8(decoded_bytes).ok()?;
     let (username, password) = decoded.split_once(':')?;
     Some((username.to_string(), password.to_string()))
-}
-
-/// Minimal base64 decoder (mirrors the one in the auth middleware to avoid
-/// an extra dependency).
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let input = input.trim();
-    if input.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-
-    for &b in input.as_bytes() {
-        if b == b'=' {
-            break;
-        }
-        let val = match TABLE.iter().position(|&c| c == b) {
-            Some(v) => v as u32,
-            None => {
-                if b == b'\n' || b == b'\r' || b == b' ' {
-                    continue;
-                }
-                return None;
-            }
-        };
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-
-    Some(output)
 }
 
 /// Verify a proxy auth user's password against their stored hash/plaintext.

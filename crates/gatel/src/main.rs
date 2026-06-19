@@ -8,7 +8,9 @@ mod win_service;
 use std::sync::Arc;
 
 use clap::Parser;
-use gatel_core::config::{GlobalConfig, auto_config_from_env, parse_config, parse_config_file};
+use gatel_core::config::{
+    GlobalConfig, auto_config_from_env, kdl_string, parse_config, parse_config_file,
+};
 use gatel_core::server::{self, AppState};
 use gatel_core::tls::TlsManager;
 use tracing::{error, info, warn};
@@ -136,24 +138,7 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
             config: config_path,
             address,
         } => {
-            // Determine admin address (and optional auth token) from flag or config.
-            let (admin_addr, auth_token) = if let Some(addr) = address {
-                (addr, None)
-            } else {
-                let config = parse_config_file(&config_path)?;
-                match config.global.admin_addr {
-                    Some(addr) => (
-                        addr.to_string(),
-                        reload_auth_token(&config.global).map(str::to_owned),
-                    ),
-                    None => {
-                        return Err(anyhow::anyhow!(
-                            "admin API not configured in '{config_path}'; \
-                             set 'admin' in the global block or use --address"
-                        ));
-                    }
-                }
-            };
+            let (admin_addr, auth_token) = reload_target(&config_path, address)?;
 
             match admin_reload_request(&admin_addr, auth_token.as_deref()) {
                 Ok(body) => {
@@ -175,18 +160,21 @@ async fn async_main(cli: cli::Cli) -> anyhow::Result<()> {
 
             // Build a synthetic config
             let browse_str = if browse { " browse=true" } else { "" };
+            let listen_addr = format!("{listen}:{port}");
             let config_str = format!(
                 r#"
 global {{
-    http "{listen}:{port}"
+    http {}
 }}
 site "*" {{
     route "/*" {{
-        root "{root}"
+        root {}
         file-server{browse_str}
     }}
 }}
-"#
+"#,
+                kdl_string(&listen_addr),
+                kdl_string(&root)
             );
             let config = parse_config(&config_str)?;
             info!("serving {} on {}:{}", root, listen, port);
@@ -235,7 +223,10 @@ site "*" {{
 ///
 /// - SIGTERM / SIGINT / Ctrl+C: initiate graceful shutdown.
 /// - SIGHUP (Unix only): hot-reload configuration.
-async fn signal_handler(state: Arc<AppState>, #[allow(unused)] config_path: String) {
+async fn signal_handler(
+    state: Arc<AppState>,
+    #[cfg_attr(not(unix), allow(unused))] config_path: String,
+) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -299,7 +290,7 @@ async fn initiate_shutdown(state: &AppState) {
 }
 
 /// Hot-reload configuration from disk.
-#[allow(dead_code)]
+#[cfg(unix)]
 async fn reload_config(state: &AppState, config_path: &str) {
     gatel_core::sd_notify::sd_notify("RELOADING=1");
 
@@ -402,6 +393,29 @@ fn reload_auth_token(global: &GlobalConfig) -> Option<&str> {
         .or(global.admin_write_token.as_deref())
 }
 
+fn reload_target(
+    config_path: &str,
+    address: Option<String>,
+) -> Result<(String, Option<String>), anyhow::Error> {
+    if let Some(addr) = address {
+        let auth_token = parse_config_file(config_path)
+            .ok()
+            .and_then(|config| reload_auth_token(&config.global).map(str::to_owned));
+        return Ok((addr, auth_token));
+    }
+
+    let config = parse_config_file(config_path)?;
+    let auth_token = reload_auth_token(&config.global).map(str::to_owned);
+    let Some(admin_addr) = config.global.admin_addr else {
+        return Err(anyhow::anyhow!(
+            "admin API not configured in '{config_path}'; \
+             set 'admin' in the global block or use --address"
+        ));
+    };
+
+    Ok((admin_addr.to_string(), auth_token))
+}
+
 fn init_tracing(
     level: &str,
     format: &str,
@@ -480,7 +494,11 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn reload_auth_token_prefers_admin_auth_token() {
@@ -501,5 +519,75 @@ mod tests {
         };
 
         assert_eq!(reload_auth_token(&global), Some("write-token"));
+    }
+
+    #[test]
+    fn reload_target_uses_config_token_with_explicit_address() {
+        let dir = unique_temp_dir();
+        let config_path = dir.join("gatel.kdl");
+        std::fs::write(
+            &config_path,
+            r#"
+global {
+    admin "127.0.0.1:2019"
+    admin-auth-token "admin-token"
+}
+"#,
+        )
+        .unwrap();
+
+        let (addr, token) = reload_target(
+            config_path.to_str().unwrap(),
+            Some("127.0.0.1:2020".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(addr, "127.0.0.1:2020");
+        assert_eq!(token.as_deref(), Some("admin-token"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_target_allows_explicit_address_when_config_is_unavailable() {
+        let dir = unique_temp_dir();
+        let missing_config = dir.join("missing.kdl");
+
+        let (addr, token) = reload_target(
+            missing_config.to_str().unwrap(),
+            Some("127.0.0.1:2020".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(addr, "127.0.0.1:2020");
+        assert_eq!(token, None);
+
+        let invalid_config = dir.join("invalid.kdl");
+        std::fs::write(&invalid_config, "global { admin ").unwrap();
+
+        let (addr, token) = reload_target(
+            invalid_config.to_str().unwrap(),
+            Some("127.0.0.1:2021".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(addr, "127.0.0.1:2021");
+        assert_eq!(token, None);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn unique_temp_dir() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "gatel-main-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }

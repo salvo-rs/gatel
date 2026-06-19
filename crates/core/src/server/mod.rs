@@ -658,6 +658,22 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
         .restore_runtime_state()
         .await
         .map_err(|error| crate::ProxyError::Internal(error.to_string()))?;
+
+    run_server(state, None).await
+}
+
+#[cfg(test)]
+async fn run_with_http_listener(
+    state: Arc<AppState>,
+    http_listener: TcpListener,
+) -> Result<(), crate::ProxyError> {
+    run_server(state, Some(http_listener)).await
+}
+
+async fn run_server(
+    state: Arc<AppState>,
+    http_listener: Option<TcpListener>,
+) -> Result<(), crate::ProxyError> {
     let config = state.config.load();
 
     // Start the admin API server if configured.
@@ -666,6 +682,11 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
             warn!(
                 %admin_addr,
                 "admin API is listening on a non-loopback address without bearer-token authentication"
+            );
+        } else if admin_addr.ip().is_loopback() && !admin_auth_configured(&config.global) {
+            warn!(
+                %admin_addr,
+                "admin API is listening on loopback without bearer-token authentication; configure a token for production or forwarded/containerized deployments"
             );
         }
         let admin_state = Arc::clone(&state);
@@ -691,14 +712,17 @@ pub async fn run(state: Arc<AppState>) -> Result<(), crate::ProxyError> {
         }
     }
 
-    let http_addr = config.global.http_addr;
+    let http_listener = match http_listener {
+        Some(listener) => listener,
+        None => TcpListener::bind(config.global.http_addr).await?,
+    };
+    let http_addr = http_listener.local_addr()?;
     let proxy_protocol_enabled = config.global.proxy_protocol;
 
     if proxy_protocol_enabled {
         info!("PROXY protocol support enabled");
     }
 
-    let http_listener = TcpListener::bind(http_addr).await?;
     info!(%http_addr, "listening for HTTP connections");
 
     // If TLS is configured, start the HTTPS listener concurrently.
@@ -1224,26 +1248,20 @@ mod tests {
         String::from_utf8(payload).unwrap()
     }
 
-    async fn free_http_addr() -> std::net::SocketAddr {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        addr
-    }
-
     async fn spawn_proxy() -> (
         Arc<AppState>,
         std::net::SocketAddr,
         tokio::task::JoinHandle<()>,
     ) {
-        let http_addr = free_http_addr().await;
+        let http_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
         let mut config = AppConfig::default();
         config.global.http_addr = http_addr;
 
         let state = AppState::new(config, None);
         let run_state = Arc::clone(&state);
         let handle = tokio::spawn(async move {
-            let _ = run(run_state).await;
+            let _ = run_with_http_listener(run_state, http_listener).await;
         });
 
         let client = reqwest::Client::builder()
