@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -368,7 +369,23 @@ pub fn auto_config_from_env() -> Option<String> {
 
 /// Quote a string for use as a KDL string literal.
 pub fn kdl_string(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a string cannot fail")
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                write!(out, "\\u{{{:x}}}", ch as u32).expect("writing to a string cannot fail")
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2381,12 +2398,13 @@ site "api.example.com" {
     fn kdl_string_escapes_quotes_and_control_chars() {
         let input = format!(
             "site {} {{ route \"/*\" {{ proxy {} }} }}",
-            kdl_string("app\"demo\n.example.com"),
+            kdl_string("app\"demo\n\u{1b}.example.com"),
             kdl_string("http://127.0.0.1:3000/a\"b")
         );
+        assert!(input.contains("\\u{1b}"));
         let config = parse_config(&input).unwrap();
 
-        assert_eq!(config.sites[0].host, "app\"demo\n.example.com");
+        assert_eq!(config.sites[0].host, "app\"demo\n\u{1b}.example.com");
         match &config.sites[0].routes[0].handler {
             HandlerConfig::Proxy(proxy) => {
                 assert_eq!(proxy.upstreams[0].addr, "http://127.0.0.1:3000/a\"b");
