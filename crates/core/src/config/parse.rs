@@ -24,6 +24,184 @@ pub enum ConfigError {
     InvalidValue { field: String, detail: String },
 }
 
+fn integer_range(value: i128, field: &str, min: i128, max: i128) -> Result<i128, ConfigError> {
+    if value < min || value > max {
+        return Err(ConfigError::InvalidValue {
+            field: field.into(),
+            detail: format!("expected integer in range {min}..={max}, got {value}"),
+        });
+    }
+    Ok(value)
+}
+
+fn named_integer(node: &KdlNode, name: &str, field: &str) -> Result<Option<i128>, ConfigError> {
+    let Some(value) = node.get(name) else {
+        return Ok(None);
+    };
+    value
+        .as_integer()
+        .map(Some)
+        .ok_or_else(|| ConfigError::InvalidValue {
+            field: field.into(),
+            detail: "expected integer".into(),
+        })
+}
+
+fn positional_integer(
+    node: &KdlNode,
+    index: usize,
+    field: &str,
+) -> Result<Option<i128>, ConfigError> {
+    let Some(value) = node.get(index) else {
+        return Ok(None);
+    };
+    value
+        .as_integer()
+        .map(Some)
+        .ok_or_else(|| ConfigError::InvalidValue {
+            field: field.into(),
+            detail: "expected integer".into(),
+        })
+}
+
+fn named_u16_or(
+    node: &KdlNode,
+    name: &str,
+    default: u16,
+    min: u16,
+    max: u16,
+    field: &str,
+) -> Result<u16, ConfigError> {
+    Ok(match named_integer(node, name, field)? {
+        Some(value) => integer_range(value, field, i128::from(min), i128::from(max))? as u16,
+        None => default,
+    })
+}
+
+fn named_u32_or(
+    node: &KdlNode,
+    name: &str,
+    default: u32,
+    min: u32,
+    max: u32,
+    field: &str,
+) -> Result<u32, ConfigError> {
+    Ok(match named_integer(node, name, field)? {
+        Some(value) => integer_range(value, field, i128::from(min), i128::from(max))? as u32,
+        None => default,
+    })
+}
+
+fn named_u64_or(
+    node: &KdlNode,
+    name: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+    field: &str,
+) -> Result<u64, ConfigError> {
+    Ok(match named_integer(node, name, field)? {
+        Some(value) => integer_range(value, field, i128::from(min), i128::from(max))? as u64,
+        None => default,
+    })
+}
+
+fn optional_named_u32(
+    node: &KdlNode,
+    name: &str,
+    min: u32,
+    max: u32,
+    field: &str,
+) -> Result<Option<u32>, ConfigError> {
+    Ok(match named_integer(node, name, field)? {
+        Some(value) => Some(integer_range(value, field, i128::from(min), i128::from(max))? as u32),
+        None => None,
+    })
+}
+
+fn optional_named_u16(
+    node: &KdlNode,
+    name: &str,
+    min: u16,
+    max: u16,
+    field: &str,
+) -> Result<Option<u16>, ConfigError> {
+    Ok(match named_integer(node, name, field)? {
+        Some(value) => Some(integer_range(value, field, i128::from(min), i128::from(max))? as u16),
+        None => None,
+    })
+}
+
+fn optional_named_u64(
+    node: &KdlNode,
+    name: &str,
+    min: u64,
+    max: u64,
+    field: &str,
+) -> Result<Option<u64>, ConfigError> {
+    Ok(match named_integer(node, name, field)? {
+        Some(value) => Some(integer_range(value, field, i128::from(min), i128::from(max))? as u64),
+        None => None,
+    })
+}
+
+fn optional_named_usize(
+    node: &KdlNode,
+    name: &str,
+    min: usize,
+    max: usize,
+    field: &str,
+) -> Result<Option<usize>, ConfigError> {
+    Ok(match named_integer(node, name, field)? {
+        Some(value) => Some(integer_range(value, field, min as i128, max as i128)? as usize),
+        None => None,
+    })
+}
+
+fn optional_positional_u64(
+    node: &KdlNode,
+    index: usize,
+    min: u64,
+    max: u64,
+    field: &str,
+) -> Result<Option<u64>, ConfigError> {
+    Ok(match positional_integer(node, index, field)? {
+        Some(value) => Some(integer_range(value, field, i128::from(min), i128::from(max))? as u64),
+        None => None,
+    })
+}
+
+fn optional_positional_usize(
+    node: &KdlNode,
+    index: usize,
+    min: usize,
+    max: usize,
+    field: &str,
+) -> Result<Option<usize>, ConfigError> {
+    Ok(match positional_integer(node, index, field)? {
+        Some(value) => Some(integer_range(value, field, min as i128, max as i128)? as usize),
+        None => None,
+    })
+}
+
+fn required_non_empty_string_prop(
+    node: &KdlNode,
+    name: &str,
+    field: &str,
+) -> Result<String, ConfigError> {
+    let value = node
+        .get(name)
+        .and_then(|v| v.as_string())
+        .ok_or_else(|| ConfigError::MissingField(field.into()))?;
+    if value.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: field.into(),
+            detail: "expected non-empty string".into(),
+        });
+    }
+    Ok(value.to_string())
+}
+
 /// Parse a KDL configuration string into an `AppConfig`.
 ///
 /// This function parses a single KDL string and does **not** resolve
@@ -474,20 +652,12 @@ fn parse_global(node: &KdlNode) -> Result<GlobalConfig, ConfigError> {
                     .unwrap_or(true);
             }
             "tcp-send-buffer" => {
-                cfg.tcp_send_buffer = child
-                    .entries()
-                    .iter()
-                    .find(|e| e.name().is_none())
-                    .and_then(|e| e.value().as_integer())
-                    .map(|v| v as usize);
+                cfg.tcp_send_buffer =
+                    optional_positional_usize(child, 0, 1, usize::MAX, "tcp-send-buffer")?;
             }
             "tcp-recv-buffer" => {
-                cfg.tcp_recv_buffer = child
-                    .entries()
-                    .iter()
-                    .find(|e| e.name().is_none())
-                    .and_then(|e| e.value().as_integer())
-                    .map(|v| v as usize);
+                cfg.tcp_recv_buffer =
+                    optional_positional_usize(child, 0, 1, usize::MAX, "tcp-recv-buffer")?;
             }
             "otlp-endpoint" => {
                 cfg.otlp_endpoint = first_string_arg(child);
@@ -524,20 +694,12 @@ fn parse_log_file_config(node: &KdlNode) -> Result<LogFileConfig, ConfigError> {
                     format = first_string_arg(child);
                 }
                 "rotate-size" => {
-                    rotate_size = child
-                        .entries()
-                        .iter()
-                        .find(|e| e.name().is_none())
-                        .and_then(|e| e.value().as_integer())
-                        .map(|v| v as u64);
+                    rotate_size =
+                        optional_positional_u64(child, 0, 1, u64::MAX, "log rotate-size")?;
                 }
                 "rotate-keep" => {
-                    rotate_keep = child
-                        .entries()
-                        .iter()
-                        .find(|e| e.name().is_none())
-                        .and_then(|e| e.value().as_integer())
-                        .map(|v| v as usize);
+                    rotate_keep =
+                        optional_positional_usize(child, 0, 1, usize::MAX, "log rotate-keep")?;
                 }
                 _ => {}
             }
@@ -607,10 +769,13 @@ fn parse_tls(node: &KdlNode) -> Result<TlsConfig, ConfigError> {
                     .get("ask")
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
-                let rate_limit = child
-                    .get("rate-limit")
-                    .and_then(|v| v.as_integer())
-                    .map(|v| v as u32);
+                let rate_limit = optional_named_u32(
+                    child,
+                    "rate-limit",
+                    1,
+                    u32::MAX,
+                    "tls on-demand rate-limit",
+                )?;
                 tls.on_demand = Some(OnDemandTlsConfig { ask, rate_limit });
             }
             "min-version" => {
@@ -924,10 +1089,8 @@ fn parse_route(
             "force-https" => middlewares.push(parse_force_https(child)?),
             "trailing-slash" => middlewares.push(parse_trailing_slash(child)?),
             "decompress" => {
-                let max_size = child
-                    .get("max-size")
-                    .and_then(|v| v.as_integer())
-                    .map(|v| v as usize);
+                let max_size =
+                    optional_named_usize(child, "max-size", 1, usize::MAX, "decompress max-size")?;
                 middlewares.push(HoopConfig::Decompress { max_size });
             }
             "error-pages" => middlewares.push(parse_error_pages(child)?),
@@ -982,10 +1145,7 @@ fn parse_route(
             }
             "respond" => {
                 let body = first_string_arg(child).unwrap_or_default();
-                let status = child
-                    .get("status")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(200) as u16;
+                let status = named_u16_or(child, "status", 200, 100, 599, "respond status")?;
                 handler = Some(HandlerConfig::Respond { status, body });
             }
             other => {
@@ -1224,11 +1384,8 @@ fn parse_forward_proxy(node: &KdlNode) -> Result<ForwardProxyConfig, ConfigError
                     let username = first_string_arg(child).ok_or_else(|| {
                         ConfigError::MissingField("forward-proxy user username".into())
                     })?;
-                    let password_hash = child
-                        .get("hash")
-                        .and_then(|v| v.as_string())
-                        .unwrap_or("")
-                        .to_string();
+                    let password_hash =
+                        required_non_empty_string_prop(child, "hash", "forward-proxy user hash")?;
                     auth_users.push(BasicAuthUser {
                         username,
                         password_hash,
@@ -1314,10 +1471,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
             "upstream" => {
                 let addr = first_string_arg(child)
                     .ok_or_else(|| ConfigError::MissingField("upstream address".into()))?;
-                let weight = child
-                    .get("weight")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(1) as u32;
+                let weight = named_u32_or(child, "weight", 1, 1, u32::MAX, "upstream weight")?;
                 upstreams.push(UpstreamConfig {
                     addr,
                     weight,
@@ -1370,14 +1524,22 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                     .map(parse_duration)
                     .transpose()?
                     .unwrap_or(Duration::from_secs(5));
-                let unhealthy_threshold = child
-                    .get("unhealthy-threshold")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(3) as u32;
-                let healthy_threshold = child
-                    .get("healthy-threshold")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(2) as u32;
+                let unhealthy_threshold = named_u32_or(
+                    child,
+                    "unhealthy-threshold",
+                    3,
+                    1,
+                    u32::MAX,
+                    "health-check unhealthy-threshold",
+                )?;
+                let healthy_threshold = named_u32_or(
+                    child,
+                    "healthy-threshold",
+                    2,
+                    1,
+                    u32::MAX,
+                    "health-check healthy-threshold",
+                )?;
                 health_check = Some(HealthCheckConfig {
                     uri,
                     interval,
@@ -1387,10 +1549,14 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 });
             }
             "passive-health" => {
-                let max_fails = child
-                    .get("max-fails")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(5) as u32;
+                let max_fails = named_u32_or(
+                    child,
+                    "max-fails",
+                    5,
+                    1,
+                    u32::MAX,
+                    "passive-health max-fails",
+                )?;
                 let fail_window = child
                     .get("fail-window")
                     .and_then(|v| v.as_string())
@@ -1410,17 +1576,29 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 });
             }
             "retries" => {
-                retries = first_string_arg(child)
-                    .or_else(|| {
-                        child
-                            .entries()
-                            .iter()
-                            .find(|e| e.name().is_none())
-                            .and_then(|e| e.value().as_integer())
-                            .map(|i| i.to_string())
-                    })
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(0);
+                retries = match child.get(0) {
+                    Some(value) => {
+                        if let Some(value) = value.as_integer() {
+                            integer_range(value, "proxy retries", 0, i128::from(u32::MAX))? as u32
+                        } else if let Some(value) = value.as_string() {
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| ConfigError::InvalidValue {
+                                    field: "proxy retries".into(),
+                                    detail: format!(
+                                        "expected integer in range 0..={}, got {value}",
+                                        u32::MAX
+                                    ),
+                                })?
+                        } else {
+                            return Err(ConfigError::InvalidValue {
+                                field: "proxy retries".into(),
+                                detail: "expected integer".into(),
+                            });
+                        }
+                    }
+                    None => 0,
+                };
             }
             "retry-buffer-limit" => {
                 let value = child
@@ -1463,7 +1641,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                     .map(|s| s.to_string())
                     .or_else(|| first_string_arg(child))
                     .ok_or_else(|| ConfigError::MissingField("dns-upstream name".into()))?;
-                let port = child.get("port").and_then(|v| v.as_integer()).unwrap_or(80) as u16;
+                let port = named_u16_or(child, "port", 80, 1, u16::MAX, "dns-upstream port")?;
                 let refresh_interval = child
                     .get("refresh")
                     .and_then(|v| v.as_string())
@@ -1486,7 +1664,8 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                         positional[1].value().as_string(),
                     )
                 {
-                    error_pages.insert(code as u16, body.to_string());
+                    let code = integer_range(code, "error-page status", 100, 599)? as u16;
+                    error_pages.insert(code, body.to_string());
                 }
             }
             "header-up-replace" => {
@@ -1503,10 +1682,8 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                 upstream_http2 = child.get(0).and_then(|v| v.as_bool()).unwrap_or(true);
             }
             "max-connections" => {
-                max_connections = child
-                    .get(0)
-                    .and_then(|v| v.as_integer())
-                    .map(|v| v as usize);
+                max_connections =
+                    optional_positional_usize(child, 0, 1, usize::MAX, "max-connections")?;
             }
             "keepalive" => {
                 keepalive_timeout = child
@@ -1583,20 +1760,14 @@ fn parse_rate_limit(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
         .map(parse_duration)
         .transpose()?
         .unwrap_or(Duration::from_secs(60));
-    let max = node.get("max").and_then(|v| v.as_integer()).unwrap_or(100) as u64;
-    let burst = node
-        .get("burst")
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u64);
+    let max = named_u64_or(node, "max", 100, 1, u64::MAX, "rate-limit max")?;
+    let burst = optional_named_u64(node, "burst", 1, u64::MAX, "rate-limit burst")?;
     Ok(HoopConfig::RateLimit { window, max, burst })
 }
 
 fn parse_encode(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
     let encodings = string_args(node);
-    let level = node
-        .get("level")
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32);
+    let level = optional_named_u32(node, "level", 0, u32::MAX, "encode level")?;
     if encodings.is_empty() {
         return Ok(HoopConfig::Encode {
             encodings: vec!["gzip".into()],
@@ -1617,11 +1788,8 @@ fn parse_basic_auth(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
                 "user" => {
                     let username = first_string_arg(child)
                         .ok_or_else(|| ConfigError::MissingField("basic-auth username".into()))?;
-                    let password_hash = child
-                        .get("hash")
-                        .and_then(|v| v.as_string())
-                        .unwrap_or("")
-                        .to_string();
+                    let password_hash =
+                        required_non_empty_string_prop(child, "hash", "basic-auth user hash")?;
                     users.push(BasicAuthUser {
                         username,
                         password_hash,
@@ -1633,7 +1801,11 @@ fn parse_basic_auth(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
                         .iter()
                         .find(|e| e.name().is_none())
                         .and_then(|e| e.value().as_integer())
-                        .map(|v| v as u32);
+                        .map(|v| {
+                            integer_range(v, "basic-auth brute-force-max", 1, i128::from(u32::MAX))
+                                .map(|v| v as u32)
+                        })
+                        .transpose()?;
                 }
                 "brute-force-window" => {
                     brute_force_window = first_string_arg(child)
@@ -1780,11 +1952,18 @@ fn parse_replace(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
 
 fn parse_cache(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
     let mut cfg = CacheConfig::default();
-    if let Some(v) = node.get("max-entries").and_then(|v| v.as_integer()) {
-        cfg.max_entries = v as usize;
+    if let Some(v) = optional_named_usize(node, "max-entries", 1, usize::MAX, "cache max-entries")?
+    {
+        cfg.max_entries = v;
     }
-    if let Some(v) = node.get("max-entry-size").and_then(|v| v.as_integer()) {
-        cfg.max_entry_size = v as usize;
+    if let Some(v) = optional_named_usize(
+        node,
+        "max-entry-size",
+        1,
+        usize::MAX,
+        "cache max-entry-size",
+    )? {
+        cfg.max_entry_size = v;
     }
     if let Some(v) = node.get("max-age").and_then(|v| v.as_string()) {
         cfg.default_max_age = parse_duration(v)?;
@@ -1811,14 +1990,20 @@ fn parse_forward_auth(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
 }
 
 fn parse_buffer_limit(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
-    let max_request_body = node
-        .get("max-request-body")
-        .and_then(|v| v.as_integer())
-        .map(|v| v as usize);
-    let max_response_body = node
-        .get("max-response-body")
-        .and_then(|v| v.as_integer())
-        .map(|v| v as usize);
+    let max_request_body = optional_named_usize(
+        node,
+        "max-request-body",
+        1,
+        usize::MAX,
+        "buffer-limit max-request-body",
+    )?;
+    let max_response_body = optional_named_usize(
+        node,
+        "max-response-body",
+        1,
+        usize::MAX,
+        "buffer-limit max-response-body",
+    )?;
     Ok(HoopConfig::BufferLimit {
         max_request_body,
         max_response_body,
@@ -1857,12 +2042,7 @@ fn parse_cors(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
                     expose_headers.extend(string_args(child));
                 }
                 "max-age" => {
-                    max_age = child
-                        .entries()
-                        .iter()
-                        .find(|e| e.name().is_none())
-                        .and_then(|e| e.value().as_integer())
-                        .map(|v| v as u64);
+                    max_age = optional_positional_u64(child, 0, 0, u64::MAX, "cors max-age")?;
                 }
                 _ => {}
             }
@@ -1914,11 +2094,21 @@ fn parse_request_id(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
 }
 
 fn parse_force_https(node: &KdlNode) -> Result<HoopConfig, ConfigError> {
-    let https_port = node
-        .get("port")
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u16)
-        .or_else(|| first_string_arg(node).and_then(|s| s.parse::<u16>().ok()));
+    let https_port =
+        if let Some(port) = optional_named_u16(node, "port", 1, u16::MAX, "force-https port")? {
+            Some(port)
+        } else if let Some(value) = first_string_arg(node) {
+            Some(
+                value
+                    .parse::<u16>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        field: "force-https port".into(),
+                        detail: format!("expected integer in range 1..={}, got {value}", u16::MAX),
+                    })?,
+            )
+        } else {
+            None
+        };
     Ok(HoopConfig::ForceHttps { https_port })
 }
 
@@ -2577,6 +2767,98 @@ site "proxy.example.com" {
 "#;
 
         assert!(parse_config(input).is_err());
+    }
+
+    #[test]
+    fn test_forward_proxy_user_requires_hash() {
+        let input = r#"
+site "proxy.example.com" {
+    route "/*" {
+        forward-proxy {
+            user "alice"
+        }
+    }
+}
+"#;
+
+        let err = parse_config(input).unwrap_err().to_string();
+        assert!(err.contains("forward-proxy user hash"), "{err}");
+    }
+
+    #[test]
+    fn test_basic_auth_user_requires_hash() {
+        let input = r#"
+site "app.example.com" {
+    route "/*" {
+        basic-auth {
+            user "admin"
+        }
+        proxy "localhost:3000"
+    }
+}
+"#;
+
+        let err = parse_config(input).unwrap_err().to_string();
+        assert!(err.contains("basic-auth user hash"), "{err}");
+    }
+
+    #[test]
+    fn numeric_config_fields_reject_invalid_ranges() {
+        let cases = [
+            (
+                r#"
+global {
+    tcp-send-buffer -1
+}
+site "app.example.com" {
+    route "/*" {
+        proxy "localhost:3000"
+    }
+}
+"#,
+                "tcp-send-buffer",
+            ),
+            (
+                r#"
+site "app.example.com" {
+    route "/*" {
+        proxy {
+            upstream "localhost:3000" weight=-1
+        }
+    }
+}
+"#,
+                "upstream weight",
+            ),
+            (
+                r#"
+site "app.example.com" {
+    route "/*" {
+        rate-limit max=-1
+        proxy "localhost:3000"
+    }
+}
+"#,
+                "rate-limit max",
+            ),
+            (
+                r#"
+site "app.example.com" {
+    route "/*" {
+        proxy {
+            dns-upstream name="app.local" port=70000
+        }
+    }
+}
+"#,
+                "dns-upstream port",
+            ),
+        ];
+
+        for (input, field) in cases {
+            let err = parse_config(input).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
     }
 
     #[test]

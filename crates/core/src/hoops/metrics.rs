@@ -22,6 +22,19 @@ type RouteMatchKey = (String, String);
 /// Composite key for backend selection counters: `(site, route, backend, policy)`.
 type BackendSelectionKey = (String, String, String, String);
 
+pub(crate) fn prometheus_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str(r"\\"),
+            '"' => escaped.push_str(r#"\""#),
+            '\n' => escaped.push_str(r"\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 /// Shared metrics store. Safe to use from multiple tasks concurrently.
 pub struct Metrics {
     /// `gatel_requests_total` — counter per (host, method, status).
@@ -121,6 +134,8 @@ impl Metrics {
         out.push_str("# TYPE gatel_requests_total counter\n");
         for entry in self.request_counts.iter() {
             let (host, method, status) = entry.key();
+            let host = prometheus_label_value(host);
+            let method = prometheus_label_value(method);
             let count = entry.value().load(Ordering::Relaxed);
             out.push_str(&format!(
                 "gatel_requests_total{{host=\"{host}\",method=\"{method}\",status=\"{status}\"}} {count}\n"
@@ -134,6 +149,8 @@ impl Metrics {
         out.push_str("# TYPE gatel_request_duration_seconds histogram\n");
         for entry in self.request_duration_sum.iter() {
             let (host, method) = entry.key();
+            let host = prometheus_label_value(host);
+            let method = prometheus_label_value(method);
             let sum_micros = entry.value().load(Ordering::Relaxed);
             let sum_secs = sum_micros as f64 / 1_000_000.0;
             let count = self
@@ -160,6 +177,8 @@ impl Metrics {
         out.push_str("# TYPE gatel_route_matches_total counter\n");
         for entry in self.route_match_counts.iter() {
             let (site, route) = entry.key();
+            let site = prometheus_label_value(site);
+            let route = prometheus_label_value(route);
             let count = entry.value().load(Ordering::Relaxed);
             out.push_str(&format!(
                 "gatel_route_matches_total{{site=\"{site}\",route=\"{route}\"}} {count}\n"
@@ -173,6 +192,10 @@ impl Metrics {
         out.push_str("# TYPE gatel_backend_selections_total counter\n");
         for entry in self.backend_selection_counts.iter() {
             let (site, route, backend, policy) = entry.key();
+            let site = prometheus_label_value(site);
+            let route = prometheus_label_value(route);
+            let backend = prometheus_label_value(backend);
+            let policy = prometheus_label_value(policy);
             let count = entry.value().load(Ordering::Relaxed);
             out.push_str(&format!(
                 "gatel_backend_selections_total{{site=\"{site}\",route=\"{route}\",backend=\"{backend}\",policy=\"{policy}\"}} {count}\n"
@@ -266,5 +289,25 @@ mod tests {
         assert!(output.contains("gatel_route_matches_total"));
         assert!(output.contains("gatel_backend_selections_total"));
         assert!(output.contains("gatel_active_connections 1"));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_label_values() {
+        let m = Metrics::new();
+        m.record_request(
+            "exa\"mple\\host\nline",
+            "GET",
+            200,
+            Duration::from_millis(1),
+        );
+        m.record_route_match("site\"a", "/api\\v1\nusers");
+        m.record_backend_selection("site", "route", "127.0.0.1:3000\"x", "least\\conn");
+
+        let output = m.render_prometheus();
+
+        assert!(output.contains(r#"host="exa\"mple\\host\nline""#));
+        assert!(output.contains(r#"route="/api\\v1\nusers""#));
+        assert!(output.contains(r#"backend="127.0.0.1:3000\"x""#));
+        assert!(output.contains(r#"policy="least\\conn""#));
     }
 }
