@@ -485,6 +485,7 @@ proxy {
     health-check uri="/health" interval="10s" timeout="5s"
     passive-health max-fails=5 fail-window="30s" cooldown="60s"
     retries 2
+    retry-buffer-limit 1048576
     header-up "X-Real-IP" "{client_ip}"
     header-down "-Server"
     dns-upstream name="app.svc.cluster.local" port=8080 refresh="30s"

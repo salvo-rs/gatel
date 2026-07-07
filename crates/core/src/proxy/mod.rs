@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, Request, Response, Uri};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt;
@@ -127,6 +127,7 @@ pub struct ReverseProxy {
     headers_up: Vec<(String, String)>,
     headers_down: Vec<(String, String)>,
     retries: u32,
+    retry_buffer_limit: usize,
     /// Active health checker (holds the background task; dropped with the proxy).
     _health_checker: Option<HealthChecker>,
     /// Passive health checker (tracks 5xx responses).
@@ -230,6 +231,7 @@ impl ReverseProxy {
             headers_up,
             headers_down,
             retries: config.retries,
+            retry_buffer_limit: config.retry_buffer_limit,
             _health_checker: health_checker,
             passive_health,
             error_pages: config.error_pages.clone(),
@@ -354,11 +356,22 @@ impl ReverseProxy {
 
         // Collect the body bytes so we can replay on retries.
         let (parts, body) = request.into_parts();
-        let body_bytes = body
-            .collect()
-            .await
-            .map_err(|e| ProxyError::Internal(format!("failed to buffer body: {e}")))?
-            .to_bytes();
+        let body_bytes = match collect_body_bytes_limited(body, self.retry_buffer_limit).await? {
+            Some(bytes) => bytes,
+            None => {
+                warn!(
+                    limit = self.retry_buffer_limit,
+                    "request body exceeded retry buffer limit"
+                );
+                return Response::builder()
+                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(crate::full_body(format!(
+                        "Payload Too Large: retry buffer limit of {} bytes exceeded",
+                        self.retry_buffer_limit
+                    )))
+                    .map_err(|e| ProxyError::Internal(e.to_string()));
+            }
+        };
 
         let max_attempts = 1 + self.retries;
         let mut last_failed_addr: Option<String> = None;
@@ -876,11 +889,73 @@ async fn send_via_unix(
         .map_err(ProxyError::Hyper)
 }
 
+async fn collect_body_bytes_limited(
+    mut body: Body,
+    limit: usize,
+) -> Result<Option<Bytes>, ProxyError> {
+    let mut total = 0usize;
+    let mut chunks = Vec::new();
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|error| ProxyError::Internal(format!("failed to buffer body: {error}")))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let Some(next_total) = total.checked_add(data.len()) else {
+            return Ok(None);
+        };
+        if next_total > limit {
+            return Ok(None);
+        }
+        total = next_total;
+        chunks.push(data);
+    }
+
+    let mut bytes = BytesMut::with_capacity(total);
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(bytes.freeze()))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use http::header::{CONNECTION, PROXY_AUTHENTICATE, TE, TRANSFER_ENCODING, UPGRADE};
 
     use super::*;
+    use crate::config::{DEFAULT_RETRY_BUFFER_LIMIT, LbPolicy, UpstreamConfig};
+
+    fn test_proxy_config() -> ProxyConfig {
+        ProxyConfig {
+            upstreams: vec![UpstreamConfig {
+                addr: "127.0.0.1:9".to_string(),
+                weight: 1,
+                activity_key: None,
+            }],
+            lb: LbPolicy::RoundRobin,
+            lb_header: None,
+            lb_cookie: None,
+            health_check: None,
+            passive_health: None,
+            headers_up: HashMap::new(),
+            headers_down: HashMap::new(),
+            retries: 1,
+            retry_buffer_limit: DEFAULT_RETRY_BUFFER_LIMIT,
+            dynamic_upstreams: None,
+            error_pages: HashMap::new(),
+            headers_up_replace: Vec::new(),
+            tls_skip_verify: false,
+            upstream_http2: false,
+            max_connections: None,
+            keepalive_timeout: None,
+            sanitize_uri: true,
+            srv_upstream: None,
+        }
+    }
 
     #[test]
     fn strip_hop_by_hop_headers_removes_standard_and_connection_named_headers() {
@@ -953,5 +1028,29 @@ mod tests {
             uri.path_and_query().unwrap().as_str(),
             "/admin/users?debug=true"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_buffer_limit_rejects_oversized_request_body() {
+        let mut config = test_proxy_config();
+        config.retry_buffer_limit = 3;
+        let proxy = ReverseProxy::new(
+            &config,
+            Arc::new(BackendActivityTracker::default()),
+            Arc::new(Metrics::new()),
+            "site".to_string(),
+            "route".to_string(),
+        );
+        let request = Request::builder()
+            .uri("/")
+            .body(crate::full_body("four"))
+            .unwrap();
+
+        let response = proxy
+            .proxy(request, "127.0.0.1:12345".parse().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

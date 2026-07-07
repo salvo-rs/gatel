@@ -253,17 +253,20 @@ proxy {
     upstream "10.0.1.1:8080"
     upstream "10.0.1.2:8080"
     retries 2
+    retry-buffer-limit 1048576
 }
 ```
 
 | Directive | Default | Description |
 |---|---|---|
 | `retries` | `0` | Number of retry attempts after the initial request fails |
+| `retry-buffer-limit` | `1048576` | Maximum request body bytes buffered for retry replay when `retries` is greater than `0` |
 
 **Retry behavior:**
 
 - When `retries` is `0`, the request body streams to the upstream without being buffered by the reverse proxy.
-- When `retries` is greater than `0`, the request body is buffered in memory so it can be replayed on retries.
+- When `retries` is greater than `0`, the request body is buffered in memory up to `retry-buffer-limit` so it can be replayed on retries.
+- Requests whose bodies exceed `retry-buffer-limit` return `413 Payload Too Large` before an upstream connection is attempted.
 - A request is retried when: (a) the upstream connection fails, or (b) the upstream returns a 5xx status code.
 - On retry, the load balancer is called again to select a (potentially different) backend. If there are multiple backends, Gatel tries to avoid the backend that just failed.
 - Total attempts = 1 (initial) + retries.

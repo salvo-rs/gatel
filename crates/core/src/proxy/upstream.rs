@@ -369,6 +369,7 @@ mod tests {
             headers_up: HashMap::new(),
             headers_down: HashMap::new(),
             retries: 0,
+            retry_buffer_limit: crate::config::DEFAULT_RETRY_BUFFER_LIMIT,
             dynamic_upstreams: None,
             error_pages: HashMap::new(),
             headers_up_replace: Vec::new(),

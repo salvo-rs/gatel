@@ -310,15 +310,18 @@ proxy {
     upstream "10.0.1.2:3000"
     upstream "10.0.1.3:3000"
     retries 2
+    retry-buffer-limit 1048576
 }
 ```
 
 **说明**：
 
 - `retries 2` 表示最多重试 2 次（加上首次请求，总共最多 3 次尝试）。
+- `retry-buffer-limit 1048576` 表示启用重试时，最多为重放请求体缓存 1 MiB。
 - 重试时会选择不同的后端（避免重试同一个失败的后端）。
 - `retries` 为 `0` 时，请求体会直接流式转发到上游，不会被反向代理完整缓存。
-- `retries` 大于 `0` 时，请求体会被缓存在内存中，以便重试时重新发送。
+- `retries` 大于 `0` 时，请求体会在 `retry-buffer-limit` 上限内缓存在内存中，以便重试时重新发送。
+- 请求体超过 `retry-buffer-limit` 时，会在连接上游前返回 `413 Payload Too Large`。
 - 连接失败、超时或上游返回 5xx 状态码时会触发重试。
 
 HTTPS 上游默认使用内置 WebPKI 信任根校验证书。只有在隔离的开发环境或明确可信的私有网络中才应使用 `tls-skip-verify true`，因为它会关闭上游证书校验。

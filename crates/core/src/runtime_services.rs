@@ -1480,6 +1480,7 @@ fn proxy_route_config(
             headers_up: BTreeMap::new().into_iter().collect(),
             headers_down: BTreeMap::new().into_iter().collect(),
             retries: 0,
+            retry_buffer_limit: crate::config::DEFAULT_RETRY_BUFFER_LIMIT,
             dynamic_upstreams: None,
             error_pages: BTreeMap::new().into_iter().collect(),
             headers_up_replace: Vec::new(),
