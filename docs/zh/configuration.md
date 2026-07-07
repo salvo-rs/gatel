@@ -595,6 +595,7 @@ proxy {
     upstream "127.0.0.1:3002" weight=1
     lb "round_robin"
     retries 2
+    retry-buffer-limit 1048576
     health-check path="/health" interval="10s" timeout="3s" threshold=3
     passive-health fail-duration="30s" max-fails=5 unhealthy-status="502,503,504"
     header-up "X-Real-IP" "{remote_ip}"

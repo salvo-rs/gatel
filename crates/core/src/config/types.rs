@@ -519,6 +519,8 @@ pub struct FastCgiConfig {
 }
 
 /// Reverse proxy handler config.
+pub const DEFAULT_RETRY_BUFFER_LIMIT: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProxyConfig {
     pub upstreams: Vec<UpstreamConfig>,
@@ -533,6 +535,8 @@ pub struct ProxyConfig {
     pub headers_down: HashMap<String, String>,
     /// Number of retry attempts on upstream failure (0 = no retries).
     pub retries: u32,
+    /// Maximum request body bytes buffered for retry replay.
+    pub retry_buffer_limit: usize,
     /// Optional DNS-based dynamic upstream resolution.
     pub dynamic_upstreams: Option<DnsUpstreamConfig>,
     /// Custom response bodies to substitute when upstream returns these status

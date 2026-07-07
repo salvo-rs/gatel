@@ -1273,6 +1273,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
             headers_up: HashMap::new(),
             headers_down: HashMap::new(),
             retries: 0,
+            retry_buffer_limit: DEFAULT_RETRY_BUFFER_LIMIT,
             dynamic_upstreams: None,
             error_pages: HashMap::new(),
             headers_up_replace: Vec::new(),
@@ -1294,6 +1295,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
     let mut headers_up = HashMap::new();
     let mut headers_down = HashMap::new();
     let mut retries = 0u32;
+    let mut retry_buffer_limit = DEFAULT_RETRY_BUFFER_LIMIT;
     let mut dynamic_upstreams = None;
     let mut error_pages: HashMap<u16, String> = HashMap::new();
     let mut headers_up_replace: Vec<(String, String, String)> = Vec::new();
@@ -1420,6 +1422,24 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(0);
             }
+            "retry-buffer-limit" => {
+                let value = child
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().is_none())
+                    .and_then(|e| e.value().as_integer())
+                    .ok_or_else(|| ConfigError::InvalidValue {
+                        field: "retry-buffer-limit".into(),
+                        detail: "expected positive integer byte size".into(),
+                    })?;
+                if value <= 0 || value > usize::MAX as i128 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "retry-buffer-limit".into(),
+                        detail: format!("expected positive integer byte size, got {value}"),
+                    });
+                }
+                retry_buffer_limit = value as usize;
+            }
             "header-up" => {
                 let entries: Vec<String> = string_args(child);
                 if entries.len() >= 2 {
@@ -1539,6 +1559,7 @@ fn parse_proxy(node: &KdlNode) -> Result<ProxyConfig, ConfigError> {
         headers_up,
         headers_down,
         retries,
+        retry_buffer_limit,
         dynamic_upstreams,
         error_pages,
         headers_up_replace,
@@ -2373,6 +2394,46 @@ site "api.example.com" {
         // Second site with manual TLS
         let site1 = &config.sites[1];
         assert!(site1.tls.is_some());
+    }
+
+    #[test]
+    fn test_parse_retry_buffer_limit() {
+        let input = r#"
+site "app.example.com" {
+    route "/*" {
+        proxy {
+            upstream "localhost:3000"
+            retries 2
+            retry-buffer-limit 4096
+        }
+    }
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.sites[0].routes[0].handler {
+            HandlerConfig::Proxy(proxy) => {
+                assert_eq!(proxy.retries, 2);
+                assert_eq!(proxy.retry_buffer_limit, 4096);
+            }
+            _ => panic!("expected proxy handler"),
+        }
+    }
+
+    #[test]
+    fn test_parse_retry_buffer_limit_rejects_non_positive_values() {
+        let input = r#"
+site "app.example.com" {
+    route "/*" {
+        proxy {
+            upstream "localhost:3000"
+            retries 2
+            retry-buffer-limit 0
+        }
+    }
+}
+"#;
+
+        assert!(parse_config(input).is_err());
     }
 
     #[test]
