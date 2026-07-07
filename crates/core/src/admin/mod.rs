@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
@@ -18,7 +19,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::config::{GlobalConfig, parse_config};
-use crate::hoops::metrics::Metrics;
+use crate::hoops::metrics::{Metrics, prometheus_label_value};
 use crate::runtime_services::{
     RuntimeListener, RuntimeListenerPatch, RuntimeRoute, RuntimeRoutePatch, RuntimeService,
     RuntimeServiceError, RuntimeServicePatch, RuntimeState, RuntimeTarget, RuntimeTargetPatch,
@@ -28,6 +29,7 @@ use crate::server::{AppState, RuntimeStateError};
 use crate::{Body, ProxyError, full_body};
 
 const MAX_ADMIN_JSON_BODY_SIZE: usize = 1024 * 1024;
+const MAX_ADMIN_CONFIG_BODY_SIZE: usize = 1024 * 1024;
 
 #[derive(serde::Serialize)]
 struct RuntimeTargetView {
@@ -269,9 +271,9 @@ fn handle_get_config(state: &AppState) -> Response<Body> {
             .header("Content-Type", "application/json")
             .body(full_body(json))
             .unwrap(),
-        Err(e) => json_response(
+        Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            format!("serialization failed: {e}"),
         ),
     }
 }
@@ -292,9 +294,9 @@ async fn handle_config_reload(state: &AppState) -> Response<Body> {
                 Ok(()) => json_response(StatusCode::OK, r#"{"status":"reloaded"}"#),
                 Err(error) => json_runtime_state_error(error),
             },
-            Err(e) => json_response(
+            Err(e) => json_error(
                 StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error":"config reload failed: {e}"}}"#),
+                format!("config reload failed: {e}"),
             ),
         }
     } else {
@@ -823,27 +825,12 @@ fn handle_metrics(state: &AppState, metrics: &Metrics) -> Response<Body> {
 
 /// `POST /config` — apply a new KDL configuration from the request body.
 async fn handle_post_config(req: Request<Incoming>, state: &AppState) -> Response<Body> {
-    let body_bytes = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error":"failed to read body: {e}"}}"#),
-            );
-        }
-    };
-
-    let config_str = match std::str::from_utf8(&body_bytes) {
+    let config_str = match text_body(req, MAX_ADMIN_CONFIG_BODY_SIZE).await {
         Ok(s) => s,
-        Err(e) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error":"invalid UTF-8: {e}"}}"#),
-            );
-        }
+        Err(response) => return response,
     };
 
-    match parse_config(config_str) {
+    match parse_config(&config_str) {
         Ok(new_config) => {
             let sites = new_config.sites.len();
             let routes: usize = new_config.sites.iter().map(|s| s.routes.len()).sum();
@@ -858,36 +845,18 @@ async fn handle_post_config(req: Request<Incoming>, state: &AppState) -> Respons
                 Err(error) => json_runtime_state_error(error),
             }
         }
-        Err(e) => json_response(
-            StatusCode::BAD_REQUEST,
-            &format!(r#"{{"error":"config parse failed: {e}"}}"#),
-        ),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("config parse failed: {e}")),
     }
 }
 
 /// `POST /config/test` — validate a KDL configuration without applying it.
 async fn handle_test_config(req: Request<Incoming>) -> Response<Body> {
-    let body_bytes = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error":"failed to read body: {e}"}}"#),
-            );
-        }
-    };
-
-    let config_str = match std::str::from_utf8(&body_bytes) {
+    let config_str = match text_body(req, MAX_ADMIN_CONFIG_BODY_SIZE).await {
         Ok(s) => s,
-        Err(e) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error":"invalid UTF-8: {e}"}}"#),
-            );
-        }
+        Err(response) => return response,
     };
 
-    match parse_config(config_str) {
+    match parse_config(&config_str) {
         Ok(config) => {
             let sites = config.sites.len();
             let routes: usize = config.sites.iter().map(|s| s.routes.len()).sum();
@@ -896,7 +865,7 @@ async fn handle_test_config(req: Request<Incoming>) -> Response<Body> {
                 &format!(r#"{{"status":"valid","sites":{sites},"routes":{routes}}}"#),
             )
         }
-        Err(e) => json_response(StatusCode::BAD_REQUEST, &format!(r#"{{"error":"{e}"}}"#)),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, e.to_string()),
     }
 }
 
@@ -920,6 +889,13 @@ fn json_response(status: StatusCode, body: &str) -> Response<Body> {
         .unwrap()
 }
 
+fn json_error(status: StatusCode, message: impl AsRef<str>) -> Response<Body> {
+    json_response(
+        status,
+        &serde_json::json!({ "error": message.as_ref() }).to_string(),
+    )
+}
+
 fn json_pretty_response<T>(status: StatusCode, value: &T) -> Response<Body>
 where
     T: serde::Serialize,
@@ -930,9 +906,9 @@ where
             .header("Content-Type", "application/json")
             .body(full_body(json))
             .unwrap(),
-        Err(e) => json_response(
+        Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            format!("serialization failed: {e}"),
         ),
     }
 }
@@ -972,10 +948,7 @@ fn target_view_from_ref(
 }
 
 fn json_runtime_service_error(error: RuntimeServiceError) -> Response<Body> {
-    json_response(
-        status_for_runtime_error(&error),
-        &format!(r#"{{"error":"{error}"}}"#),
-    )
+    json_error(status_for_runtime_error(&error), error.to_string())
 }
 
 fn json_runtime_state_error(error: RuntimeStateError) -> Response<Body> {
@@ -983,10 +956,9 @@ fn json_runtime_state_error(error: RuntimeStateError) -> Response<Body> {
         RuntimeStateError::Validation(error) => json_runtime_service_error(error),
         RuntimeStateError::Persist(message)
         | RuntimeStateError::Restore(message)
-        | RuntimeStateError::Apply(message) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!(r#"{{"error":"{message}"}}"#),
-        ),
+        | RuntimeStateError::Apply(message) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
     }
 }
 
@@ -1007,31 +979,39 @@ async fn json_body<T>(req: Request<Incoming>) -> Result<T, Response<Body>>
 where
     T: serde::de::DeserializeOwned,
 {
-    let body_bytes = match Limited::new(req.into_body(), MAX_ADMIN_JSON_BODY_SIZE)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(error) => {
-            if error.downcast_ref::<LengthLimitError>().is_some() {
-                return Err(json_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    r#"{"error":"request body too large"}"#,
-                ));
-            }
-            return Err(json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error":"failed to read body: {error}"}}"#),
-            ));
-        }
-    };
+    let body_bytes = limited_body(req, MAX_ADMIN_JSON_BODY_SIZE).await?;
 
     serde_json::from_slice(&body_bytes).map_err(|error| {
-        json_response(
+        json_error(
             StatusCode::BAD_REQUEST,
-            &format!(r#"{{"error":"invalid JSON payload: {error}"}}"#),
+            format!("invalid JSON payload: {error}"),
         )
     })
+}
+
+async fn text_body(req: Request<Incoming>, limit: usize) -> Result<String, Response<Body>> {
+    let body_bytes = limited_body(req, limit).await?;
+    std::str::from_utf8(&body_bytes)
+        .map(|body| body.to_string())
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, format!("invalid UTF-8: {error}")))
+}
+
+async fn limited_body(req: Request<Incoming>, limit: usize) -> Result<Bytes, Response<Body>> {
+    match Limited::new(req.into_body(), limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(error) => {
+            if error.downcast_ref::<LengthLimitError>().is_some() {
+                return Err(json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body too large",
+                ));
+            }
+            Err(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("failed to read body: {error}"),
+            ))
+        }
+    }
 }
 
 fn expected_revision(req: &Request<Incoming>) -> Option<u64> {
@@ -1190,6 +1170,9 @@ fn render_runtime_target_metrics(
     );
     output.push_str("# TYPE gatel_runtime_targets gauge\n");
     for ((service, route, group, state), count) in counts {
+        let service = prometheus_label_value(&service);
+        let route = prometheus_label_value(&route);
+        let group = prometheus_label_value(&group);
         output.push_str(&format!(
             "gatel_runtime_targets{{service=\"{service}\",route=\"{route}\",group=\"{group}\",state=\"{state}\"}} {count}\n"
         ));
@@ -1199,6 +1182,10 @@ fn render_runtime_target_metrics(
     );
     output.push_str("# TYPE gatel_runtime_target_activity gauge\n");
     for (service, route, group, target, state, activity) in activity_rows {
+        let service = prometheus_label_value(&service);
+        let route = prometheus_label_value(&route);
+        let group = prometheus_label_value(&group);
+        let target = prometheus_label_value(&target);
         output.push_str(&format!(
             "gatel_runtime_target_activity{{service=\"{service}\",route=\"{route}\",group=\"{group}\",target=\"{target}\",state=\"{state}\"}} {activity}\n"
         ));
@@ -1526,6 +1513,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_error_escapes_dynamic_messages() {
+        let response = json_error(StatusCode::BAD_REQUEST, "bad \"quote\"\nnext line");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["error"], "bad \"quote\"\nnext line");
+    }
+
+    #[tokio::test]
+    async fn config_test_rejects_oversized_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let state = AppState::new(AppConfig::default(), None);
+        let metrics = Arc::clone(&state.metrics);
+        let server = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { start_admin_server(addr, state, metrics).await.unwrap() }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let base_url = format!("http://{addr}");
+
+        for _ in 0..40 {
+            if let Ok(response) = client.get(format!("{base_url}/health")).send().await
+                && response.status().is_success()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let response = client
+            .post(format!("{base_url}/config/test"))
+            .body("x".repeat(MAX_ADMIN_CONFIG_BODY_SIZE + 1))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(payload["error"], "request body too large");
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn runtime_service_and_target_crud_via_admin_api() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1652,11 +1691,11 @@ mod tests {
         runtime
             .upsert_service(
                 RuntimeService {
-                    id: "api".to_string(),
+                    id: "api\"svc".to_string(),
                     revision: 0,
                     listeners: Vec::new(),
                     routes: vec![RuntimeRoute {
-                        id: "api".to_string(),
+                        id: "api\nroute".to_string(),
                         hosts: vec!["example.com".to_string()],
                         path_prefix: "/api".to_string(),
                         matchers: Vec::new(),
@@ -1667,10 +1706,10 @@ mod tests {
                         response: None,
                         timeout_seconds: None,
                         target_groups: vec![RuntimeTargetGroup {
-                            id: "primary".to_string(),
+                            id: "primary\\group".to_string(),
                             weight: 100,
                             targets: vec![RuntimeTarget {
-                                id: "app-1".to_string(),
+                                id: "app-1\"blue".to_string(),
                                 addr: "127.0.0.1:3000".to_string(),
                                 weight: 100,
                                 state: RuntimeTargetState::Draining,
@@ -1688,13 +1727,19 @@ mod tests {
 
         let activity = crate::proxy::activity::BackendActivityTracker::default();
         let _guard = activity.acquire(runtime_target_activity_key(
-            "api", "api", "primary", "app-1",
+            "api\"svc",
+            "api\nroute",
+            "primary\\group",
+            "app-1\"blue",
         ));
 
         let metrics = render_runtime_target_metrics(&runtime, &activity);
         assert!(metrics.contains("gatel_runtime_targets"));
         assert!(metrics.contains("gatel_runtime_target_activity"));
-        assert!(metrics.contains("target=\"app-1\""));
+        assert!(metrics.contains(r#"service="api\"svc""#));
+        assert!(metrics.contains(r#"route="api\nroute""#));
+        assert!(metrics.contains(r#"group="primary\\group""#));
+        assert!(metrics.contains(r#"target="app-1\"blue""#));
         assert!(metrics.contains("state=\"draining\""));
         assert!(metrics.contains("} 1"));
     }
