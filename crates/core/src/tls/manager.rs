@@ -18,6 +18,8 @@ use certon::{
     Storage,
 };
 use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use tokio::task::JoinHandle;
@@ -543,8 +545,7 @@ fn build_client_verifier(
             ProxyError::Internal(format!("failed to read CA cert file {ca_path}: {e}"))
         })?;
 
-        let mut reader = std::io::BufReader::new(pem_data.as_slice());
-        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        let certs: Vec<_> = CertificateDer::pem_reader_iter(pem_data.as_slice())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 ProxyError::Internal(format!(

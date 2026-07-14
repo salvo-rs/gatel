@@ -87,6 +87,7 @@ async fn handle_h3_connection(
     let h3_conn = h3_quinn::Connection::new(quinn_conn);
     let mut server_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
         h3::server::Connection::new(h3_conn).await?;
+    let conn_ctrl = salvo::ConnCtrl::new();
 
     loop {
         let resolver: Option<RequestResolver<h3_quinn::Connection, Bytes>> =
@@ -105,8 +106,9 @@ async fn handle_h3_connection(
         };
 
         let state = Arc::clone(&state);
+        let conn_ctrl = conn_ctrl.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_h3_request(resolver, client_addr, state).await {
+            if let Err(e) = handle_h3_request(resolver, client_addr, state, conn_ctrl).await {
                 debug!(client = %client_addr, "H3 request error: {e}");
             }
         });
@@ -121,6 +123,7 @@ async fn handle_h3_request(
     resolver: RequestResolver<h3_quinn::Connection, Bytes>,
     client_addr: SocketAddr,
     state: Arc<AppState>,
+    conn_ctrl: salvo::ConnCtrl,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Resolve the request headers and obtain the bidirectional stream.
     let (req, mut stream) = resolver.resolve_request().await?;
@@ -142,7 +145,7 @@ async fn handle_h3_request(
     let body_data = Bytes::from(body_bytes);
 
     // Route through the Salvo service by building a Salvo-compatible request.
-    let response = route_h3_via_salvo(req, body_data, client_addr, &state).await;
+    let response = route_h3_via_salvo(req, body_data, client_addr, &state, conn_ctrl).await;
 
     // Send the response status + headers.
     let (resp_parts, resp_body) = response.into_parts();
@@ -175,6 +178,7 @@ async fn route_h3_via_salvo(
     body_data: Bytes,
     client_addr: SocketAddr,
     state: &AppState,
+    conn_ctrl: salvo::ConnCtrl,
 ) -> Response<Body> {
     use salvo::http::ReqBody;
 
@@ -195,6 +199,7 @@ async fn route_h3_via_salvo(
         client_addr.into(),
         salvo::http::uri::Scheme::HTTPS,
         None,
+        conn_ctrl,
         alt_svc_h3,
     );
 
