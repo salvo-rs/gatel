@@ -46,10 +46,12 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(io);
+    let conn_ctrl = salvo::ConnCtrl::new();
 
     let service = service_fn(move |req: Request<Incoming>| {
         let state = Arc::clone(&state);
-        async move { handle_request(req, local_addr, client_addr, &state, is_tls).await }
+        let conn_ctrl = conn_ctrl.clone();
+        async move { handle_request(req, local_addr, client_addr, &state, is_tls, conn_ctrl).await }
     });
 
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -70,6 +72,7 @@ async fn handle_request(
     client_addr: SocketAddr,
     state: &AppState,
     is_tls: bool,
+    conn_ctrl: salvo::ConnCtrl,
 ) -> Result<hyper::Response<salvo::http::ResBody>, hyper::Error> {
     let service = state.service.load();
     let scheme = if is_tls {
@@ -95,6 +98,7 @@ async fn handle_request(
         client_addr.into(),
         scheme,
         None,
+        conn_ctrl,
         alt_svc_h3,
     );
     handler.call(req).await

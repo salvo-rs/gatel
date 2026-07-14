@@ -19,6 +19,7 @@ use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256, SanType,
 };
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -334,8 +335,7 @@ impl KeyPairExt for KeyPair {
 }
 
 fn pem_to_der(pem: &str) -> Result<CertificateDer<'static>, String> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let mut iter = rustls_pemfile::certs(&mut reader);
+    let mut iter = CertificateDer::pem_reader_iter(pem.as_bytes());
     match iter.next() {
         Some(Ok(der)) => Ok(der),
         Some(Err(e)) => Err(format!("PEM parse error: {e}")),

@@ -5,7 +5,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.2"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.94"
 license = "Apache-2.0"
 description = "A high-performance, KDL-configured reverse proxy and web server"
 repository = "https://github.com/salvo-rs/gatel"
@@ -73,7 +73,6 @@ async-compression = { version = "0.4", features = [
 pin-project-lite = "0.2"
 futures-util = "0.3"
 async-trait = "0.1"
-rustls-pemfile = "2"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "json",
@@ -102,7 +101,7 @@ opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.33"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
-salvo = { version = "0.93", default-features = false, features = [
+salvo = { version = "0.94", default-features = false, features = [
     "fix-http1-request-uri",
     "logging",
     "serve-static",

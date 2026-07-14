@@ -48,7 +48,6 @@ rand = { workspace = true }
 async-trait = { workspace = true }
 async-compression = { workspace = true }
 dashmap = { workspace = true }
-rustls-pemfile = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
 h3 = { workspace = true, optional = true }
