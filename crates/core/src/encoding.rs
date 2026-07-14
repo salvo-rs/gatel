@@ -48,10 +48,9 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
         if seen_padding {
             return None;
         }
-        let value = match BASE64_TABLE.iter().position(|&candidate| candidate == byte) {
-            Some(value) => value as u32,
-            None => return None,
-        };
+        let value = BASE64_TABLE
+            .iter()
+            .position(|&candidate| candidate == byte)? as u32;
         data_len += 1;
         buffer = (buffer << 6) | value;
         bits += 6;
