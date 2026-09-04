@@ -28,6 +28,6 @@ pub use diagnostic::{Code, Diagnostic, Diagnostics, Severity, did_you_mean};
 pub use hash::{Fingerprint, Fingerprinted, Hasher};
 pub use id::{BootId, Generation, ResourceId, ResourceKind, SourceId, SourceKind, SourceRev};
 pub use origin::{Origin, Span};
-pub use secret::{SecretRef, SecretString};
+pub use secret::{SecretRef, SecretString, resolve_secret};
 pub use snapshot::{RevVector, Snapshot, SourceSnapshot};
 pub use value::{Node, Property, Scalar, Value};

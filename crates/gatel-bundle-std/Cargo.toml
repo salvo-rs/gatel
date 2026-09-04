@@ -13,6 +13,7 @@ gatel-macros.workspace = true
 gatel-plan.workspace = true
 
 async-compression.workspace = true
+bcrypt.workspace = true
 bytes.workspace = true
 http.workspace = true
 futures-util.workspace = true

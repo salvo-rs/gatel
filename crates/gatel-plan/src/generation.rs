@@ -346,10 +346,7 @@ mod tests {
             hasher.update_str(&self.0);
         }
 
-        fn build(
-            &self,
-            _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
-        ) -> Result<Arc<dyn Handler>, String> {
+        fn build(&self, _cx: crate::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
             Err("not built in tests".into())
         }
 

@@ -1,6 +1,5 @@
 //! `request-id`: give every request a name that appears in its log line.
 
-use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,7 +33,7 @@ impl DirectiveConfig for Config {
         hasher.update_bool(self.trust_client);
     }
 
-    fn build(&self, _state: Option<Arc<dyn Any + Send + Sync>>) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         let name = http::HeaderName::try_from(self.header.as_str())
             .map_err(|_| format!("`{}` is not a valid header name", self.header))?;
         Ok(Arc::new(RequestIdHandler {
@@ -153,6 +152,13 @@ mod tests {
 
     use super::*;
 
+    /// A context with nothing in it, for a directive that needs nothing.
+    fn empty_context() -> gatel_plan::BuildContext<'static> {
+        gatel_plan::BuildContext {
+            root: std::path::Path::new("."),
+            state: None,
+        }
+    }
     fn origin() -> Origin {
         Origin::synthetic("test")
     }
@@ -190,7 +196,7 @@ mod tests {
         let raw =
             Node::new("request-id", origin()).with_prop("header", Value::string("not a header", origin()));
         let (config, _) = decode(raw);
-        assert!(config.unwrap().build(None).is_err());
+        assert!(config.unwrap().build(empty_context()).is_err());
     }
 
     #[test]
@@ -212,7 +218,7 @@ mod tests {
     #[test]
     fn generated_ids_are_distinct() {
         let (config, _) = decode(Node::new("request-id", origin()));
-        let handler = config.unwrap().build(None).unwrap();
+        let handler = config.unwrap().build(empty_context()).unwrap();
         let _ = handler;
         let first = prefix();
         assert_eq!(first.len(), 8);

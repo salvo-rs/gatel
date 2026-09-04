@@ -1,0 +1,32 @@
+// Authentication, rewriting and the order they run in.
+global { http ":8080" }
+
+site "*" {
+    access-log
+    request-id
+
+    route "/api/*" {
+        // Written last, runs first: its phase decides, not its position.
+        proxy "127.0.0.1:9000"
+
+        // Strip the prefix the gateway routes on, so the backend sees the
+        // path it expects. Runs after the guards below, never before — a
+        // rewrite must not carry a request past a filter written against the
+        // original path.
+        rewrite strip-prefix="/api"
+
+        // The password is never here. Only a reference to a bcrypt hash,
+        // because a configuration file ends up in version control, in an
+        // image, and in a backup.
+        basic-auth realm="api" {
+            user "service" hash="env:SERVICE_HASH"
+            user "ops" hash="file:secrets/ops.hash"
+        }
+
+        rate-limit max=1000 window="1m" key="header:x-api-key"
+    }
+
+    route "/*" {
+        respond "public\n"
+    }
+}

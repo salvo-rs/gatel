@@ -22,10 +22,7 @@ impl DirectiveConfig for StubConfig {
         hasher.update_str(&self.0);
     }
 
-    fn build(
-        &self,
-        _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    ) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         Err("not built in compiler tests".into())
     }
 

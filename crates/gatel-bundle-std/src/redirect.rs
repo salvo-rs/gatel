@@ -32,10 +32,7 @@ impl DirectiveConfig for Config {
         hasher.update_u64(self.status.as_u16() as u64);
     }
 
-    fn build(
-        &self,
-        _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    ) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         let location = http::HeaderValue::from_str(&self.to)
             .map_err(|_| format!("`{}` cannot be sent as a Location header", self.to))?;
         Ok(Arc::new(RedirectHandler {
@@ -131,6 +128,13 @@ mod tests {
 
     use super::*;
 
+    /// A context with nothing in it, for a directive that needs nothing.
+    fn empty_context() -> gatel_plan::BuildContext<'static> {
+        gatel_plan::BuildContext {
+            root: std::path::Path::new("."),
+            state: None,
+        }
+    }
     fn origin() -> Origin {
         Origin::synthetic("test")
     }
@@ -184,7 +188,7 @@ mod tests {
     #[test]
     fn a_target_that_cannot_be_a_header_fails_at_build_not_at_request_time() {
         let (config, _) = decode(node("https://example.com/\u{7f}bad"));
-        let error = match config.unwrap().build(None) {
+        let error = match config.unwrap().build(empty_context()) {
             Ok(_) => panic!("a header value that cannot be sent must fail at build time"),
             Err(error) => error,
         };

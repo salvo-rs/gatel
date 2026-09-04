@@ -232,6 +232,36 @@ impl std::fmt::Debug for DirectiveState {
     }
 }
 
+/// What a directive is given when its handler is built.
+///
+/// Everything here is decided before anything is published, so a secret that
+/// cannot be read or a path that does not exist stops a reload rather than
+/// failing a request later.
+pub struct BuildContext<'a> {
+    /// The directory `file:` references resolve against.
+    pub root: &'a std::path::Path,
+    /// Whatever [`DirectiveConfig::state`] asked for, resolved against what is
+    /// already running. `None` for a directive that asked for nothing.
+    pub state: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl BuildContext<'_> {
+    /// Read the material a reference names, with the usual bounds and
+    /// permission checks.
+    pub fn secret(&self, reference: &gatel_model::SecretRef) -> Result<gatel_model::SecretString, String> {
+        gatel_model::resolve_secret(reference, self.root)
+    }
+
+    /// Take the state as a concrete type, or say what went wrong.
+    pub fn state<T: Any + Send + Sync>(&self, what: &str) -> Result<Arc<T>, String> {
+        self.state
+            .clone()
+            .ok_or_else(|| format!("{what} was not provided"))?
+            .downcast::<T>()
+            .map_err(|_| format!("{what} is not of the expected type"))
+    }
+}
+
 /// A decoded directive configuration.
 ///
 /// `hash_into` must cover everything that changes behaviour and nothing that
@@ -243,9 +273,9 @@ pub trait DirectiveConfig: Any + Send + Sync + 'static {
     /// failure here rejects the candidate and leaves the running configuration
     /// untouched.
     ///
-    /// `state` is whatever [`DirectiveConfig::state`] asked for, resolved
-    /// against what is already running. A stateless directive ignores it.
-    fn build(&self, state: Option<Arc<dyn Any + Send + Sync>>) -> Result<Arc<dyn Handler>, String>;
+    /// Anything it needs from outside — a secret, a resolved path, its own
+    /// state — arrives in the context.
+    fn build(&self, cx: BuildContext<'_>) -> Result<Arc<dyn Handler>, String>;
 
     /// What this directive needs to keep between requests, if anything.
     fn state(&self) -> Option<DirectiveState> {
@@ -544,10 +574,7 @@ mod tests {
             hasher.update_str(&self.label);
         }
 
-        fn build(
-            &self,
-            _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
-        ) -> Result<Arc<dyn Handler>, String> {
+        fn build(&self, _cx: crate::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
             Err("not built in tests".to_string())
         }
 

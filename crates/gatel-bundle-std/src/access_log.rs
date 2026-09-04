@@ -60,10 +60,7 @@ impl DirectiveConfig for Config {
         hasher.update_bool(self.query);
     }
 
-    fn build(
-        &self,
-        _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    ) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         Ok(Arc::new(AccessLogHandler {
             json: self.json,
             query: self.query,

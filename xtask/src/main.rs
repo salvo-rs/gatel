@@ -51,6 +51,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "gatel-macros",
             "gatel-plan",
             "async-compression",
+            "bcrypt",
             "bytes",
             "futures-util",
             "http-body-util",

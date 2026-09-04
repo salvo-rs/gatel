@@ -5,7 +5,6 @@
 //! rather than attempted whenever it would not help — an already-encoded body,
 //! an image, a response too small to be worth a header.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_compression::tokio::bufread::{BrotliEncoder, DeflateEncoder, GzipEncoder, ZstdEncoder};
@@ -74,7 +73,7 @@ impl DirectiveConfig for Config {
         hasher.update_u64(self.min_size.bytes());
     }
 
-    fn build(&self, _state: Option<Arc<dyn Any + Send + Sync>>) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         Ok(Arc::new(EncodeHandler {
             encodings: self.encodings.clone(),
             min_size: self.min_size,

@@ -119,10 +119,8 @@ impl DirectiveConfig for Config {
         })
     }
 
-    fn build(&self, state: Option<Arc<dyn Any + Send + Sync>>) -> Result<Arc<dyn Handler>, String> {
-        let buckets = state
-            .and_then(|state| state.downcast::<Buckets>().ok())
-            .ok_or_else(|| "rate-limit was not given its buckets".to_string())?;
+    fn build(&self, cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
+        let buckets: Arc<Buckets> = cx.state("the rate limit's buckets")?;
         Ok(Arc::new(RateLimitHandler {
             buckets,
             max: self.max,
@@ -328,6 +326,13 @@ mod tests {
 
     use super::*;
 
+    /// A context with nothing in it, for a directive that needs nothing.
+    fn empty_context() -> gatel_plan::BuildContext<'static> {
+        gatel_plan::BuildContext {
+            root: std::path::Path::new("."),
+            state: None,
+        }
+    }
     fn origin() -> Origin {
         Origin::synthetic("test")
     }
@@ -483,7 +488,7 @@ mod tests {
     #[test]
     fn building_without_state_fails_rather_than_limiting_nothing() {
         let (config, _) = decode(node(10, "1m"));
-        let error = match config.unwrap().build(None) {
+        let error = match config.unwrap().build(empty_context()) {
             Ok(_) => panic!("a rate limiter with no buckets would let everything through"),
             Err(error) => error,
         };

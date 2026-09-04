@@ -88,6 +88,57 @@ impl fmt::Display for SecretRef {
     }
 }
 
+/// Read the material a reference names.
+///
+/// The same bounds as any other secret file: it must be inside the
+/// configuration directory, small, and not readable by anyone else on the
+/// machine.
+pub fn resolve_secret(reference: &SecretRef, root: &Path) -> Result<SecretString, String> {
+    match reference {
+        SecretRef::Env(name) => std::env::var(name)
+            .map(SecretString::new)
+            .map_err(|_| format!("the environment variable `{name}` is not set")),
+        SecretRef::File(_) => {
+            let path = reference.resolve_path(root)?;
+            let metadata =
+                std::fs::metadata(&path).map_err(|error| format!("cannot read `{reference}`: {error}"))?;
+            if !metadata.is_file() {
+                return Err(format!("`{reference}` is not a regular file"));
+            }
+            if metadata.len() > MAX_SECRET_BYTES {
+                return Err(format!("`{reference}` is larger than {MAX_SECRET_BYTES} bytes"));
+            }
+            check_permissions(reference, &metadata)?;
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read `{reference}`: {error}"))?;
+            // A trailing newline is what an editor adds, not part of the secret.
+            Ok(SecretString::new(contents.trim_end_matches(['\r', '\n'])))
+        }
+    }
+}
+
+/// A secret is a password, a token or a key. Anything much larger is a mistake.
+const MAX_SECRET_BYTES: u64 = 64 * 1024;
+
+#[cfg(unix)]
+fn check_permissions(reference: &SecretRef, metadata: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "`{reference}` is readable by group or others (mode {mode:o}); use 0600"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_permissions(_reference: &SecretRef, _metadata: &std::fs::Metadata) -> Result<(), String> {
+    // Windows ACLs do not map onto a mode, and guessing would either reject
+    // reasonable setups or give false assurance.
+    Ok(())
+}
+
 /// Resolved secret material. Redacted in every rendering path.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretString(String);
@@ -185,6 +236,37 @@ mod tests {
         assert_eq!(secret.to_string(), "<redacted>");
         assert_eq!(format!("{secret:?}"), "SecretString(<redacted>)");
         assert_eq!(secret.expose(), "hunter2");
+    }
+
+    #[test]
+    fn a_file_secret_is_read_without_its_trailing_newline() {
+        let directory = std::env::temp_dir().join(format!(
+            "gatel-secret-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("token"), "s3cret\n").unwrap();
+
+        let resolved = resolve_secret(&SecretRef::parse("token").unwrap(), &directory).unwrap();
+        assert_eq!(resolved.expose(), "s3cret");
+
+        let missing = resolve_secret(&SecretRef::parse("absent").unwrap(), &directory).unwrap_err();
+        assert!(missing.contains("absent"), "{missing}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unset_environment_variable_says_which_one() {
+        let error = resolve_secret(
+            &SecretRef::parse("env:GATEL_DEFINITELY_UNSET").unwrap(),
+            Path::new("."),
+        )
+        .unwrap_err();
+        assert!(error.contains("GATEL_DEFINITELY_UNSET"), "{error}");
     }
 
     #[test]

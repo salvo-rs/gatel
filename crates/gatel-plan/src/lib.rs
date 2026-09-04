@@ -24,8 +24,8 @@ pub mod spec;
 pub mod upstream;
 
 pub use directive::{
-    Bundle, Directive, DirectiveConfig, DirectiveInstance, DirectiveMeta, DirectiveState, FailurePolicy,
-    Phase, Registry, RegistryBuilder, Role, Scope, Scopes,
+    BuildContext, Bundle, Directive, DirectiveConfig, DirectiveInstance, DirectiveMeta, DirectiveState,
+    FailurePolicy, Phase, Registry, RegistryBuilder, Role, Scope, Scopes,
 };
 pub use generation::{Committed, Failure, GenerationStore, Outcome, Preparation, Status};
 pub use matcher::{HeaderLookup, HostMatch, MatchContext, Matcher, MethodMatch, PathMatch, parse_cidr};

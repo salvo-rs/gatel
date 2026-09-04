@@ -4,7 +4,6 @@
 //! header. A filter that believed a forwarding header from an untrusted peer
 //! would be a filter anyone could walk through.
 
-use std::any::Any;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -75,7 +74,7 @@ impl DirectiveConfig for Config {
         });
     }
 
-    fn build(&self, _state: Option<Arc<dyn Any + Send + Sync>>) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         Ok(Arc::new(IpFilterHandler {
             allow: self.allow.clone(),
             deny: self.deny.clone(),
@@ -208,6 +207,13 @@ mod tests {
 
     use super::*;
 
+    /// A context with nothing in it, for a directive that needs nothing.
+    fn empty_context() -> gatel_plan::BuildContext<'static> {
+        gatel_plan::BuildContext {
+            root: std::path::Path::new("."),
+            state: None,
+        }
+    }
     fn origin() -> Origin {
         Origin::synthetic("test")
     }
@@ -227,7 +233,7 @@ mod tests {
             node = node.with_prop("deny", Value::string(deny, origin()));
         }
         let config = decode(node).0.expect("valid filter");
-        let any = config.build(None).unwrap();
+        let any = config.build(empty_context()).unwrap();
         let _ = any;
         // Rebuild the handler directly so the decision function can be tested.
         let mut allow_networks = Vec::new();

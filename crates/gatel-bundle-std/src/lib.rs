@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access_log;
+pub mod basic_auth;
 pub mod encode;
 pub mod file_server;
 pub mod headers;
@@ -17,6 +18,7 @@ pub mod rate_limit;
 pub mod redirect;
 pub mod request_id;
 pub mod respond;
+pub mod rewrite;
 
 use gatel_plan::Bundle;
 
@@ -32,6 +34,8 @@ pub fn bundle() -> Bundle {
         .with(rate_limit::RateLimit)
         .with(file_server::FileServerDirective)
         .with(encode::Encode)
+        .with(rewrite::Rewrite)
+        .with(basic_auth::BasicAuth)
 }
 
 #[cfg(test)]
@@ -48,6 +52,7 @@ mod tests {
             names,
             [
                 "access-log",
+                "basic-auth",
                 "encode",
                 "file-server",
                 "headers",
@@ -55,7 +60,8 @@ mod tests {
                 "rate-limit",
                 "redirect",
                 "request-id",
-                "respond"
+                "respond",
+                "rewrite"
             ]
         );
     }

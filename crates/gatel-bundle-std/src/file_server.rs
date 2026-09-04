@@ -5,7 +5,6 @@
 //! links are followed, rather than on the request text — a check on the text
 //! alone is defeated by a link inside the root pointing outside it.
 
-use std::any::Any;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -52,7 +51,7 @@ impl DirectiveConfig for Config {
         hasher.update_bool(self.precompressed);
     }
 
-    fn build(&self, _state: Option<Arc<dyn Any + Send + Sync>>) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         // Resolve the root once, here, so every request compares against a
         // path that is already canonical.
         let root = std::fs::canonicalize(&self.root)
@@ -502,6 +501,13 @@ mod tests {
 
     use super::*;
 
+    /// A context with nothing in it, for a directive that needs nothing.
+    fn empty_context() -> gatel_plan::BuildContext<'static> {
+        gatel_plan::BuildContext {
+            root: std::path::Path::new("."),
+            state: None,
+        }
+    }
     fn origin() -> Origin {
         Origin::synthetic("test")
     }
@@ -676,7 +682,7 @@ mod tests {
             .with_prop("root", Value::string("/definitely/not/here", origin()));
         let (config, _) = decode(node);
         // A missing directory stops the reload rather than 404-ing every request.
-        assert!(config.unwrap().build(None).is_err());
+        assert!(config.unwrap().build(empty_context()).is_err());
     }
 
     #[test]

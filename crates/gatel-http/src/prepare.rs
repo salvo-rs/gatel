@@ -126,7 +126,11 @@ pub fn prepare(
                 let mut chain = Vec::with_capacity(route.chain.len() + 1);
                 for directive in &route.chain {
                     let state = resolve_state(directive, resources.state);
-                    chain.push(directive.config.build(state).map_err(|error| {
+                    let cx = gatel_plan::BuildContext {
+                        root: resources.root,
+                        state,
+                    };
+                    chain.push(directive.config.build(cx).map_err(|error| {
                         format!(
                             "`{}` in route `{}`: {error}",
                             directive.meta.name,
@@ -137,7 +141,7 @@ pub fn prepare(
                 chain.push(build_terminal(
                     &route.terminal,
                     &upstreams,
-                    resources.state,
+                    resources,
                     route.id.name(),
                 )?);
                 routes.push(PreparedRoute {
@@ -217,7 +221,7 @@ fn resolve_state(
 fn build_terminal(
     terminal: &Terminal,
     upstreams: &UpstreamRuntimes,
-    state: &StateRegistry,
+    resources: &Resources<'_>,
     route: &str,
 ) -> Result<Arc<dyn salvo_core::Handler>, String> {
     match terminal {
@@ -228,10 +232,14 @@ fn build_terminal(
             Ok(Arc::new(crate::proxy::ProxyTerminal::new(Arc::clone(runtime))))
         }
         Terminal::Directive(instance) => {
-            let resolved = resolve_state(instance, state);
+            let state = resolve_state(instance, resources.state);
+            let cx = gatel_plan::BuildContext {
+                root: resources.root,
+                state,
+            };
             instance
                 .config
-                .build(resolved)
+                .build(cx)
                 .map_err(|error| format!("`{}` in route `{route}`: {error}", instance.meta.name))
         }
     }
