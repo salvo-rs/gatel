@@ -8,7 +8,7 @@
 //!   preference: the previous generation of this project had a 3,142-line configuration parser, and that is
 //!   exactly how a codebase stops being reviewable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -132,13 +132,15 @@ fn main() -> ExitCode {
     let failures = match task.as_str() {
         "deps" => check_dependencies(&root),
         "loc" => check_file_sizes(&root),
+        "events" => check_events(&root),
         "check" => {
             let mut failures = check_dependencies(&root);
             failures.extend(check_file_sizes(&root));
+            failures.extend(check_events(&root));
             failures
         }
         other => {
-            eprintln!("xtask: unknown task `{other}`; try deps, loc or check");
+            eprintln!("xtask: unknown task `{other}`; try deps, loc, events or check");
             return ExitCode::from(2);
         }
     };
@@ -282,4 +284,96 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
     }
     found.sort();
     found
+}
+
+/// Every structured event the code emits must be written down, and everything
+/// written down must still be emitted.
+///
+/// An event name is an interface: something is alerting on it. Renaming one
+/// without noticing is the kind of change that is only discovered when the
+/// alert does not fire.
+fn check_events(root: &Path) -> Vec<String> {
+    let documented = match std::fs::read_to_string(root.join("docs/EVENTS.md")) {
+        Ok(text) => documented_events(&text),
+        Err(error) => return vec![format!("cannot read docs/EVENTS.md: {error}")],
+    };
+    let emitted = emitted_events(root);
+
+    let mut failures = Vec::new();
+    for (target, event) in &emitted {
+        if !documented.contains(&(target.clone(), event.clone())) {
+            failures.push(format!(
+                "event `{event}` on `{target}` is emitted but not in docs/EVENTS.md"
+            ));
+        }
+    }
+    for (target, event) in &documented {
+        if !emitted.contains(&(target.clone(), event.clone())) {
+            failures.push(format!(
+                "event `{event}` on `{target}` is in docs/EVENTS.md but never emitted"
+            ));
+        }
+    }
+    failures
+}
+
+/// The `## gatel::x` headings, and the first column of the table under each.
+fn documented_events(text: &str) -> BTreeSet<(String, String)> {
+    let mut events = BTreeSet::new();
+    let mut target = String::new();
+    for line in text.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            target = heading.trim().trim_matches('`').to_string();
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("| `") else {
+            continue;
+        };
+        if let Some(name) = rest.split('`').next()
+            && !target.is_empty()
+        {
+            events.insert((target.clone(), name.to_string()));
+        }
+    }
+    events
+}
+
+/// `target: "..."` followed within a few lines by `event = "..."`, which is the
+/// shape every one of them is written in.
+fn emitted_events(root: &Path) -> BTreeSet<(String, String)> {
+    let mut events = BTreeSet::new();
+    for path in rust_files(root) {
+        // The checker is not part of the running gateway, and its own examples
+        // of the shape it looks for are not events.
+        if path.starts_with(root.join("xtask")) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let mut target: Option<String> = None;
+        let mut at = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            if let Some(found) = quoted_after(line, "target:") {
+                target = Some(found);
+                at = index;
+            }
+            if let Some(name) = quoted_after(line, "event =")
+                && let Some(target) = &target
+                && index.saturating_sub(at) <= 8
+            {
+                events.insert((target.clone(), name));
+            }
+        }
+    }
+    events
+}
+
+/// The first double-quoted string after a marker on one line.
+fn quoted_after(line: &str, marker: &str) -> Option<String> {
+    let rest = line.split_once(marker)?.1;
+    let start = rest.find('"')? + 1;
+    let end = rest[start..].find('"')? + start;
+    Some(rest[start..end].to_string())
 }

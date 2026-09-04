@@ -90,7 +90,8 @@ error[unknown-property]: `balance "round-robin"` has no property `header`
 
 Not yet: ACME, caching, forward authentication, the admin API, tracing,
 HTTP/3, and the CGI family. What is done, what is missing and what proves each is in
-[docs/FEATURES.md](docs/FEATURES.md).
+[docs/FEATURES.md](docs/FEATURES.md), and every event it emits is in
+[docs/EVENTS.md](docs/EVENTS.md).
 
 ## Building
 

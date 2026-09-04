@@ -112,7 +112,7 @@ carries; it is the same list, generated rather than written down.
 | Readiness that distinguishes local conditions from shared ones | yes | done | `gatel-observe/src/health.rs`, `tests/observe.rs` |
 | Liveness that cannot fail on a downstream condition | yes | done | `gatel-observe/src/health.rs` |
 | Metrics and health as ordinary routes, subject to their own guards | yes | done | `tests/observe.rs` |
-| Structured events with stable names | yes | partial | events exist and are named; there is no snapshot test of the field set |
+| Structured events with stable names | yes | done | `docs/EVENTS.md`, checked against the code in both directions by `cargo run -p xtask` |
 | OpenTelemetry traces | no | not started | — |
 
 ## Engineering
@@ -126,6 +126,7 @@ carries; it is the same list, generated rather than written down.
 | Fuzzing of the KDL frontend and the matchers | yes | **not started** | — |
 | A soak test | yes | **not started** | — |
 | Interoperability suite against curl, browsers and other proxies | yes | partial | tests speak raw HTTP on the wire; there is no external-client suite |
+| Every event name written down and checked | yes | done | `docs/EVENTS.md`, `cargo run -p xtask` |
 | Release matrix and signed artefacts | yes | **not started** | — |
 | `gatel upgrade` | no | not started | — |
 
@@ -136,8 +137,8 @@ In order of what a deployment would miss first:
 1. **ACME.** The single largest gap. Everything else about TLS is in place; a
    certificate still has to be put there by hand.
 2. **Release engineering** — the matrix, signed artefacts, a soak test, fuzzing.
-3. **An events snapshot test**, so a field name cannot change without somebody
-   deciding to change it.
+3. **Interoperability against real clients** — the tests speak raw HTTP, which
+   is not the same as having been through a browser and a CDN.
 
 Everything marked 2.1 is deliberate: `cache`, `forward-auth`, `circuit-breaker`
 and the Admin API are each large enough to want their own release, and none of

@@ -415,7 +415,7 @@ impl ProxyTerminal {
         let Some(backend_upgrade) = extensions.remove::<hyper::upgrade::OnUpgrade>() else {
             tracing::warn!(
                 target: "gatel::upstream",
-                event = "upgrade_unavailable",
+                event = "upstream_upgrade_unavailable",
                 upstream = self.upstream.spec.id.name(),
                 endpoint,
             );
@@ -424,7 +424,7 @@ impl ProxyTerminal {
         let Some(client_upgrade) = client_upgrade else {
             tracing::warn!(
                 target: "gatel::connection",
-                event = "upgrade_unavailable",
+                event = "client_upgrade_unavailable",
                 detail = "the client connection cannot be upgraded",
             );
             return;

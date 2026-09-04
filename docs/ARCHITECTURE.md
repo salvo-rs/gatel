@@ -263,5 +263,8 @@ directive.
   and `SecretString` is redacted in every rendering path.
 - **No forwarding header believed by default.** `trusted-proxy` decides, and the
   canonical client address is computed once, where that policy lives.
+- **No undocumented event.** Every structured event is in `docs/EVENTS.md`, and
+  `cargo run -p xtask` fails if the code and the list disagree in either
+  direction. An event name is an interface: something is alerting on it.
 - **No silent fallback.** An unknown node, property or reference is an error
   with a position and, where possible, a suggestion.
