@@ -80,7 +80,7 @@ error[unknown-property]: `balance "round-robin"` has no property `header`
 |---|---|
 | Serving | HTTP/1.1 and HTTP/2, keep-alive, graceful drain, WebSocket and other upgrades |
 | Routing | host (exact, wildcard, catch-all), path (exact, prefix), method, header/query/cookie/client-ip matchers |
-| Reverse proxy | 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, active and passive health, safe retry |
+| Reverse proxy | TLS to backends with a private authority and client identity, 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, active and passive health, safe retry |
 | TLS | manual PEM certificates, SNI, mutual TLS, automatic certificates over ACME (HTTP-01), and a development authority that issues for local names without being asked — `gatel trust` once, then `https://localhost` works |
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
 | Directives | `respond`, `redirect`, `file-server`, `rewrite`, `trailing-slash`, `force-https`, `headers`, `encode`, `cors`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `timeout`, `body-limit`, `error-pages`, `metrics`, `health` |

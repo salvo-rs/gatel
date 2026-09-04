@@ -34,6 +34,9 @@ tokio = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true, features = ["x509-parser"] }
 gatel-bundle-std.workspace = true
 gatel-kdl.workspace = true
+# A backend that only speaks TLS, for the upstream-TLS tests.
+rustls.workspace = true
+tokio-rustls.workspace = true
 # A certificate authority small enough to run in a test needs to read JWS.
 base64 = "0.23"
 serde_json.workspace = true

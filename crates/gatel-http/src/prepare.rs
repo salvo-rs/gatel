@@ -104,7 +104,7 @@ pub fn prepare(
         .collect();
     resources.binds.ensure(&wanted)?;
 
-    let (upstreams, resolutions) = UpstreamRuntimes::resolve(plan, resources.state);
+    let (upstreams, resolutions) = UpstreamRuntimes::resolve(plan, resources.state, resources.root)?;
     let upstreams = Arc::new(upstreams);
     for (id, resolution) in &resolutions {
         if !resolution.all_reused() {

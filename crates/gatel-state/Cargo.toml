@@ -11,6 +11,7 @@ repository.workspace = true
 gatel-model.workspace = true
 gatel-observe.workspace = true
 gatel-plan.workspace = true
+gatel-tls.workspace = true
 
 bytes.workspace = true
 http.workspace = true

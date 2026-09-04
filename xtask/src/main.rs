@@ -42,6 +42,9 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "gatel-model",
             "gatel-plan",
             "gatel-observe",
+            // The pool dials backends, and some of them speak TLS. The client
+            // side of TLS lives with the server side, not in a second place.
+            "gatel-tls",
             "gatel-kdl",
             "bytes",
             "http",

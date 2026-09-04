@@ -361,7 +361,7 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
             backend.address,
             r#""http" path="/healthz" interval="50ms" timeout="40ms" healthy-threshold=1"#,
         ));
-        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state);
+        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state, std::path::Path::new(".")).unwrap();
 
         let endpoints = Arc::clone(&runtimes.iter().next().unwrap().endpoints);
         assert_eq!(endpoints.all()[0].health(), Health::Unknown);
@@ -383,7 +383,7 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
             backend.address,
             r#""http" path="/healthz" interval="50ms" timeout="40ms" unhealthy-threshold=2"#,
         ));
-        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state);
+        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state, std::path::Path::new(".")).unwrap();
         let endpoints = Arc::clone(&runtimes.iter().next().unwrap().endpoints);
 
         let supervisor = Supervisor::new(Telemetry::new());
@@ -400,7 +400,12 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
         let backend = backend(200).await;
         let state = StateRegistry::new();
         let check = r#""tcp" interval="50ms" timeout="40ms" healthy-threshold=2"#;
-        let (runtimes, _) = UpstreamRuntimes::resolve(&plan(&config(backend.address, check)), &state);
+        let (runtimes, _) = UpstreamRuntimes::resolve(
+            &plan(&config(backend.address, check)),
+            &state,
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let runtimes = Arc::new(runtimes);
 
         let supervisor = Supervisor::new(Telemetry::new());
@@ -410,7 +415,12 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
 
         // Same upstream, same check: reconciling again must leave the worker
         // alone rather than restart its counters.
-        let (again, _) = UpstreamRuntimes::resolve(&plan(&config(backend.address, check)), &state);
+        let (again, _) = UpstreamRuntimes::resolve(
+            &plan(&config(backend.address, check)),
+            &state,
+            std::path::Path::new("."),
+        )
+        .unwrap();
         supervisor.reconcile(&Arc::new(again)).await;
         assert_eq!(
             endpoints.all()[0].health(),
@@ -431,7 +441,9 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
                 r#""tcp" interval="50ms" timeout="40ms""#,
             )),
             &state,
-        );
+            std::path::Path::new("."),
+        )
+        .unwrap();
 
         let supervisor = Supervisor::new(Telemetry::new());
         supervisor.reconcile(&Arc::new(with)).await;
@@ -445,7 +457,8 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
 "#,
             backend.address
         );
-        let (plain, _) = UpstreamRuntimes::resolve(&plan(&without), &state);
+        let (plain, _) =
+            UpstreamRuntimes::resolve(&plan(&without), &state, std::path::Path::new(".")).unwrap();
         supervisor.reconcile(&Arc::new(plain)).await;
         assert!(supervisor.running().await.is_empty(), "no check means no worker");
         supervisor.shutdown().await;
@@ -461,7 +474,7 @@ upstream "api" { endpoint "127.0.0.1:9" }
 site "*" { route "/" { proxy upstream="api" } }
 "#,
         );
-        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state);
+        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state, std::path::Path::new(".")).unwrap();
         let supervisor = Supervisor::new(Telemetry::new());
         supervisor.reconcile(&Arc::new(runtimes)).await;
         assert!(supervisor.running().await.is_empty());

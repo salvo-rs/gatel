@@ -992,9 +992,11 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "rcgen",
+ "rustls",
  "salvo_core",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 
@@ -1051,6 +1053,7 @@ dependencies = [
  "gatel-model",
  "gatel-observe",
  "gatel-plan",
+ "gatel-tls",
  "http",
  "http-body-util",
  "hyper",

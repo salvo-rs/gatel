@@ -199,3 +199,145 @@ site "*" {{
         "the connection survived the reload"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TLS to a backend
+// ---------------------------------------------------------------------------
+
+/// A backend that only speaks TLS, signed by an authority the test controls.
+async fn tls_backend(name: &str) -> (std::net::SocketAddr, String) {
+    use std::sync::Arc;
+
+    let authority = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        authority.cert.der().to_vec(),
+    )];
+    let key = rustls::pki_types::PrivateKeyDer::try_from(authority.signing_key.serialize_der()).unwrap();
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                while let Ok(read) = stream.read(&mut buffer).await {
+                    if read == 0 {
+                        return;
+                    }
+                    let body = "the backend spoke tls\n";
+                    let _ = stream
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                                .as_bytes(),
+                        )
+                        .await;
+                }
+            });
+        }
+    });
+    (address, authority.cert.pem())
+}
+
+#[tokio::test]
+async fn a_backend_that_speaks_tls_is_reached_over_tls() {
+    let gateway = Gateway::new("upstream-tls");
+    let port = free_port();
+    let (backend, authority) = tls_backend("api.internal").await;
+    std::fs::write(gateway.directory.join("upstream-ca.pem"), &authority).unwrap();
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+upstream "api" {{
+    endpoint "{backend}"
+    tls server-name="api.internal" ca="file:upstream-ca.pem"
+}}
+site "*" id="all" {{ route "/*" id="any" {{ proxy upstream="api" }} }}
+"#
+        ))
+        .await;
+
+    let response = get(gateway.address(), "/").await;
+    assert!(
+        response.contains("the backend spoke tls"),
+        "the connection has to be TLS, not plaintext: {response}"
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_authority_that_will_not_load_stops_the_reload() {
+    let gateway = Gateway::new("upstream-tls-bad-ca");
+    let port = free_port();
+    let good = format!(
+        r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{ route "/*" id="any" {{ respond "serving\n" }} }}
+"#
+    );
+    gateway.apply(&good).await;
+
+    let outcome = gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+upstream "api" {{
+    endpoint "127.0.0.1:9"
+    tls server-name="api.internal" ca="file:absent.pem"
+}}
+site "*" id="all" {{ route "/*" id="any" {{ proxy upstream="api" }} }}
+"#
+        ))
+        .await;
+    // Not a connection error under traffic, where it would look like the
+    // backend's fault.
+    let gatel_plan::Outcome::PrepareFailed(detail) = outcome else {
+        panic!("expected the reload to be refused: {outcome:?}");
+    };
+    assert!(detail.contains("upstream `api`"), "{detail}");
+    assert!(detail.contains("cannot read the upstream CA"), "{detail}");
+
+    // The previous configuration is untouched.
+    assert!(get(gateway.address(), "/").await.contains("serving"));
+}
+
+#[tokio::test]
+async fn a_backend_certificate_from_nobody_it_trusts_is_refused() {
+    let gateway = Gateway::new("upstream-tls-untrusted");
+    let port = free_port();
+    let (backend, _authority) = tls_backend("api.internal").await;
+    // A different authority: the one that signed the backend is not named.
+    let other = rcgen::generate_simple_self_signed(vec!["other".to_string()]).unwrap();
+    std::fs::write(gateway.directory.join("upstream-ca.pem"), other.cert.pem()).unwrap();
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+upstream "api" {{
+    endpoint "{backend}"
+    tls server-name="api.internal" ca="file:upstream-ca.pem"
+}}
+site "*" id="all" {{ route "/*" id="any" {{ proxy upstream="api" }} }}
+"#
+        ))
+        .await;
+
+    // There is no way to turn verification off, so this fails — which is the
+    // point. A gateway that would accept any certificate is a gateway whose
+    // TLS to the backend means nothing.
+    let response = get(gateway.address(), "/").await;
+    assert!(response.starts_with("HTTP/1.1 50"), "{response}");
+    assert!(!response.contains("the backend spoke tls"), "{response}");
+}

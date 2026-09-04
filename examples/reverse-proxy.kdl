@@ -57,3 +57,16 @@ site "*" {
         redirect "https://api.example.com/" permanent=#true
     }
 }
+
+// A backend that speaks TLS. `server-name` is both the SNI value and the name
+// the certificate is checked against — written down rather than taken from the
+// address, because a backend is usually reached by an address that is not its
+// name.
+//
+// There is no way to turn verification off. That option exists in other
+// gateways because it makes a broken deployment work today, and it is how
+// deployments stay broken for years. A private authority is named instead.
+upstream "partner" {
+    endpoint "10.0.9.1:443"
+    tls server-name="partner.internal" ca="file:partner-ca.pem"
+}

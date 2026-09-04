@@ -297,6 +297,10 @@ directive.
   `tls internal` issues short-lived certificates from an authority generated on
   first use, and `gatel trust` installs its root — as its own command, because
   adding a trust anchor changes what every program on the machine believes.
+- **No `tls-skip-verify` for backends either.** An upstream that speaks TLS is
+  verified, and a private authority is named with `ca`. The option exists in
+  other gateways because it makes a broken deployment work today, and it is how
+  deployments stay broken for years.
 - **No secret material in configuration.** `env:` and `file:` references only,
   and `SecretString` is redacted in every rendering path.
 - **No forwarding header believed by default.** `trusted-proxy` decides, and the

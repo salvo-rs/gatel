@@ -119,6 +119,11 @@ struct EndpointPool {
 pub struct ConnectionPool {
     config: gatel_plan::Pool,
     protocol: UpstreamProtocol,
+    /// Present exactly when the configuration said the backend speaks TLS.
+    /// Built during prepare, so a certificate authority that will not load
+    /// stops a reload rather than turning into a connection error under
+    /// traffic, where it would look like the backend's fault.
+    tls: Option<Arc<gatel_tls::ClientTls>>,
     endpoints: Mutex<HashMap<String, Arc<EndpointPool>>>,
 }
 
@@ -127,6 +132,7 @@ impl std::fmt::Debug for ConnectionPool {
         f.debug_struct("ConnectionPool")
             .field("protocol", &self.protocol)
             .field("max_per_endpoint", &self.config.max_per_endpoint)
+            .field("tls", &self.tls.as_ref().map(|tls| tls.server_name()))
             .finish()
     }
 }
@@ -144,10 +150,15 @@ pub struct PoolStats {
 }
 
 impl ConnectionPool {
-    pub fn new(config: gatel_plan::Pool, protocol: UpstreamProtocol) -> Self {
+    pub fn new(
+        config: gatel_plan::Pool,
+        protocol: UpstreamProtocol,
+        tls: Option<Arc<gatel_tls::ClientTls>>,
+    ) -> Self {
         Self {
             config,
             protocol,
+            tls,
             endpoints: Mutex::new(HashMap::new()),
         }
     }
@@ -238,8 +249,28 @@ impl ConnectionPool {
         };
         // Interactive traffic; batching small writes only adds latency.
         let _ = stream.set_nodelay(true);
-        let io = TokioIo::new(stream);
 
+        // The handshake is bounded by the same deadline as the connection it
+        // is part of. A backend that accepts and then says nothing must not
+        // hold a slot for longer than dialling one would have.
+        match &self.tls {
+            None => self.handshake(TokioIo::new(stream)).await,
+            Some(tls) => {
+                let secured = match tokio::time::timeout(timeouts.connect, tls.connect(stream)).await {
+                    Ok(Ok(secured)) => secured,
+                    Ok(Err(error)) => return Err(CheckoutError::Connect(error)),
+                    Err(_) => return Err(CheckoutError::ConnectTimeout(timeouts.connect)),
+                };
+                self.handshake(TokioIo::new(secured)).await
+            }
+        }
+    }
+
+    /// The HTTP handshake, over whichever transport got here.
+    async fn handshake<IO>(&self, io: TokioIo<IO>) -> Result<Sender, CheckoutError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         match self.protocol {
             UpstreamProtocol::Http1 => {
                 let (sender, connection) = http1::handshake(io)
@@ -449,7 +480,7 @@ mod tests {
             tls: None,
             origin: Origin::synthetic("test"),
         };
-        let pool = ConnectionPool::new(config, UpstreamProtocol::Http1);
+        let pool = ConnectionPool::new(config, UpstreamProtocol::Http1, None);
         (EndpointSet::new(&upstream), pool)
     }
 

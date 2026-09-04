@@ -48,7 +48,17 @@ impl UpstreamRuntimes {
     /// This is the point where "the operator raised a pool limit" and "the
     /// operator replaced the backends" become different things: the first keeps
     /// live connections, the second does not.
-    pub fn resolve(plan: &Plan, state: &StateRegistry) -> (Self, Vec<(ResourceId, UpstreamResolution)>) {
+    /// `root` is the directory `file:` references resolve against, for the
+    /// certificate authority and client identity an upstream may name.
+    ///
+    /// Returns an error only for something the configuration got wrong about
+    /// TLS. Everything else here is a lookup against what is already running
+    /// and cannot fail.
+    pub fn resolve(
+        plan: &Plan,
+        state: &StateRegistry,
+        root: &std::path::Path,
+    ) -> Result<(Self, Vec<(ResourceId, UpstreamResolution)>), String> {
         let mut runtimes = Vec::with_capacity(plan.upstreams.len());
         let mut resolutions = Vec::with_capacity(plan.upstreams.len());
 
@@ -61,12 +71,22 @@ impl UpstreamRuntimes {
                     .expect("compile binds endpoints, selector and pool for every upstream")
             };
 
+            // Built before the pool is bound, so a bad authority stops the
+            // reload rather than being discovered on the first request.
+            let tls = match &upstream.tls {
+                Some(spec) => Some(Arc::new(
+                    gatel_tls::ClientTls::new(spec, upstream.protocol, root)
+                        .map_err(|error| format!("upstream `{}`: {error}", upstream.id.name()))?,
+                )),
+                None => None,
+            };
+
             let (endpoints, endpoints_resolution) =
                 state.bind(&binding(StateKind::Endpoints), || EndpointSet::new(upstream));
             let (selector, selector_resolution) =
                 state.bind(&binding(StateKind::Selector), SelectorState::new);
             let (pool, pool_resolution) = state.bind(&binding(StateKind::Pool), || {
-                ConnectionPool::new(upstream.pool, upstream.protocol)
+                ConnectionPool::new(upstream.pool, upstream.protocol, tls)
             });
 
             resolutions.push((
@@ -85,7 +105,7 @@ impl UpstreamRuntimes {
             }));
         }
 
-        (Self { runtimes }, resolutions)
+        Ok((Self { runtimes }, resolutions))
     }
 
     pub fn get(&self, id: &ResourceId) -> Option<&Arc<UpstreamRuntime>> {
@@ -174,11 +194,12 @@ site "*" { route "/" { proxy upstream="api" } }
     #[test]
     fn a_compatible_reload_keeps_the_pool_and_the_cursor() {
         let state = StateRegistry::new();
-        let (before, _) = UpstreamRuntimes::resolve(&plan(BASE), &state);
+        let (before, _) = UpstreamRuntimes::resolve(&plan(BASE), &state, std::path::Path::new(".")).unwrap();
 
         // Raising a limit is compatible: live connections must survive it.
         let widened = BASE.replace("max-per-endpoint=8", "max-per-endpoint=64");
-        let (after, resolutions) = UpstreamRuntimes::resolve(&plan(&widened), &state);
+        let (after, resolutions) =
+            UpstreamRuntimes::resolve(&plan(&widened), &state, std::path::Path::new(".")).unwrap();
 
         assert!(resolutions[0].1.all_reused(), "{:?}", resolutions[0].1);
         let before = &before.runtimes[0];
@@ -191,9 +212,10 @@ site "*" { route "/" { proxy upstream="api" } }
     #[test]
     fn replacing_the_backends_replaces_endpoints_and_pool_but_not_the_cursor() {
         let state = StateRegistry::new();
-        let (before, _) = UpstreamRuntimes::resolve(&plan(BASE), &state);
+        let (before, _) = UpstreamRuntimes::resolve(&plan(BASE), &state, std::path::Path::new(".")).unwrap();
         let moved = BASE.replace("127.0.0.1:9000", "127.0.0.1:9001");
-        let (after, resolutions) = UpstreamRuntimes::resolve(&plan(&moved), &state);
+        let (after, resolutions) =
+            UpstreamRuntimes::resolve(&plan(&moved), &state, std::path::Path::new(".")).unwrap();
 
         let resolution = resolutions[0].1;
         assert_eq!(resolution.endpoints, Resolution::Replaced);
@@ -207,12 +229,13 @@ site "*" { route "/" { proxy upstream="api" } }
     #[test]
     fn changing_only_the_strategy_keeps_connections_and_health() {
         let state = StateRegistry::new();
-        let (before, _) = UpstreamRuntimes::resolve(&plan(BASE), &state);
+        let (before, _) = UpstreamRuntimes::resolve(&plan(BASE), &state, std::path::Path::new(".")).unwrap();
         let rebalanced = BASE.replace(
             "pool max-per-endpoint=8",
             "balance \"least-conn\"\n    pool max-per-endpoint=8",
         );
-        let (after, resolutions) = UpstreamRuntimes::resolve(&plan(&rebalanced), &state);
+        let (after, resolutions) =
+            UpstreamRuntimes::resolve(&plan(&rebalanced), &state, std::path::Path::new(".")).unwrap();
 
         let resolution = resolutions[0].1;
         assert_eq!(resolution.selector, Resolution::Replaced);
@@ -224,7 +247,7 @@ site "*" { route "/" { proxy upstream="api" } }
     #[test]
     fn removing_an_upstream_retires_its_state() {
         let state = StateRegistry::new();
-        UpstreamRuntimes::resolve(&plan(BASE), &state);
+        UpstreamRuntimes::resolve(&plan(BASE), &state, std::path::Path::new(".")).unwrap();
         assert_eq!(state.len(), 3);
 
         let without = r#"
@@ -232,7 +255,7 @@ global { http ":8080" }
 site "*" { route "/" { respond } }
 "#;
         let plan = plan(without);
-        UpstreamRuntimes::resolve(&plan, &state);
+        UpstreamRuntimes::resolve(&plan, &state, std::path::Path::new(".")).unwrap();
         let retired = state.retain(&plan.bindings);
         assert_eq!(retired.len(), 3);
         assert!(state.is_empty());
@@ -242,7 +265,7 @@ site "*" { route "/" { respond } }
     fn upstreams_are_addressable_by_identity() {
         let state = StateRegistry::new();
         let plan = plan(BASE);
-        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state);
+        let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state, std::path::Path::new(".")).unwrap();
         let id = gatel_model::ResourceId::new(gatel_model::ResourceKind::Upstream, "api");
         assert!(runtimes.get(&id).is_some());
         assert!(

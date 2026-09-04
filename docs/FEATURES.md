@@ -61,6 +61,8 @@ carries; it is the same list, generated rather than written down.
 | Safe retry: only a request with no body, only before anything was sent | yes | done | `gatel-http/src/proxy.rs` |
 | Hop-by-hop headers stripped by rebuilding the request | yes | done | `gatel-http/src/proxy.rs` |
 | `X-Forwarded-For` from a canonical client address, decided once | yes | done | `gatel-http/tests/proxy.rs` |
+| TLS to a backend: SNI, a private authority, a client identity | yes | done | `gatel-tls/src/client.rs`, `gatel-http/tests/proxy.rs` |
+| No way to skip verifying a backend's certificate | yes | done | the option does not exist; `tests/proxy.rs` proves an untrusted backend is refused |
 | Retry with a replayed body | no | not started | only `safe` is implemented, deliberately |
 | Circuit breaker as a directive | no (2.1) | not started | passive ejection covers the common case |
 | Forward proxying | no | not started | — |
