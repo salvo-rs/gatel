@@ -20,6 +20,9 @@ carries; it is the same list, generated rather than written down.
 | `Snapshot → Spec → Plan → Generation → State` as the only path | yes | done | enforced by `cargo run -p xtask`; no second entry point exists |
 | `spec_hash` ignores formatting; `plan_hash` includes the build's capabilities | yes | done | `gatel-plan` hash tests, `gatel-http/tests/reload.rs` no-op detection |
 | Secrets by reference only (`env:`, `file:`), redacted everywhere | yes | done | `gatel-model/src/secret.rs`; `basic-auth` refuses an inline hash |
+| A plan carries the reference, never the material; an error never quotes it | yes | done | `gatel-http/tests/secrets.rs`, verified to fail when a leak is introduced |
+| Provenance and clean-room rules written down | yes | done | `docs/design/provenance.md` |
+| Threat model, with which defences are tested and which are not | yes | done | `docs/design/threat-model.md` |
 | `validate`, `explain`, `diff`, `capabilities`, `trust` | yes | done | exit codes covered by `crates/gatel/src/main.rs`; every example compiles in `gatel-http/tests/examples.rs` |
 | Admin API as a second source under `runtime/` | no (2.1) | not started | — |
 | Kubernetes source | no | not started | — |
