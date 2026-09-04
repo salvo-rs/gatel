@@ -657,3 +657,89 @@ site "*" { route "/" { respond "hi" } }
     );
     assert_eq!(spec.global.limits.max_connections, 500);
 }
+
+// ---------------------------------------------------------------------------
+// Automatic certificates
+// ---------------------------------------------------------------------------
+
+const ACME_SITE: &str = r#"
+global {
+    http ":80"
+    https ":443"
+    acme email="ops@example.com" agreed=#true
+}
+site "example.com" {
+    tls acme
+    route "/" { respond "hi" }
+}
+"#;
+
+#[test]
+fn a_site_may_ask_for_an_automatic_certificate() {
+    let spec = spec(ACME_SITE);
+    let acme = spec.global.acme.expect("the acme block was declared");
+    assert_eq!(acme.email, "ops@example.com");
+    assert!(acme.directory.starts_with("https://acme-v02.api.letsencrypt.org"));
+    assert_eq!(acme.renew_before, std::time::Duration::from_secs(30 * 86_400));
+}
+
+#[test]
+fn asking_for_one_without_a_certificate_authority_is_refused() {
+    // Otherwise the first anyone would know is a handshake failing.
+    let diagnostics = errors(&ACME_SITE.replace("    acme email=\"ops@example.com\" agreed=#true\n", ""));
+    assert!(has(&diagnostics, Code::UnresolvedReference));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("nothing configured a certificate authority"))
+    );
+}
+
+#[test]
+fn a_wildcard_site_cannot_ask_for_one() {
+    let diagnostics = errors(&ACME_SITE.replace(r#"site "example.com""#, r#"site "*.example.com""#));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("no single host to certify"))
+    );
+}
+
+#[test]
+fn the_terms_are_not_agreed_to_on_the_operators_behalf() {
+    let diagnostics = errors(&ACME_SITE.replace(" agreed=#true", ""));
+    assert!(diagnostics.iter().any(|d| d.message.contains("agreed=#true")));
+    let help = diagnostics
+        .iter()
+        .find(|d| d.message.contains("agreed"))
+        .and_then(|d| d.help.clone())
+        .unwrap();
+    assert!(help.contains("terms of service"), "{help}");
+}
+
+#[test]
+fn a_contact_address_is_required() {
+    let diagnostics = errors(&ACME_SITE.replace(r#"email="ops@example.com" "#, ""));
+    assert!(diagnostics.iter().any(|d| d.message.contains("needs an `email`")));
+}
+
+#[test]
+fn a_directory_url_that_is_not_one_is_refused() {
+    let diagnostics = errors(&ACME_SITE.replace("agreed=#true", r#"agreed=#true ca="letsencrypt""#));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("not a directory URL"))
+    );
+}
+
+#[test]
+fn a_test_certificate_authority_can_be_named() {
+    let spec = spec(&ACME_SITE.replace(
+        "agreed=#true",
+        r#"agreed=#true ca="https://127.0.0.1:14000/dir" renew-before="1h""#,
+    ));
+    let acme = spec.global.acme.unwrap();
+    assert_eq!(acme.directory, "https://127.0.0.1:14000/dir");
+    assert_eq!(acme.renew_before, std::time::Duration::from_secs(3600));
+}

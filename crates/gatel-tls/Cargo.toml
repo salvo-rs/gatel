@@ -9,8 +9,11 @@ repository.workspace = true
 
 [dependencies]
 gatel-model.workspace = true
+gatel-observe.workspace = true
 gatel-plan.workspace = true
 
+async-trait.workspace = true
+certon.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true

@@ -7,11 +7,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acme;
 pub mod certificate;
 pub mod internal;
 pub mod server;
 pub mod store;
 
+pub use acme::{Acme, Challenges, Issued, Issuer, RouteSolver, Wanted};
 pub use certificate::Certificate;
 pub use internal::InternalCa;
 /// Re-exported so nothing above this crate has to name rustls directly.

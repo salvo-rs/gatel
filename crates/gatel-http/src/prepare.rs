@@ -19,11 +19,18 @@ use salvo_core::{Router, Service};
 use crate::bind::BindTable;
 use crate::dispatch::{Dispatcher, PreparedRoute, PreparedSite};
 
+/// Who obtains certificates, and for which sites.
+pub type AcmeIntent = (Arc<gatel_tls::Acme>, Vec<gatel_tls::Wanted>);
+
 /// What preparation is allowed to touch: everything that outlives a generation.
 pub struct Resources<'a> {
     pub binds: &'a BindTable,
     pub state: &'a StateRegistry,
     pub certificates: &'a Arc<CertificateStore>,
+    /// ACME challenges outstanding for the process, answered by every listener.
+    pub challenges: &'a Arc<gatel_tls::Challenges>,
+    /// Opens the account with the certificate authority, once for the process.
+    pub acme: &'a dyn Fn(&gatel_plan::Acme) -> Result<Arc<gatel_tls::Acme>, String>,
     /// What the process measures. Older than any generation, which is why a
     /// counter reads across a reload rather than restarting at zero.
     pub telemetry: &'a Arc<gatel_observe::Telemetry>,
@@ -67,6 +74,10 @@ impl std::fmt::Debug for ListenerRuntime {
 pub struct Runtime {
     pub listeners: BTreeMap<SocketAddr, Arc<ListenerRuntime>>,
     pub upstreams: Arc<UpstreamRuntimes>,
+    /// The sites that want automatic certificates, and who gets them. Empty
+    /// unless the configuration asked. Reconciled after the commit, like a
+    /// health check, so a candidate that fails starts no orders.
+    pub acme: Option<AcmeIntent>,
     pub limits: Limits,
     pub grace_period: Duration,
 }
@@ -119,9 +130,11 @@ pub fn prepare(
         // breaking the first handshake after it.
         let tls = gatel_tls::prepare_listener(
             listener_plan,
+            plan.spec.global.acme.as_ref(),
             &TlsPreparation {
                 store: resources.certificates,
                 internal: &internal,
+                acme: resources.acme,
                 root: resources.root,
             },
         )?;
@@ -191,6 +204,7 @@ pub fn prepare(
             tls: listener_plan.listener.protocol.is_tls(),
             trusted_proxies: plan.spec.global.trusted_proxies.clone(),
             max_body: plan.spec.global.limits.max_body.bytes(),
+            challenges: Arc::clone(resources.challenges),
             metrics: Arc::clone(&listener_metrics),
         };
 
@@ -209,6 +223,7 @@ pub fn prepare(
     Ok(Arc::new(Runtime {
         listeners,
         upstreams,
+        acme: acme_wanted(plan, resources)?,
         limits: plan.spec.global.limits.clone(),
         grace_period: plan.spec.global.grace_period,
     }))
@@ -276,4 +291,35 @@ fn build_terminal(
                 .map_err(|error| format!("`{}` in route `{route}`: {error}", instance.meta.name))
         }
     }
+}
+
+/// Which sites want an automatic certificate, and the account that gets them.
+///
+/// Collected from the plan rather than discovered while loading certificates,
+/// so a site served on several listeners is asked for once.
+fn acme_wanted(plan: &Plan, resources: &Resources<'_>) -> Result<Option<AcmeIntent>, String> {
+    let mut wanted: Vec<gatel_tls::Wanted> = Vec::new();
+    for site in &plan.spec.sites {
+        let Some(tls) = &site.tls else { continue };
+        if tls.source != gatel_plan::CertificateSource::Acme {
+            continue;
+        }
+        let gatel_plan::HostMatch::Exact(host) = &site.host else {
+            continue;
+        };
+        if wanted.iter().any(|one| one.host == *host) {
+            continue;
+        }
+        wanted.push(gatel_tls::Wanted {
+            site: site.id.clone(),
+            host: host.clone(),
+        });
+    }
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let Some(config) = plan.spec.global.acme.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(((resources.acme)(config)?, wanted)))
 }

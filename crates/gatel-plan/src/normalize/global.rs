@@ -16,8 +16,26 @@ use gatel_model::{
 
 use super::Context;
 use crate::matcher::parse_cidr;
-use crate::spec::{Admin, AdminBind, Global, Limits, Listener, ListenerProtocol, Log};
+use crate::spec::{Acme, Admin, AdminBind, Global, Limits, Listener, ListenerProtocol, Log};
 use crate::upstream::{Upstream, decode_upstream_body};
+
+#[derive(Debug, FromNode)]
+struct AcmeNode {
+    /// The CA's directory URL. Defaults to Let's Encrypt.
+    #[gatel(prop)]
+    ca: Option<String>,
+    #[gatel(prop)]
+    email: Option<String>,
+    /// The CA's terms of service. There is no default: agreeing on an
+    /// operator's behalf is not this program's to do.
+    #[gatel(prop, default = false)]
+    agreed: bool,
+    /// Where the account key and the certificates are kept.
+    #[gatel(prop)]
+    directory: Option<String>,
+    #[gatel(prop)]
+    renew_before: Option<Duration>,
+}
 
 #[derive(Debug, FromNode)]
 struct LimitsNode {
@@ -123,8 +141,13 @@ impl Context<'_> {
                         global.admin = Some(admin);
                     }
                 }
+                "acme" => {
+                    if let Some(acme) = self.acme(child) {
+                        global.acme = Some(acme);
+                    }
+                }
                 other => {
-                    const KNOWN: [&str; 7] = [
+                    const KNOWN: [&str; 8] = [
                         "http",
                         "https",
                         "grace-period",
@@ -132,6 +155,7 @@ impl Context<'_> {
                         "limits",
                         "log",
                         "admin",
+                        "acme",
                     ];
                     let mut diagnostic = Diagnostic::error(
                         Code::UnknownNode,
@@ -319,5 +343,69 @@ impl Context<'_> {
         }
         let id = ResourceId::new(ResourceKind::Upstream, name);
         decode_upstream_body(node, id, owner.clone(), self.diagnostics)
+    }
+}
+
+impl Context<'_> {
+    /// `acme email="..." agreed=#true`, once, for the whole process.
+    pub(super) fn acme(&mut self, node: &Node) -> Option<Acme> {
+        let fields = AcmeNode::from_node(node, self.diagnostics)?;
+
+        let Some(email) = fields.email.filter(|email| email.contains('@')) else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    Code::MissingField,
+                    node.origin.clone(),
+                    "`acme` needs an `email`",
+                )
+                .with_help(
+                    "the CA writes to it about expiry and problems; a certificate nobody can be                      told about is one that expires quietly",
+                ),
+            );
+            return None;
+        };
+        if !fields.agreed {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    Code::MissingField,
+                    node.origin.clone(),
+                    "`acme` needs `agreed=#true`",
+                )
+                .with_help(
+                    "issuing a certificate accepts the CA's terms of service, and this program                      will not accept them on your behalf",
+                ),
+            );
+            return None;
+        }
+
+        let directory = fields.ca.unwrap_or_else(|| Acme::DEFAULT_DIRECTORY.to_string());
+        if !directory.starts_with("https://") && !directory.starts_with("http://") {
+            self.error(
+                Code::InvalidValue,
+                &node.origin,
+                format!("`{directory}` is not a directory URL"),
+            );
+            return None;
+        }
+
+        // Two thirds through the life of a 90-day certificate, which leaves a
+        // month to notice that renewal is not working.
+        let renew_before = fields.renew_before.unwrap_or(Duration::from_secs(30 * 86_400));
+        if renew_before.is_zero() {
+            self.error(
+                Code::InvalidValue,
+                &node.origin,
+                "`renew-before` of zero would renew only after the certificate had expired",
+            );
+            return None;
+        }
+
+        Some(Acme {
+            directory,
+            email,
+            agreed: true,
+            directory_path: fields.directory,
+            renew_before,
+        })
     }
 }

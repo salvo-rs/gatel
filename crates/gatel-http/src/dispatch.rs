@@ -83,6 +83,9 @@ pub struct Dispatcher {
     pub trusted_proxies: Vec<(IpAddr, u8)>,
     /// The largest request body anything behind this listener will read.
     pub max_body: u64,
+    /// Outstanding ACME challenges, answered before anything else looks at the
+    /// request.
+    pub challenges: Arc<gatel_tls::Challenges>,
     pub metrics: Arc<ListenerMetrics>,
 }
 
@@ -273,6 +276,19 @@ impl Handler for Dispatcher {
         }
         depot.insert("gatel.tls", self.tls);
 
+        // Before routing, and before every guard. A certificate authority
+        // asking for a challenge is not a visitor: `force-https` must not
+        // redirect it, a rate limit must not refuse it, and no route needs to
+        // exist for it. It is answered here or nowhere.
+        if let Some(answer) = self.challenges.answer_for_path(request.uri().path()) {
+            response.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/octet-stream"),
+            );
+            let _ = response.write_body(answer);
+            return;
+        }
+
         // Before routing, because the limit belongs to the listener rather than
         // to whichever route happens to claim the request, and because a client
         // that declared too much should be told so without reading a byte.
@@ -389,6 +405,7 @@ mod tests {
             tls: false,
             trusted_proxies: Vec::new(),
             max_body: u64::MAX,
+            challenges: gatel_tls::Challenges::new(),
             metrics: Arc::new(ListenerMetrics::default()),
         }
     }
@@ -564,6 +581,7 @@ mod tests {
 
         let trusting = Dispatcher {
             max_body: u64::MAX,
+            challenges: gatel_tls::Challenges::new(),
             metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,
@@ -581,6 +599,7 @@ mod tests {
             .into();
         let trusting = Dispatcher {
             max_body: u64::MAX,
+            challenges: gatel_tls::Challenges::new(),
             metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,
@@ -606,6 +625,7 @@ mod tests {
             .into();
         let trusting = Dispatcher {
             max_body: u64::MAX,
+            challenges: gatel_tls::Challenges::new(),
             metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,

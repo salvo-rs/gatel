@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod acme_ca;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,10 +27,17 @@ pub struct Gateway {
     pub binds: Arc<BindTable>,
     pub state: Arc<StateRegistry>,
     pub certificates: Arc<gatel_tls::CertificateStore>,
+    pub challenges: Arc<gatel_tls::Challenges>,
+    /// The account with the certificate authority, opened on first use and
+    /// kept: it is the process's, not a generation's.
+    pub acme: std::sync::Mutex<Option<Arc<gatel_tls::Acme>>>,
     pub telemetry: Arc<gatel_observe::Telemetry>,
     pub server: Arc<Server>,
     pub registry: Registry,
     pub directory: PathBuf,
+    /// A reopened gateway shares the first one's directory and must not delete
+    /// it out from under the test.
+    owns_directory: bool,
     revision: std::cell::Cell<u64>,
 }
 
@@ -51,6 +60,8 @@ impl Gateway {
             binds,
             state: Arc::new(StateRegistry::new()),
             certificates: Arc::new(gatel_tls::CertificateStore::new()),
+            challenges: gatel_tls::Challenges::new(),
+            acme: std::sync::Mutex::new(None),
             telemetry: gatel_observe::Telemetry::new(),
             registry: Registry::builder()
                 .bundle(gatel_bundle_std::bundle())
@@ -58,6 +69,44 @@ impl Gateway {
                 .unwrap(),
             directory,
             revision: std::cell::Cell::new(0),
+            owns_directory: true,
+        }
+    }
+
+    /// Stop serving and release every socket, the way a process exiting does.
+    ///
+    /// Needed before [`Gateway::reopen`], because two of these in one test are
+    /// two processes only in the ways that matter — the sockets are real and
+    /// only one of them can have a port.
+    pub async fn stop(&self) {
+        self.server.shutdown().await;
+        self.binds.retain(&[]);
+    }
+
+    /// A second process over the same configuration directory.
+    ///
+    /// Everything a process owns starts empty — the certificate store, the
+    /// generation, the state — and everything on disk is still there, which is
+    /// what a restart is.
+    pub fn reopen(previous: &Gateway) -> Self {
+        let store = Arc::new(GenerationStore::new());
+        let binds = Arc::new(BindTable::new());
+        Self {
+            server: Arc::new(Server::new(Arc::clone(&store), Arc::clone(&binds))),
+            store,
+            binds,
+            state: Arc::new(StateRegistry::new()),
+            certificates: Arc::new(gatel_tls::CertificateStore::new()),
+            challenges: gatel_tls::Challenges::new(),
+            acme: std::sync::Mutex::new(None),
+            telemetry: gatel_observe::Telemetry::new(),
+            registry: Registry::builder()
+                .bundle(gatel_bundle_std::bundle())
+                .build()
+                .unwrap(),
+            directory: previous.directory.clone(),
+            revision: std::cell::Cell::new(0),
+            owns_directory: false,
         }
     }
 
@@ -89,6 +138,8 @@ impl Gateway {
         let binds = Arc::clone(&self.binds);
         let state = Arc::clone(&self.state);
         let certificates = Arc::clone(&self.certificates);
+        let challenges = Arc::clone(&self.challenges);
+        let acme = self.acme_factory();
         let telemetry = Arc::clone(&self.telemetry);
         let root = self.directory.clone();
         let ca_directory = self.directory.join("ca");
@@ -99,6 +150,8 @@ impl Gateway {
                     binds: &binds,
                     state: &state,
                     certificates: &certificates,
+                    challenges: &challenges,
+                    acme: &acme,
                     telemetry: &telemetry,
                     root: &root,
                     internal_ca: ca_directory.clone(),
@@ -138,6 +191,36 @@ impl Gateway {
         self.telemetry.metrics.retain(&live);
     }
 
+    /// The account with the certificate authority, opened on first use, the way
+    /// `App` does it.
+    fn acme_factory(&self) -> impl Fn(&gatel_plan::Acme) -> Result<Arc<gatel_tls::Acme>, String> + use<'_> {
+        move |config| {
+            let mut held = self.acme.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(acme) = held.as_ref() {
+                return Ok(Arc::clone(acme));
+            }
+            let acme = gatel_tls::Acme::new(
+                config,
+                &self.directory,
+                Arc::clone(&self.challenges),
+                Arc::clone(&self.certificates),
+                Arc::clone(&self.telemetry),
+            )?;
+            *held = Some(Arc::clone(&acme));
+            Ok(acme)
+        }
+    }
+
+    /// What `App::activate` does for automatic certificates.
+    pub async fn reconcile_acme(&self) {
+        let Some(committed) = self.store.current() else {
+            return;
+        };
+        if let Some((acme, wanted)) = &committed.runtime.acme {
+            acme.reconcile(wanted.clone()).await;
+        }
+    }
+
     pub fn address(&self) -> SocketAddr {
         *self
             .store
@@ -153,7 +236,9 @@ impl Gateway {
 
 impl Drop for Gateway {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.directory);
+        if self.owns_directory {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
     }
 }
 

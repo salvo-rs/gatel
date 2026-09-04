@@ -35,8 +35,8 @@ pub use plan::{
     diff_bindings,
 };
 pub use spec::{
-    Admin, AdminBind, CertificateSource, ClientAuth, Global, Limits, Listener, ListenerProtocol, Log, Route,
-    Site, SiteTls, Spec, Terminal,
+    Acme, Admin, AdminBind, CertificateSource, ClientAuth, Global, Limits, Listener, ListenerProtocol, Log,
+    Route, Site, SiteTls, Spec, Terminal,
 };
 pub use upstream::{
     Balance, Endpoint, Health, HealthKind, PassiveHealth, Pool, Retry, RetryMode, Timeouts, Upstream,

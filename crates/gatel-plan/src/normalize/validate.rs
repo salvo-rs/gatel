@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 
 use gatel_model::{Code, Diagnostic, Diagnostics, Origin, did_you_mean};
 
-use crate::matcher::compare_specificity;
-use crate::spec::{Spec, Terminal};
+use crate::matcher::{HostMatch, compare_specificity};
+use crate::spec::{CertificateSource, Spec, Terminal};
 
 pub(super) fn reject_duplicate_directives(
     directives: &[crate::directive::DirectiveInstance],
@@ -112,6 +112,7 @@ pub(super) fn check_uniqueness(spec: &Spec, diagnostics: &mut Diagnostics) {
 }
 
 pub(super) fn check_references(spec: &Spec, diagnostics: &mut Diagnostics) {
+    check_acme(spec, diagnostics);
     let listener_names: Vec<&str> = spec
         .listeners
         .iter()
@@ -214,4 +215,46 @@ pub(super) fn sort_routes(spec: &mut Spec) {
     });
     spec.listeners.sort_by(|a, b| a.name.cmp(&b.name));
     spec.upstreams.sort_by(|a, b| a.id.name().cmp(b.id.name()));
+}
+
+/// A site that asks for an automatic certificate has to be able to get one.
+///
+/// Both of these are found here rather than at issuance time, because the first
+/// time anyone would otherwise notice is a handshake failing in production.
+fn check_acme(spec: &Spec, diagnostics: &mut Diagnostics) {
+    for site in &spec.sites {
+        let Some(tls) = &site.tls else { continue };
+        if tls.source != CertificateSource::Acme {
+            continue;
+        }
+        if spec.global.acme.is_none() {
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::UnresolvedReference,
+                    site.origin.clone(),
+                    format!(
+                        "site `{}` asks for `tls acme`, but nothing configured a certificate authority",
+                        site.host.describe()
+                    ),
+                )
+                .with_help("add `acme email=\"...\" agreed=#true` to `global`"),
+            );
+        }
+        // A CA issues for names, and a wildcard site does not name one. The
+        // wildcard certificate a DNS-01 challenge could get is a different
+        // thing, and would have to be asked for explicitly.
+        if !matches!(site.host, HostMatch::Exact(_)) {
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::InvalidValue,
+                    site.origin.clone(),
+                    format!(
+                        "site `{}` cannot use `tls acme`: there is no single host to certify",
+                        site.host.describe()
+                    ),
+                )
+                .with_help("name the site, or use `tls cert=.. key=..` for a certificate you already have"),
+            );
+        }
+    }
 }

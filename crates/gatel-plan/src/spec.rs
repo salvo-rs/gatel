@@ -273,6 +273,9 @@ pub struct Global {
     /// Peers whose forwarding headers are believed.
     pub trusted_proxies: Vec<(IpAddr, u8)>,
     pub admin: Option<Admin>,
+    /// Present exactly when the configuration asked for automatic
+    /// certificates. A site that says `tls acme` without it is an error.
+    pub acme: Option<Acme>,
     pub log: Log,
 }
 
@@ -283,6 +286,7 @@ impl Default for Global {
             limits: Limits::default(),
             trusted_proxies: Vec::new(),
             admin: None,
+            acme: None,
             log: Log::default(),
         }
     }
@@ -307,6 +311,47 @@ impl Global {
                 hasher.update_none();
             }
         }
+        match &self.acme {
+            Some(acme) => acme.hash_into(hasher),
+            None => {
+                hasher.update_none();
+            }
+        }
+    }
+}
+
+/// Automatic certificates, for every site that asks for them.
+///
+/// Process-wide rather than per site, because the account with the CA is: one
+/// key, one contact, one set of rate limits. A site says `tls acme` and nothing
+/// else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acme {
+    /// The CA's directory URL.
+    pub directory: String,
+    /// The contact the CA writes to about expiry and problems. Required,
+    /// because a certificate nobody can be told about is one that expires
+    /// silently.
+    pub email: String,
+    /// Whether the operator has accepted the CA's terms. Never defaulted to
+    /// true: agreeing on somebody's behalf is not this program's to do.
+    pub agreed: bool,
+    /// Where the account key and issued certificates are kept.
+    pub directory_path: Option<String>,
+    /// Renew once this much of the certificate's life is left.
+    pub renew_before: Duration,
+}
+
+impl Acme {
+    /// Let's Encrypt, which is what an operator who did not say means.
+    pub const DEFAULT_DIRECTORY: &'static str = "https://acme-v02.api.letsencrypt.org/directory";
+
+    pub fn hash_into(&self, hasher: &mut Hasher) {
+        hasher.update_str(&self.directory);
+        hasher.update_str(&self.email);
+        hasher.update_bool(self.agreed);
+        hasher.update_opt_str(self.directory_path.as_deref());
+        hasher.update_duration(self.renew_before);
     }
 }
 

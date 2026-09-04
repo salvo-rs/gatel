@@ -1,0 +1,46 @@
+// Automatic certificates.
+//
+// The plaintext listener has to exist and be reachable from the internet on
+// port 80: that is where the certificate authority asks its question. Gatel
+// answers it from that listener before routing and before every guard, so it
+// works even while no site is served there — a redirect to HTTPS, or a 403,
+// would be a certificate that never arrives.
+global {
+    http ":80"
+    https ":443"
+
+    // The account is the process's, not a site's: one key, one contact, one set
+    // of the authority's rate limits. A site just says `tls acme`.
+    //
+    // `directory` is where the account key and the certificates are kept, so a
+    // restart serves what it had rather than ordering again.
+    acme email="ops@example.com" agreed=#true renew-before="30d" \
+         directory="/var/lib/gatel/acme"
+}
+
+site "example.com" {
+    // Nothing is ordered while the configuration is being applied. An order
+    // takes seconds when everything works and minutes when it does not, and a
+    // reload must not wait for a certificate authority's bad afternoon — so the
+    // listener starts, readiness says `certificate_pending`, and the
+    // certificate arrives when it arrives.
+    tls acme
+
+    route "/*" {
+        proxy "127.0.0.1:8080"
+    }
+}
+
+// Everything that arrives in plaintext is sent to the secure URL. Written as
+// its own site because a site with `tls` is only served on the TLS listener.
+site "*" listener="http" {
+    route "/*" {
+        force-https
+
+        // Never reached: `force-https` is a guard, so it answers before this
+        // does, and on a plaintext listener it always answers. A route still
+        // needs something to answer with, and saying so beats a terminal that
+        // pretends to serve something.
+        respond status=421 "this listener only redirects\n"
+    }
+}

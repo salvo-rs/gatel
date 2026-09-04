@@ -125,6 +125,21 @@ renewal is not a configuration change, so it never produces a generation. The
 resolver reads through the store on each handshake, which is what lets a
 certificate be replaced while established connections carry on.
 
+That is also why an automatic certificate is never ordered during a reload. An
+order takes seconds when everything works and minutes when it does not, and a
+reload that waited for one would be a reload a certificate authority's bad
+afternoon could stall. A commit publishes the intent — these sites want
+certificates — and a background task reconciles against it afterwards, exactly
+as a health check does. A site with no certificate yet cannot be served over
+TLS, and readiness says so; it does not get a certificate this process signed
+itself, because one of those is a certificate that lies.
+
+The ACME protocol is `certon`'s. What is Gatel's is where the challenge is
+answered: the listener the configuration already declares, before routing and
+before every guard, rather than a second server the library would otherwise
+start on port 80. A certificate authority asking a question is not a visitor —
+`force-https` must not redirect it and a rate limit must not refuse it.
+
 ## Ordering is decided once
 
 Middleware runs in phase order, and the phase is part of a directive's identity

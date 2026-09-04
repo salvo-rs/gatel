@@ -103,6 +103,11 @@ const ALLOWED: &[(&str, &[&str])] = &[
         &[
             "gatel-model",
             "gatel-plan",
+            // The ACME protocol itself. Same organisation, same licence, and
+            // already what v1 uses: one implementation rather than two.
+            "certon",
+            "async-trait",
+            "gatel-observe",
             "rcgen",
             "rustls",
             "rustls-pemfile",

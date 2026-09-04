@@ -23,6 +23,13 @@ pub struct App {
     /// Certificates outlive generations: a renewal is not a configuration
     /// change and must not produce one.
     pub certificates: Arc<CertificateStore>,
+    /// ACME challenges outstanding right now. Process-wide and outside every
+    /// generation: an order started under one configuration must still be
+    /// answerable after a reload.
+    pub challenges: Arc<gatel_tls::Challenges>,
+    /// The account with the certificate authority, opened on first use and
+    /// kept: it is the process's, not a generation's.
+    pub acme: std::sync::Mutex<Option<(gatel_model::Fingerprint, Arc<gatel_tls::Acme>)>>,
     /// What the process measures and reports about itself. Older than any
     /// generation, so a counter reads across a reload.
     pub telemetry: Arc<Telemetry>,
@@ -47,6 +54,8 @@ impl App {
             server,
             supervisor: Arc::new(Supervisor::new(Arc::clone(&telemetry))),
             certificates: Arc::new(CertificateStore::new()),
+            challenges: gatel_tls::Challenges::new(),
+            acme: std::sync::Mutex::new(None),
             telemetry,
             root,
             source: SourceId::file("main"),
@@ -75,6 +84,8 @@ impl App {
         let binds = Arc::clone(&self.binds);
         let state = Arc::clone(&self.state);
         let certificates = Arc::clone(&self.certificates);
+        let challenges = Arc::clone(&self.challenges);
+        let acme = self.acme_factory();
         let telemetry = Arc::clone(&self.telemetry);
         let root = self.root_directory().to_path_buf();
         let outcome = self.store.attempt(&snapshot, &self.registry, move |preparation| {
@@ -84,6 +95,8 @@ impl App {
                     binds: &binds,
                     state: &state,
                     certificates: &certificates,
+                    challenges: &challenges,
+                    acme: &acme,
                     telemetry: &telemetry,
                     root: &root,
                     internal_ca: InternalCa::default_directory(),
@@ -92,6 +105,45 @@ impl App {
         });
         outcome.record(&self.telemetry);
         outcome
+    }
+
+    /// Open the account with the certificate authority, once.
+    ///
+    /// Memoised on what the configuration said, so a reload that leaves the
+    /// authority alone keeps the account, its key and its rate-limit standing,
+    /// and one that changes it opens a new one.
+    fn acme_factory(&self) -> impl Fn(&gatel_plan::Acme) -> Result<Arc<gatel_tls::Acme>, String> + use<'_> {
+        let root = self.root_directory().to_path_buf();
+        move |config| {
+            let mut hasher = gatel_model::Hasher::new();
+            config.hash_into(&mut hasher);
+            let fingerprint = hasher.finish();
+
+            let mut held = self.acme.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((known, acme)) = held.as_ref()
+                && *known == fingerprint
+            {
+                return Ok(Arc::clone(acme));
+            }
+            let acme = gatel_tls::Acme::new(
+                config,
+                &root,
+                Arc::clone(&self.challenges),
+                Arc::clone(&self.certificates),
+                Arc::clone(&self.telemetry),
+            )?;
+            *held = Some((fingerprint, Arc::clone(&acme)));
+            Ok(acme)
+        }
+    }
+
+    /// The account, if one has been opened.
+    fn acme_account(&self) -> Option<Arc<gatel_tls::Acme>> {
+        self.acme
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(_, acme)| Arc::clone(acme))
     }
 
     /// Compile without preparing anything, for `validate` and `explain`.
@@ -115,6 +167,20 @@ impl App {
             .health
             .committed(self.server.active_addresses().await.len());
         self.telemetry.metrics.retain(&live_series(&committed.plan));
+        // After the commit, never before: a candidate that failed to prepare
+        // must not have asked a certificate authority for anything.
+        match &committed.runtime.acme {
+            Some((acme, wanted)) => acme.reconcile(wanted.clone()).await,
+            // The configuration no longer asks for any, so whatever was
+            // ordering stops. Taken out of the lock first: an async wait must
+            // not be done holding one.
+            None => {
+                let running = self.acme_account();
+                if let Some(acme) = running {
+                    acme.reconcile(Vec::new()).await;
+                }
+            }
+        }
         // Only after the new generation is live: anything still held by a
         // draining request keeps working, it is simply no longer findable.
         for retired in self.state.retain(&committed.plan.bindings) {
@@ -143,6 +209,9 @@ impl App {
         self.telemetry.health.draining();
         self.server.shutdown().await;
         self.supervisor.shutdown().await;
+        if let Some(acme) = self.acme_account() {
+            acme.shutdown().await;
+        }
     }
 
     /// Every file the configuration tree touched, so a watcher knows what to

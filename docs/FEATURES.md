@@ -74,7 +74,10 @@ carries; it is the same list, generated rather than written down.
 | Certificates outlive generations; a renewal produces none | yes | done | `gatel-tls/src/store.rs` |
 | A development authority, and `gatel trust` as its own command | yes | done | `gatel-tls/src/internal.rs`, `gatel-http/tests/tls.rs` |
 | No `tls-skip-verify`, anywhere | yes | done | the option does not exist |
-| ACME, with HTTP-01 and TLS-ALPN-01 | yes | **not started** | — |
+| ACME with HTTP-01 | yes | done | `gatel-http/tests/acme.rs` drives a whole order — the real client, a test authority that actually fetches the challenge from the gateway |
+| ACME with TLS-ALPN-01 or DNS-01 | no (2.1) | not started | `certon` implements both; neither is wired to a listener yet |
+| Never ordering during a reload | yes | done | `gatel-tls/src/server.rs`, `tests/acme.rs`: a listener whose site has no certificate still starts |
+| A certificate kept across a restart | yes | done | `gatel-http/tests/acme.rs` |
 | On-demand certificates | no | not started | — |
 
 ## Directives
@@ -134,12 +137,23 @@ carries; it is the same list, generated rather than written down.
 
 In order of what a deployment would miss first:
 
-1. **ACME.** The single largest gap. Everything else about TLS is in place; a
-   certificate still has to be put there by hand.
+1. **ACME against a real certificate authority.** The protocol is `certon`'s
+   and the integration is covered end to end, but nothing here has met Let's
+   Encrypt's staging environment. That is the next thing to do, and it needs a
+   real domain rather than a test.
 2. **Release engineering** — the matrix, signed artefacts, a soak test, fuzzing.
 3. **Interoperability against real clients** — the tests speak raw HTTP, which
    is not the same as having been through a browser and a CDN.
 
-Everything marked 2.1 is deliberate: `cache`, `forward-auth`, `circuit-breaker`
-and the Admin API are each large enough to want their own release, and none of
-them is needed to put this in front of a service.
+Everything marked 2.1 is deliberate: `cache`, `forward-auth`, `circuit-breaker`,
+the other ACME challenge types and the Admin API are each large enough to want
+their own release, and none of them is needed to put this in front of a service.
+
+## Where the ACME protocol comes from
+
+`certon`, which is the same organisation, the same licence, and already what v1
+uses — one implementation rather than two. Only its issuer is used, not its
+certificate manager: Gatel already owns a certificate store, a resolver, a
+background supervisor and a route table, and adopting a second set would split
+"a renewal is not a configuration change" across two places that both believe
+it.

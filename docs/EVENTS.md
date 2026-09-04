@@ -85,6 +85,11 @@ attempt.
 | `certificate_issued` | The development authority issued one. |
 | `certificate_forgotten` | A site no longer exists, so its certificate was released. |
 | `internal_ca_created` | The development authority was generated, on first use. |
+| `certificate_pending` | A site asked for an automatic certificate and has none yet. It cannot be served over TLS until one arrives. |
+| `certificate_order_failed` | The certificate authority refused, or could not be reached. The site keeps whatever it has and the order is retried later. |
+| `certificate_not_saved` | An issued certificate could not be written to disk. It is being served, but a restart would have to order it again. |
+| `challenge_presented` | An answer to an ACME challenge is now being served by every listener. |
+| `challenge_finished` | The authority is done with a challenge, and the answer has been withdrawn. |
 
 ## `gatel::file`
 

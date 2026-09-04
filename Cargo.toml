@@ -34,8 +34,10 @@ gatel-http = { version = "2.0.0-alpha.1", path = "crates/gatel-http" }
 gatel-tls = { version = "2.0.0-alpha.1", path = "crates/gatel-tls" }
 gatel-bundle-std = { version = "2.0.0-alpha.1", path = "crates/gatel-bundle-std" }
 
+async-trait = "0.1"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd", "deflate"] }
 bcrypt = { version = "0.17", default-features = false, features = ["std"] }
+certon = { version = "0.2.3", default-features = false, features = ["ring"] }
 blake3 = "1.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }

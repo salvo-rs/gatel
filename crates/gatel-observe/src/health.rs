@@ -28,6 +28,8 @@ pub enum Reason {
     ReloadFailing { attempts: u32, summary: String },
     /// Every endpoint of this upstream is out.
     UpstreamDown { upstream: String },
+    /// A site asked for an automatic certificate and does not have one yet.
+    CertificatePending { site: String },
 }
 
 impl Reason {
@@ -37,7 +39,9 @@ impl Reason {
     pub fn blocks(&self) -> bool {
         match self {
             Reason::Starting | Reason::NoListeners | Reason::Draining => true,
-            Reason::ReloadFailing { .. } | Reason::UpstreamDown { .. } => false,
+            Reason::ReloadFailing { .. }
+            | Reason::UpstreamDown { .. }
+            | Reason::CertificatePending { .. } => false,
         }
     }
 
@@ -52,6 +56,9 @@ impl Reason {
             Reason::UpstreamDown { upstream } => {
                 format!("every endpoint of upstream `{upstream}` is unhealthy")
             }
+            Reason::CertificatePending { site } => {
+                format!("site `{site}` has no certificate yet")
+            }
         }
     }
 
@@ -63,6 +70,7 @@ impl Reason {
             Reason::Draining => "draining",
             Reason::ReloadFailing { .. } => "reload_failing",
             Reason::UpstreamDown { .. } => "upstream_down",
+            Reason::CertificatePending { .. } => "certificate_pending",
         }
     }
 }
@@ -136,6 +144,7 @@ struct Inner {
     failures: u32,
     last_failure: Option<String>,
     down: BTreeSet<String>,
+    uncertified: BTreeSet<String>,
 }
 
 impl Health {
@@ -177,6 +186,21 @@ impl Health {
         }
     }
 
+    /// Report a site after an issuance attempt.
+    pub fn certificate(&self, site: &str, ready: bool) {
+        let mut inner = self.write();
+        if ready {
+            inner.uncertified.remove(site);
+        } else {
+            inner.uncertified.insert(site.to_string());
+        }
+    }
+
+    /// Forget sites a new plan no longer names.
+    pub fn retain_certificates(&self, live: &BTreeSet<String>) {
+        self.write().uncertified.retain(|site| live.contains(site));
+    }
+
     /// Forget upstreams a new plan no longer names.
     pub fn retain_upstreams(&self, live: &BTreeSet<String>) {
         self.write().down.retain(|name| live.contains(name));
@@ -213,6 +237,9 @@ impl Health {
             reasons.push(Reason::UpstreamDown {
                 upstream: upstream.clone(),
             });
+        }
+        for site in &inner.uncertified {
+            reasons.push(Reason::CertificatePending { site: site.clone() });
         }
 
         let state = if reasons.iter().any(Reason::blocks) {
@@ -326,6 +353,37 @@ mod tests {
     }
 
     #[test]
+    fn a_site_still_waiting_for_a_certificate_degrades() {
+        // Blocking would take every replica out at first boot, and in front of
+        // a load balancer that would stop the certificate authority reaching
+        // the challenge — so issuance would never finish.
+        let health = Health::new();
+        health.committed(1);
+        health.certificate("example.com", false);
+        let report = health.report();
+        assert_eq!(report.state, State::Degraded);
+        assert!(report.state.is_serving());
+        assert_eq!(
+            report.reasons,
+            vec![Reason::CertificatePending {
+                site: "example.com".to_string()
+            }]
+        );
+
+        health.certificate("example.com", true);
+        assert_eq!(health.report().state, State::Ready);
+    }
+
+    #[test]
+    fn a_site_a_new_plan_dropped_stops_being_reported() {
+        let health = Health::new();
+        health.committed(1);
+        health.certificate("old.example.com", false);
+        health.retain_certificates(&BTreeSet::from(["new.example.com".to_string()]));
+        assert_eq!(health.report().state, State::Ready);
+    }
+
+    #[test]
     fn draining_takes_the_instance_out_of_rotation() {
         let health = Health::new();
         health.committed(1);
@@ -360,6 +418,7 @@ mod tests {
             Reason::UpstreamDown {
                 upstream: String::new(),
             },
+            Reason::CertificatePending { site: String::new() },
         ];
         let codes: BTreeSet<_> = reasons.iter().map(|reason| reason.code()).collect();
         assert_eq!(codes.len(), reasons.len());

@@ -25,6 +25,9 @@ pub struct TlsPreparation<'a> {
     pub internal: &'a dyn Fn() -> Result<Arc<InternalCa>, String>,
     /// Where `file:` references resolve against.
     pub root: &'a Path,
+    /// Opened only when a site asks for an automatic certificate, and then once
+    /// for the process: the account with the authority is not per generation.
+    pub acme: &'a dyn Fn(&gatel_plan::Acme) -> Result<Arc<crate::acme::Acme>, String>,
 }
 
 /// Build the TLS configuration for one listener, loading every certificate it
@@ -35,6 +38,7 @@ pub struct TlsPreparation<'a> {
 /// breaking a handshake later.
 pub fn prepare_listener(
     listener: &ListenerPlan,
+    acme_config: Option<&gatel_plan::Acme>,
     preparation: &TlsPreparation<'_>,
 ) -> Result<Option<Arc<ServerConfig>>, String> {
     if !listener.listener.protocol.is_tls() {
@@ -54,7 +58,7 @@ pub fn prepare_listener(
                 listener.listener.name
             ));
         };
-        load_certificate(site.id.clone(), &site.host, tls, preparation)?;
+        load_certificate(site.id.clone(), &site.host, tls, acme_config, preparation)?;
         sites.push((site.host.clone(), site.id.clone()));
 
         if let Some(auth) = &tls.client_auth {
@@ -109,6 +113,7 @@ fn load_certificate(
     site: ResourceId,
     host: &HostMatch,
     tls: &SiteTls,
+    acme_config: Option<&gatel_plan::Acme>,
     preparation: &TlsPreparation<'_>,
 ) -> Result<(), String> {
     match &tls.source {
@@ -150,10 +155,38 @@ fn load_certificate(
             }
         }
         CertificateSource::Acme => {
-            return Err(format!(
-                "site `{}` asks for `tls acme`, which this build does not have",
-                host.describe()
-            ));
+            // Normalize already refused a site with no single name.
+            let HostMatch::Exact(name) = host else {
+                return Err(format!(
+                    "site `{}` cannot use `tls acme`: there is no single host to certify",
+                    host.describe()
+                ));
+            };
+            let Some(config) = acme_config else {
+                // `normalize` refuses this, so reaching it means the plan and
+                // the spec disagree.
+                return Err(format!(
+                    "site `{}` asks for `tls acme` with no certificate authority configured",
+                    host.describe()
+                ));
+            };
+            let acme = (preparation.acme)(config)?;
+            // Whatever a previous run obtained, so a restart serves at once.
+            // Nothing is ordered here: an order takes seconds when everything
+            // works and minutes when it does not, and a reload must not wait
+            // for a certificate authority's bad afternoon.
+            if preparation.store.get(&site).is_none() && !acme.adopt(&site, name) {
+                // Deliberately not a placeholder certificate. One this process
+                // signed itself would be a certificate that lies, and teaching
+                // people to click through a warning is worse than a handshake
+                // that fails while readiness says exactly why.
+                tracing::info!(
+                    target: "gatel::certificate",
+                    event = "certificate_pending",
+                    site = %name,
+                    source = "acme",
+                );
+            }
         }
     }
     Ok(())
@@ -237,13 +270,35 @@ mod tests {
         }
 
         fn prepare(&self, listener: &ListenerPlan) -> Result<Option<Arc<ServerConfig>>, String> {
+            self.prepare_with(listener, None)
+        }
+
+        fn prepare_with(
+            &self,
+            listener: &ListenerPlan,
+            acme_config: Option<&gatel_plan::Acme>,
+        ) -> Result<Option<Arc<ServerConfig>>, String> {
             let ca_directory = self.ca_directory.clone();
             let internal = move || InternalCa::load_or_create(&ca_directory).map(Arc::new);
+            let directory = self.directory.clone();
+            let store = Arc::clone(&self.store);
+            let challenges = crate::acme::Challenges::new();
+            let acme = move |config: &gatel_plan::Acme| {
+                crate::acme::Acme::new(
+                    config,
+                    &directory,
+                    Arc::clone(&challenges),
+                    Arc::clone(&store),
+                    gatel_observe::Telemetry::new(),
+                )
+            };
             prepare_listener(
                 listener,
+                acme_config,
                 &TlsPreparation {
                     store: &self.store,
                     internal: &internal,
+                    acme: &acme,
                     root: &self.directory,
                 },
             )
@@ -372,15 +427,75 @@ mod tests {
     }
 
     #[test]
-    fn acme_says_the_build_lacks_it_rather_than_failing_obscurely() {
+    fn acme_prepares_without_reaching_a_certificate_authority() {
+        // A listener whose site has no certificate yet still starts. Ordering
+        // one is background work, and a reload that waited for a certificate
+        // authority would be a reload its bad afternoon could stall.
         let fixture = Fixture::new("acme");
         let tls = SiteTls {
             source: CertificateSource::Acme,
             client_auth: None,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("api.example.com", Some(tls))]);
-        let error = fixture.prepare(&listener).unwrap_err();
-        assert!(error.contains("does not have"), "{error}");
+        let config = acme_config();
+        let prepared = fixture.prepare_with(&listener, Some(&config)).unwrap();
+        assert!(prepared.is_some(), "the listener is ready to accept");
+        assert!(
+            fixture.store.is_empty(),
+            "and has nothing to offer for that name until an order finishes"
+        );
+    }
+
+    #[test]
+    fn acme_without_a_certificate_authority_is_an_inconsistency_not_a_guess() {
+        // `normalize` refuses this, so reaching it means the spec and the plan
+        // disagree — which is worth saying rather than defaulting to a CA.
+        let fixture = Fixture::new("acme-nowhere");
+        let tls = SiteTls {
+            source: CertificateSource::Acme,
+            client_auth: None,
+        };
+        let listener = listener(ListenerProtocol::Https, vec![site("api.example.com", Some(tls))]);
+        let error = fixture.prepare_with(&listener, None).unwrap_err();
+        assert!(error.contains("no certificate authority configured"), "{error}");
+    }
+
+    #[test]
+    fn a_certificate_a_previous_run_obtained_is_served_at_once() {
+        let fixture = Fixture::new("acme-adopt");
+        let config = acme_config();
+        // What a previous run would have left behind.
+        let generated = rcgen::generate_simple_self_signed(vec!["api.example.com".to_string()]).unwrap();
+        let state = fixture.directory.join("acme");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("api.example.com.crt"), generated.cert.pem()).unwrap();
+        std::fs::write(
+            state.join("api.example.com.key"),
+            generated.signing_key.serialize_pem(),
+        )
+        .unwrap();
+
+        let tls = SiteTls {
+            source: CertificateSource::Acme,
+            client_auth: None,
+        };
+        let listener = listener(ListenerProtocol::Https, vec![site("api.example.com", Some(tls))]);
+        fixture.prepare_with(&listener, Some(&config)).unwrap();
+        assert_eq!(
+            fixture.store.len(),
+            1,
+            "a restart serves what it had rather than waiting to be told again"
+        );
+    }
+
+    fn acme_config() -> gatel_plan::Acme {
+        gatel_plan::Acme {
+            directory: "http://127.0.0.1:1/directory".to_string(),
+            email: "ops@example.com".to_string(),
+            agreed: true,
+            directory_path: None,
+            renew_before: std::time::Duration::from_secs(86_400),
+        }
     }
 
     #[test]
