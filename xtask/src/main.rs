@@ -23,7 +23,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("gatel-macros", &["proc-macro2", "quote", "syn", "gatel-model"]),
     ("gatel-kdl", &["gatel-model", "kdl"]),
     // Below everything that can open a socket, so the data plane can write to it.
-    ("gatel-observe", &["gatel-model"]),
+    ("gatel-observe", &["gatel-model", "time"]),
     (
         "gatel-plan",
         // salvo_core is the project's execution vocabulary; hyper, rustls and

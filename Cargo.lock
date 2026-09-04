@@ -730,6 +730,7 @@ name = "gatel-observe"
 version = "2.0.0-alpha.1"
 dependencies = [
  "gatel-model",
+ "time",
 ]
 
 [[package]]

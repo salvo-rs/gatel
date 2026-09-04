@@ -4,39 +4,32 @@
 //! reached the client. Logging there would report a streaming download as
 //! instant and a cancelled one as successful. This directive therefore wraps
 //! the response body and reports when that body ends, fails or is dropped.
+//!
+//! Where the line goes is configuration: standard error for a container, a file
+//! for a machine that keeps its own logs. An access log is not a diagnostic
+//! log, and giving it its own destination is what lets one be shipped without
+//! the other.
 
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use gatel_macros::FromNode;
-use gatel_model::{Code, Diagnostics, FromNode as _, Hasher, Node};
-use gatel_plan::{Directive, DirectiveConfig, DirectiveMeta, Phase, Scopes};
+use gatel_model::{ByteSize, Code, Diagnostic, Diagnostics, FromNode as _, Hasher, Node};
+use gatel_observe::{Format, Outcome, Record, Rotate, Sink};
+use gatel_plan::{BuildContext, Directive, DirectiveConfig, DirectiveMeta, Phase, Scopes};
 use salvo_core::http::{Request, ResBody, Response};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 
-/// How a request ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    /// The body reached its end.
-    Completed,
-    /// The body failed part way through.
-    Failed,
-    /// The client went away, or the response was dropped, before the end.
-    Cancelled,
-}
-
-impl Outcome {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Outcome::Completed => "completed",
-            Outcome::Failed => "body_error",
-            Outcome::Cancelled => "cancelled",
-        }
-    }
-}
+/// What a file grows to before it is rolled, unless the operator says
+/// otherwise.
+///
+/// Not "never": a gateway that fills a disk with its own access log has taken
+/// down the thing it was in front of.
+const DEFAULT_ROTATE: ByteSize = ByteSize(128 * 1024 * 1024);
 
 #[derive(Debug, FromNode)]
 struct Fields {
@@ -46,29 +39,69 @@ struct Fields {
     /// data, and a log is the wrong place for either.
     #[gatel(prop, default = false)]
     query: bool,
+    /// `stderr`, or `file:` and a path relative to the configuration.
+    #[gatel(prop, default = String::from("stderr"))]
+    output: String,
+    /// Roll the file at this size. `0` never rolls, for a machine whose log
+    /// rotation is somebody else's job.
+    #[gatel(prop)]
+    rotate: Option<ByteSize>,
+    #[gatel(prop, default = 4)]
+    keep: u32,
+}
+
+/// Where the lines go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Output {
+    Stderr,
+    File { path: PathBuf, rotate: Rotate },
 }
 
 #[derive(Debug)]
 pub struct Config {
-    json: bool,
+    format: Format,
     query: bool,
+    output: Output,
 }
 
 impl DirectiveConfig for Config {
     fn hash_into(&self, hasher: &mut Hasher) {
-        hasher.update_bool(self.json);
+        hasher.update_str(self.format.as_str());
         hasher.update_bool(self.query);
+        match &self.output {
+            Output::Stderr => {
+                hasher.update_str("stderr");
+            }
+            Output::File { path, rotate } => {
+                hasher.update_str("file");
+                hasher.update_str(&path.display().to_string());
+                hasher.update_u64(rotate.size);
+                hasher.update_u64(rotate.keep as u64);
+            }
+        }
     }
 
-    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, cx: BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
+        // Opened here rather than at the first request, so a path that cannot
+        // be written stops the reload while the previous one still serves.
+        let sink = match &self.output {
+            Output::Stderr => cx.telemetry.sinks.stderr(),
+            Output::File { path, rotate } => cx.telemetry.sinks.file(&cx.root.join(path), *rotate)?,
+        };
         Ok(Arc::new(AccessLogHandler {
-            json: self.json,
+            format: self.format,
             query: self.query,
+            sink,
         }))
     }
 
     fn describe(&self) -> String {
-        format!("access-log {}", if self.json { "json" } else { "text" })
+        match &self.output {
+            Output::Stderr => format!("access-log {}", self.format.as_str()),
+            Output::File { path, .. } => {
+                format!("access-log {} -> {}", self.format.as_str(), path.display())
+            }
+        }
     }
 }
 
@@ -87,31 +120,73 @@ impl Directive for AccessLog {
 
     fn decode(&self, node: &Node, diagnostics: &mut Diagnostics) -> Option<Arc<dyn DirectiveConfig>> {
         let fields = Fields::from_node(node, diagnostics)?;
-        let json = match fields.format.as_str() {
-            "text" => false,
-            "json" => true,
-            other => {
-                diagnostics.push(
-                    gatel_model::Diagnostic::error(
-                        Code::InvalidValue,
-                        node.origin.clone(),
-                        format!("unknown access log format `{other}`"),
-                    )
-                    .with_help("known formats: text, json"),
-                );
-                return None;
-            }
+        let Some(format) = Format::parse(&fields.format) else {
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::InvalidValue,
+                    node.origin.clone(),
+                    format!("unknown access log format `{}`", fields.format),
+                )
+                .with_help(format!("known formats: {}", Format::ALL.join(", "))),
+            );
+            return None;
         };
+        let output = decode_output(&fields, node, diagnostics)?;
         Some(Arc::new(Config {
-            json,
+            format,
             query: fields.query,
+            output,
         }))
     }
 }
 
+fn decode_output(fields: &Fields, node: &Node, diagnostics: &mut Diagnostics) -> Option<Output> {
+    let rotates = fields.rotate.is_some();
+    match fields.output.as_str() {
+        "stderr" => {
+            if rotates {
+                // Standard error is a stream somebody else owns. Accepting a
+                // rotation setting here would be accepting one that does
+                // nothing.
+                diagnostics.push(
+                    Diagnostic::error(
+                        Code::InvalidValue,
+                        node.origin.clone(),
+                        "`rotate` needs a file to rotate",
+                    )
+                    .with_help("write to `file:...`, or let whatever reads stderr rotate it"),
+                );
+                return None;
+            }
+            Some(Output::Stderr)
+        }
+        other => {
+            let Some(path) = other.strip_prefix("file:").filter(|path| !path.is_empty()) else {
+                diagnostics.push(
+                    Diagnostic::error(
+                        Code::InvalidValue,
+                        node.origin.clone(),
+                        format!("unknown access log output `{other}`"),
+                    )
+                    .with_help("`stderr`, or `file:` and a path such as `file:logs/access.log`"),
+                );
+                return None;
+            };
+            Some(Output::File {
+                path: PathBuf::from(path),
+                rotate: Rotate {
+                    size: fields.rotate.unwrap_or(DEFAULT_ROTATE).0,
+                    keep: fields.keep as usize,
+                },
+            })
+        }
+    }
+}
+
 struct AccessLogHandler {
-    json: bool,
+    format: Format,
     query: bool,
+    sink: Arc<Sink>,
 }
 
 #[async_trait]
@@ -124,7 +199,9 @@ impl Handler for AccessLogHandler {
         ctrl: &mut FlowCtrl,
     ) {
         let started = Instant::now();
+        let at = SystemTime::now();
         let method = request.method().to_string();
+        let version = version(request.version());
         let path = if self.query {
             request.uri().path_and_query().map(|value| value.to_string())
         } else {
@@ -134,30 +211,38 @@ impl Handler for AccessLogHandler {
 
         ctrl.call_next(request, depot, response).await;
 
-        let status = response.status_code.map(|code| code.as_u16()).unwrap_or(200);
-        let route = depot.get::<String>("gatel.route").cloned().unwrap_or_default();
-        let record = Record {
-            json: self.json,
-            method,
-            path,
-            status,
-            route,
+        let pending = Pending {
+            format: self.format,
+            sink: Arc::clone(&self.sink),
             started,
+            record: Record {
+                client: depot.get::<std::net::IpAddr>("gatel.client_ip").ok().copied(),
+                method,
+                path,
+                version,
+                status: response.status_code.map(|code| code.as_u16()).unwrap_or(200),
+                bytes: 0,
+                duration: std::time::Duration::ZERO,
+                outcome: Outcome::Completed,
+                site: depot.get::<String>("gatel.site").cloned().unwrap_or_default(),
+                route: depot.get::<String>("gatel.route").cloned().unwrap_or_default(),
+                at,
+            },
         };
 
         // Anything already fully in memory is finished now; a streaming body
         // is not, and gets a wrapper that reports when it really ends.
         match std::mem::take(response.body_mut()) {
             ResBody::None => {
-                record.emit(Outcome::Completed, 0);
+                pending.emit(Outcome::Completed, 0);
                 *response.body_mut() = ResBody::None;
             }
             ResBody::Once(bytes) => {
-                record.emit(Outcome::Completed, bytes.len() as u64);
+                pending.emit(Outcome::Completed, bytes.len() as u64);
                 *response.body_mut() = ResBody::Once(bytes);
             }
             ResBody::Chunks(chunks) => {
-                record.emit(
+                pending.emit(
                     Outcome::Completed,
                     chunks.iter().map(|chunk| chunk.len() as u64).sum(),
                 );
@@ -166,7 +251,7 @@ impl Handler for AccessLogHandler {
             other => {
                 *response.body_mut() = ResBody::Boxed(Box::pin(ObservedBody {
                     inner: other,
-                    record: Some(record),
+                    pending: Some(pending),
                     sent: 0,
                 }));
             }
@@ -174,42 +259,30 @@ impl Handler for AccessLogHandler {
     }
 }
 
-struct Record {
-    json: bool,
-    method: String,
-    path: String,
-    status: u16,
-    route: String,
-    started: Instant,
+const fn version(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "HTTP/0.9",
+        http::Version::HTTP_10 => "HTTP/1.0",
+        http::Version::HTTP_2 => "HTTP/2.0",
+        http::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    }
 }
 
-impl Record {
-    fn emit(&self, outcome: Outcome, bytes: u64) {
-        let duration = self.started.elapsed().as_millis() as u64;
-        if self.json {
-            tracing::info!(
-                target: "gatel::access",
-                event = "request_completed",
-                method = %self.method,
-                path = %self.path,
-                status = self.status,
-                route = %self.route,
-                duration_ms = duration,
-                bytes,
-                outcome = outcome.as_str(),
-            );
-        } else {
-            tracing::info!(
-                target: "gatel::access",
-                "{} {} {} {}ms {}B {}",
-                self.method,
-                self.path,
-                self.status,
-                duration,
-                bytes,
-                outcome.as_str(),
-            );
-        }
+/// A record waiting for the body to end.
+struct Pending {
+    format: Format,
+    sink: Arc<Sink>,
+    started: Instant,
+    record: Record,
+}
+
+impl Pending {
+    fn emit(mut self, outcome: Outcome, bytes: u64) {
+        self.record.outcome = outcome;
+        self.record.bytes = bytes;
+        self.record.duration = self.started.elapsed();
+        self.sink.write(&self.record.render(self.format));
     }
 }
 
@@ -222,15 +295,15 @@ pin_project_lite::pin_project! {
     struct ObservedBody {
         #[pin]
         inner: ResBody,
-        record: Option<Record>,
+        pending: Option<Pending>,
         sent: u64,
     }
 
     impl PinnedDrop for ObservedBody {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
-            if let Some(record) = this.record.take() {
-                record.emit(Outcome::Cancelled, *this.sent);
+            if let Some(pending) = this.pending.take() {
+                pending.emit(Outcome::Cancelled, *this.sent);
             }
         }
     }
@@ -253,14 +326,14 @@ impl http_body::Body for ObservedBody {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
-                if let Some(record) = this.record.take() {
-                    record.emit(Outcome::Failed, *this.sent);
+                if let Some(pending) = this.pending.take() {
+                    pending.emit(Outcome::Failed, *this.sent);
                 }
                 Poll::Ready(Some(Err(Box::new(error) as salvo_core::BoxedError)))
             }
             Poll::Ready(None) => {
-                if let Some(record) = this.record.take() {
-                    record.emit(Outcome::Completed, *this.sent);
+                if let Some(pending) = this.pending.take() {
+                    pending.emit(Outcome::Completed, *this.sent);
                 }
                 Poll::Ready(None)
             }
@@ -287,56 +360,135 @@ mod tests {
         Origin::synthetic("test")
     }
 
+    fn node(pairs: &[(&str, Value)]) -> Node {
+        let mut node = Node::new("access-log", origin());
+        for (name, value) in pairs {
+            node = node.with_prop(*name, value.clone());
+        }
+        node
+    }
+
     fn decode(node: Node) -> (Option<Arc<dyn DirectiveConfig>>, Diagnostics) {
         let mut diagnostics = Diagnostics::new();
         let config = AccessLog.decode(&node, &mut diagnostics);
         (config, diagnostics)
     }
 
+    fn string(value: &str) -> Value {
+        Value::string(value, origin())
+    }
+
     #[test]
-    fn the_default_is_text_without_the_query_string() {
-        let (config, diagnostics) = decode(Node::new("access-log", origin()));
-        assert!(!diagnostics.has_errors(), "{diagnostics}");
+    fn the_default_is_text_on_standard_error() {
+        let (config, diagnostics) = decode(node(&[]));
+        assert!(!diagnostics.has_errors());
         assert_eq!(config.unwrap().describe(), "access-log text");
     }
 
     #[test]
-    fn an_unknown_format_lists_the_known_ones() {
-        let node = Node::new("access-log", origin()).with_prop("format", Value::string("xml", origin()));
-        let (config, diagnostics) = decode(node);
+    fn all_three_formats_are_accepted() {
+        for name in Format::ALL {
+            let (config, diagnostics) = decode(node(&[("format", string(name))]));
+            assert!(!diagnostics.has_errors(), "{name}");
+            assert!(config.unwrap().describe().contains(name));
+        }
+    }
+
+    #[test]
+    fn an_unknown_format_lists_the_ones_that_exist() {
+        let (config, diagnostics) = decode(node(&[("format", string("combined"))]));
         assert!(config.is_none());
+        let help = diagnostics.iter().next().unwrap().help.clone().unwrap();
+        assert!(help.contains("text") && help.contains("clf"), "{help}");
+    }
+
+    #[test]
+    fn a_file_output_names_its_path() {
+        let (config, diagnostics) = decode(node(&[("output", string("file:logs/access.log"))]));
+        assert!(!diagnostics.has_errors());
+        assert!(config.unwrap().describe().contains("logs/access.log"));
+    }
+
+    #[test]
+    fn a_file_rolls_by_default_rather_than_filling_a_disk() {
+        let (config, _) = decode(node(&[("output", string("file:a.log"))]));
+        let mut hasher = Hasher::new();
+        config.unwrap().hash_into(&mut hasher);
+        let (explicit, _) = decode(node(&[
+            ("output", string("file:a.log")),
+            ("rotate", Value::string("128MiB", origin())),
+        ]));
+        let mut other = Hasher::new();
+        explicit.unwrap().hash_into(&mut other);
         assert_eq!(
-            diagnostics.iter().next().unwrap().help.as_deref(),
-            Some("known formats: text, json")
+            hasher.finish(),
+            other.finish(),
+            "the default has to be a real size, not none"
         );
     }
 
     #[test]
-    fn logging_the_query_string_has_to_be_asked_for() {
-        let (config, _) = decode(Node::new("access-log", origin()));
-        let mut with_query = Hasher::new();
-        let mut without_query = Hasher::new();
-        config.unwrap().hash_into(&mut without_query);
-        decode(Node::new("access-log", origin()).with_prop("query", Value::bool(true, origin())))
-            .0
+    fn rotating_standard_error_is_refused_rather_than_ignored() {
+        let (config, diagnostics) = decode(node(&[("rotate", string("10MB"))]));
+        assert!(config.is_none());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("needs a file to rotate"))
+        );
+    }
+
+    #[test]
+    fn an_unknown_output_says_what_the_two_shapes_are() {
+        let (config, diagnostics) = decode(node(&[("output", string("syslog"))]));
+        assert!(config.is_none());
+        let help = diagnostics.iter().next().unwrap().help.clone().unwrap();
+        assert!(help.contains("stderr") && help.contains("file:"), "{help}");
+    }
+
+    #[test]
+    fn an_empty_path_is_not_a_file() {
+        let (config, _) = decode(node(&[("output", string("file:"))]));
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn changing_where_lines_go_changes_the_plan() {
+        let hash = |pairs: &[(&str, Value)]| {
+            let mut hasher = Hasher::new();
+            decode(node(pairs)).0.unwrap().hash_into(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(hash(&[]), hash(&[("output", string("file:a.log"))]));
+        assert_ne!(
+            hash(&[("output", string("file:a.log"))]),
+            hash(&[("output", string("file:b.log"))])
+        );
+        assert_ne!(hash(&[]), hash(&[("format", string("clf"))]));
+    }
+
+    #[test]
+    fn a_file_is_opened_during_prepare_so_a_bad_path_stops_the_reload() {
+        let directory = std::env::temp_dir().join("gatel-access-log-refuse");
+        let _ = std::fs::create_dir_all(&directory);
+        // The path names a directory, which cannot be appended to.
+        let (config, _) = decode(node(&[("output", string("file:."))]));
+        let error = config
             .unwrap()
-            .hash_into(&mut with_query);
-        assert_ne!(with_query.finish(), without_query.finish());
+            .build(BuildContext {
+                root: &directory,
+                state: None,
+                telemetry: crate::testing::telemetry(),
+            })
+            .err()
+            .expect("appending to a directory cannot work");
+        assert!(error.contains("cannot write"), "{error}");
     }
 
     #[test]
-    fn it_observes_and_never_rejects() {
-        assert_eq!(AccessLog.meta().failure_policy, gatel_plan::FailurePolicy::Open);
-        assert_eq!(
-            AccessLog.meta().role,
-            gatel_plan::Role::Middleware(Phase::Observe)
-        );
-    }
-
-    #[test]
-    fn outcomes_have_stable_names() {
-        assert_eq!(Outcome::Completed.as_str(), "completed");
-        assert_eq!(Outcome::Failed.as_str(), "body_error");
-        assert_eq!(Outcome::Cancelled.as_str(), "cancelled");
+    fn http_versions_are_named_the_way_a_log_reader_expects() {
+        assert_eq!(version(http::Version::HTTP_11), "HTTP/1.1");
+        assert_eq!(version(http::Version::HTTP_2), "HTTP/2.0");
+        assert_eq!(version(http::Version::HTTP_10), "HTTP/1.0");
     }
 }

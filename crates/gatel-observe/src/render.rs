@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 
+use crate::Telemetry;
 use crate::instrument::{BOUNDS, Histogram};
 use crate::metrics::{Attempt, Class, Condition, Metrics, Reload};
 use crate::series::Labels;
@@ -16,13 +17,36 @@ pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Render every metric, in a fixed order, so two scrapes of an unchanged
 /// process produce identical bytes.
-pub fn prometheus(metrics: &Metrics) -> String {
+pub fn prometheus(telemetry: &Telemetry) -> String {
+    let metrics = &telemetry.metrics;
     let mut out = String::with_capacity(4096);
     process(metrics, &mut out);
     listeners(metrics, &mut out);
     routes(metrics, &mut out);
     upstreams(metrics, &mut out);
+    sinks(telemetry, &mut out);
     out
+}
+
+const SINK: &[&str] = &["sink"];
+
+fn sinks(telemetry: &Telemetry, out: &mut String) {
+    family(
+        out,
+        "gatel_log_lines_dropped_total",
+        "Log lines a full queue could not take. A request is never delayed for one.",
+        "counter",
+    );
+    for sink in telemetry.sinks.snapshot() {
+        point(
+            out,
+            "gatel_log_lines_dropped_total",
+            SINK,
+            &vec![sink.name().to_string()],
+            &[],
+            sink.dropped(),
+        );
+    }
 }
 
 fn process(metrics: &Metrics, out: &mut String) {
@@ -409,13 +433,18 @@ mod tests {
 
     use super::*;
 
+    fn telemetry() -> Telemetry {
+        Telemetry::default()
+    }
+
     #[test]
     fn a_counter_carries_its_series_labels_and_its_own() {
-        let metrics = Metrics::new();
+        let telemetry = telemetry();
+        let metrics = &telemetry.metrics;
         metrics
             .route("example.com", "api")
             .completed(200, Duration::ZERO, 0);
-        let text = prometheus(&metrics);
+        let text = prometheus(&telemetry);
         assert!(
             text.contains("gatel_requests_total{site=\"example.com\",route=\"api\",class=\"2xx\"} 1"),
             "{text}"
@@ -424,10 +453,11 @@ mod tests {
 
     #[test]
     fn a_family_is_declared_once_with_its_type() {
-        let metrics = Metrics::new();
+        let telemetry = telemetry();
+        let metrics = &telemetry.metrics;
         metrics.route("a", "one");
         metrics.route("b", "two");
-        let text = prometheus(&metrics);
+        let text = prometheus(&telemetry);
         assert_eq!(
             text.matches("# TYPE gatel_requests_total counter").count(),
             1,
@@ -437,11 +467,12 @@ mod tests {
 
     #[test]
     fn a_histogram_ends_with_inf_sum_and_count() {
-        let metrics = Metrics::new();
+        let telemetry = telemetry();
+        let metrics = &telemetry.metrics;
         metrics
             .route("*", "api")
             .completed(200, Duration::from_millis(20), 0);
-        let text = prometheus(&metrics);
+        let text = prometheus(&telemetry);
         assert!(text.contains("le=\"0.001\"} 0"), "{text}");
         assert!(text.contains("le=\"0.025\"} 1"), "{text}");
         assert!(text.contains("le=\"+Inf\"} 1"), "{text}");
@@ -451,37 +482,41 @@ mod tests {
 
     #[test]
     fn a_label_value_cannot_break_out_of_its_quotes() {
-        let metrics = Metrics::new();
+        let telemetry = telemetry();
+        let metrics = &telemetry.metrics;
         metrics.route("evil\"} fake_metric 1 #", "api");
-        let text = prometheus(&metrics);
+        let text = prometheus(&telemetry);
         assert!(text.contains("site=\"evil\\\"} fake_metric 1 #\""), "{text}");
         assert!(!text.contains("\nfake_metric"), "{text}");
     }
 
     #[test]
     fn an_unlabelled_metric_has_no_braces() {
-        let metrics = Metrics::new();
+        let telemetry = telemetry();
+        let metrics = &telemetry.metrics;
         metrics.process.generation.set(3);
-        assert!(prometheus(&metrics).contains("\ngatel_generation 3\n"));
+        assert!(prometheus(&telemetry).contains("\ngatel_generation 3\n"));
     }
 
     #[test]
     fn two_scrapes_of_an_unchanged_process_agree() {
-        let metrics = Metrics::new();
+        let telemetry = telemetry();
+        let metrics = &telemetry.metrics;
         metrics.route("b", "two");
         metrics.route("a", "one");
         metrics.upstream("api");
         metrics.listener("http");
-        assert_eq!(prometheus(&metrics), prometheus(&metrics));
+        assert_eq!(prometheus(&telemetry), prometheus(&telemetry));
     }
 
     #[test]
     fn every_family_is_declared_before_it_is_used() {
-        let metrics = Metrics::new();
+        let telemetry = telemetry();
+        let metrics = &telemetry.metrics;
         metrics.route("*", "api");
         metrics.upstream("api");
         metrics.listener("http");
-        let text = prometheus(&metrics);
+        let text = prometheus(&telemetry);
         let mut declared = std::collections::HashSet::new();
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("# TYPE ") {

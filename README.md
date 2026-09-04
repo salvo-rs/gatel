@@ -84,7 +84,7 @@ error[unknown-property]: `balance "round_robin"` has no property `header`
 | TLS | manual PEM certificates, SNI, mutual TLS, and a built-in development authority with `gatel trust` |
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
 | Directives | `respond`, `redirect`, `file-server`, `rewrite`, `headers`, `encode`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `metrics`, `health` |
-| Observability | Prometheus metrics whose label set is the size of the configuration, and readiness that distinguishes what is wrong from what a restart would fix |
+| Observability | Prometheus metrics whose label set is the size of the configuration, an access log in text/JSON/CLF to stderr or a rolled file, and readiness that distinguishes what is wrong from what a restart would fix |
 | Tooling | `validate`, `explain`, `diff`, `capabilities`, `trust` |
 
 Not yet: ACME, caching, forward authentication, the admin API, tracing,

@@ -165,7 +165,16 @@ every rate wrong precisely when someone is watching a deploy.
 
 A request is counted where its **body ends**, not where the handler returned —
 otherwise a streaming download reads as instant, a cancelled one as a success,
-and a compressed body at its uncompressed size.
+and a compressed body at its uncompressed size. The access log records the same
+moment for the same reason, in `text`, `json` or `clf`.
+
+An access log is not a diagnostic log, so it has its own destination — standard
+error, or a file that is opened during prepare and rolled by size. An open file
+is a process resource like a socket: two generations that log to the same path
+share one appender, so they cannot interleave half-written lines or rotate out
+from under each other. Writing happens on its own thread behind a bounded queue,
+and a full queue drops lines and counts them, because nothing on the request
+path may wait for a disk.
 
 Readiness distinguishes two kinds of problem, because they call for opposite
 responses:

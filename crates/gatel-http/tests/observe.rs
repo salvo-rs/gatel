@@ -263,3 +263,74 @@ site "*" {{
     let refused = get(gateway.address(), "/metrics").await;
     assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
 }
+
+#[tokio::test]
+async fn an_access_log_writes_the_common_log_format_to_a_file() {
+    let gateway = Gateway::new("access-log-file");
+    let port = free_port();
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{
+    access-log format="clf" output="file:access.log"
+    route "/hello" id="hello" {{ respond "hi\n" }}
+}}
+"#
+        ))
+        .await;
+
+    get(gateway.address(), "/hello").await;
+
+    let path = gateway.directory.join("access.log");
+    let line = read_eventually(&path).await;
+    // `client - - [date] "GET /hello HTTP/1.1" 200 3`
+    assert!(line.contains(r#""GET /hello HTTP/1.1" 200 3"#), "{line}");
+    assert!(line.starts_with("127.0.0.1 - - ["), "{line}");
+}
+
+#[tokio::test]
+async fn an_access_log_file_that_cannot_be_opened_stops_the_reload() {
+    let gateway = Gateway::new("access-log-refuse");
+    let port = free_port();
+    let good = format!(
+        r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{ route "/" id="root" {{ respond "ok\n" }} }}
+"#
+    );
+    gateway.apply(&good).await;
+
+    // The path names the configuration directory, which cannot be appended to.
+    let outcome = gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{
+    access-log output="file:."
+    route "/" id="root" {{ respond "ok\n" }}
+}}
+"#
+        ))
+        .await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::PrepareFailed(_)),
+        "opening the file belongs to prepare, not to the first request: {outcome:?}"
+    );
+    // The previous generation is untouched.
+    assert!(get(gateway.address(), "/").await.contains("ok"));
+}
+
+/// The writer flushes on a timer, so a test reads the file when it is there
+/// rather than guessing how long that takes.
+async fn read_eventually(path: &std::path::Path) -> String {
+    for _ in 0..60 {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && !text.is_empty()
+        {
+            return text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("nothing was written to {}", path.display());
+}

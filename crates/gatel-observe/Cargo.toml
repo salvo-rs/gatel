@@ -9,3 +9,5 @@ repository.workspace = true
 
 [dependencies]
 gatel-model.workspace = true
+
+time.workspace = true

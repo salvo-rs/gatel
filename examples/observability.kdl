@@ -11,7 +11,13 @@ global {
 }
 
 site "*" id="app" listener="public" {
-    access-log
+    // `clf` for the tooling that already parses it, `json` for a pipeline,
+    // `text` for a person. The file is opened when the configuration is
+    // applied, so a path that cannot be written stops the reload rather than
+    // failing at the first request — and it is rolled at 128MB by default,
+    // because a gateway that fills a disk with its own log has taken down the
+    // thing it was in front of.
+    access-log format="clf" output="file:logs/access.log" rotate="256MiB" keep=7
     route "/*" id="hello" {
         respond "hello\n"
     }

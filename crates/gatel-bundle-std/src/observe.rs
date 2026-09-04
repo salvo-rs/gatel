@@ -62,7 +62,7 @@ impl Handler for MetricsHandler {
         response: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
-        let body = gatel_observe::prometheus(&self.telemetry.metrics);
+        let body = gatel_observe::prometheus(&self.telemetry);
         response
             .add_header(http::header::CONTENT_TYPE, gatel_observe::CONTENT_TYPE, true)
             .ok();
