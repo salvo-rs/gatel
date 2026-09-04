@@ -877,3 +877,78 @@ fn writing_it_out_and_having_it_inferred_are_the_same_request() {
     let written = spec(&LOCAL.replace("site \"localhost\" {", "site \"localhost\" {\n    tls internal"));
     assert_eq!(inferred.fingerprint(), written.fingerprint());
 }
+
+// ---------------------------------------------------------------------------
+// One problem, one message
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_backend_named_rather_than_addressed_says_so_once() {
+    // The reason used to be reported after the three errors it caused, so the
+    // reader saw the cascade first and the cause last.
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+site "*" { route "/" { proxy "api.example.com:8080" } }
+"#,
+    );
+    assert_eq!(
+        diagnostics.iter().count(),
+        1,
+        "one cause, one message:\n{diagnostics}"
+    );
+    let only = diagnostics.iter().next().unwrap();
+    assert!(only.message.contains("is not a numeric `address:port`"));
+    assert!(
+        only.help
+            .as_deref()
+            .is_some_and(|help| help.contains("not resolved yet")),
+        "the question this always raises next has to be answered: {:?}",
+        only.help
+    );
+}
+
+#[test]
+fn a_route_whose_only_directive_was_refused_is_not_also_told_it_has_none() {
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+site "*" { route "/" { respondd "hi" } }
+"#,
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("nothing to answer with")),
+        "the terminal already said why:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn an_upstream_whose_endpoints_were_refused_is_not_also_told_it_has_none() {
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+upstream "api" { endpoint "nonsense" }
+site "*" { route "/" { proxy upstream="api" } }
+"#,
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("at least one `endpoint`")),
+        "each refused endpoint already said why:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn a_site_with_genuinely_no_routes_is_still_told() {
+    // The suppression must not swallow the real case.
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+site "*" { }
+"#,
+    );
+    assert!(diagnostics.iter().any(|d| d.message.contains("has no routes")));
+}

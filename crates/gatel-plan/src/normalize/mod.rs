@@ -243,7 +243,10 @@ impl Context<'_> {
             }
         }
 
-        if routes.is_empty() {
+        // Only when nothing else already explained why. A site whose only
+        // route was refused has one problem, not two, and the reader should be
+        // looking at the first.
+        if routes.is_empty() && self.diagnostics.error_count() == errors_before {
             self.diagnostics.push(
                 Diagnostic::error(
                     Code::MissingField,
@@ -372,6 +375,9 @@ impl Context<'_> {
 
         let terminal = match terminals.len() {
             1 => terminals.pop().map(|(terminal, _)| terminal)?,
+            // A terminal that failed to decode already said why, and saying
+            // there is none on top of that buries the reason.
+            0 if self.diagnostics.error_count() > errors_before => return None,
             0 => {
                 self.diagnostics.push(
                     Diagnostic::error(

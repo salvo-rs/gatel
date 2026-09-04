@@ -21,6 +21,7 @@ pub fn decode_upstream_body(
     let errors_before = diagnostics.error_count();
     let mut endpoints: Vec<Endpoint> = Vec::new();
 
+    let declared = node.children_named("endpoint").count();
     for child in node.children_named("endpoint") {
         let Some(decoded) = EndpointNode::from_node(child, diagnostics) else {
             continue;
@@ -28,7 +29,15 @@ pub fn decode_upstream_body(
         let address = match gatel_model::parse_socket_addr(&decoded.address) {
             Ok(address) => address,
             Err(message) => {
-                diagnostics.error(Code::InvalidValue, child.args[0].origin.clone(), message);
+                let mut diagnostic =
+                    gatel_model::Diagnostic::error(Code::InvalidValue, child.args[0].origin.clone(), message);
+                // The question this always raises next.
+                if decoded.address.split(':').next().is_some_and(is_name) {
+                    diagnostic = diagnostic.with_help(
+                        "host names are not resolved yet: give the address, and if the backend speaks TLS put its name in `tls server-name=`",
+                    );
+                }
+                diagnostics.push(diagnostic);
                 continue;
             }
         };
@@ -61,7 +70,9 @@ pub fn decode_upstream_body(
         });
     }
 
-    if endpoints.is_empty() {
+    // Only when none were written. Endpoints that were written and refused
+    // have already said why, one message each.
+    if endpoints.is_empty() && declared == 0 {
         diagnostics.push(
             gatel_model::Diagnostic::error(
                 Code::MissingField,
@@ -420,4 +431,16 @@ pub fn anonymous_upstream_id(route: &ResourceId, addresses: &[String]) -> Resour
     let mut key = vec![route.name()];
     key.extend(parts);
     ResourceId::derived(ResourceKind::Upstream, &key)
+}
+
+/// Whether this looks like a host name rather than a typo of an address.
+///
+/// Only used to decide whether to explain the limitation, so being generous
+/// costs nothing: the message is help on an error that is already correct.
+fn is_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.parse::<std::net::IpAddr>().is_err()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '.')
 }
