@@ -26,7 +26,7 @@ struct LimitsNode {
     #[gatel(prop)]
     body: Option<ByteSize>,
     #[gatel(prop)]
-    header_timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
     #[gatel(prop)]
     idle: Option<Duration>,
     #[gatel(prop)]
@@ -97,7 +97,7 @@ impl Context<'_> {
                         global.limits = Limits {
                             max_header: decoded.header.unwrap_or(base.max_header),
                             max_body: decoded.body.unwrap_or(base.max_body),
-                            header_timeout: decoded.header_timeout.unwrap_or(base.header_timeout),
+                            handshake_timeout: decoded.handshake_timeout.unwrap_or(base.handshake_timeout),
                             idle_timeout: decoded.idle.unwrap_or(base.idle_timeout),
                             max_connections: decoded.connections.unwrap_or(base.max_connections),
                         };

@@ -5,7 +5,11 @@ global {
     // Only a peer inside these networks may tell us the client's address.
     trusted-proxy "10.0.0.0/8"
 
-    limits header="16KiB" body="16MiB" header-timeout="10s" idle="60s" connections=10000
+    // Each of these is applied to a real connection, not just recorded.
+    // `idle` covers both a keep-alive connection waiting for its next request
+    // and a client dribbling a head out one byte at a time, because from the
+    // socket those are the same thing.
+    limits header="16KiB" body="16MiB" handshake-timeout="10s" idle="60s" connections=10000
 }
 
 upstream "api" {

@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use gatel_plan::{Committed, GenerationStore};
 use gatel_tls::TlsAcceptor;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use salvo_core::ConnCtrl;
 use salvo_core::http::uri::Scheme;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::bind::BindTable;
 use crate::prepare::Runtime;
@@ -35,6 +35,10 @@ pub struct Server {
     store: Arc<Store>,
     binds: Arc<BindTable>,
     tasks: tokio::sync::Mutex<BTreeMap<SocketAddr, AcceptTask>>,
+    /// The process-wide connection cap. One count across every listener,
+    /// because file descriptors and memory are the process's, not an address's.
+    slots: Arc<Semaphore>,
+    granted: std::sync::atomic::AtomicU32,
 }
 
 impl Server {
@@ -43,6 +47,33 @@ impl Server {
             store,
             binds,
             tasks: tokio::sync::Mutex::new(BTreeMap::new()),
+            slots: Arc::new(Semaphore::new(0)),
+            granted: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Move the connection cap to what the committed generation asks for.
+    ///
+    /// Lowering it never closes anything: the connections already open keep
+    /// their slots and the cap takes effect as they end, because dropping a
+    /// live request to satisfy a number an operator just typed would be a
+    /// worse surprise than being briefly over it.
+    fn set_capacity(&self, wanted: u32) {
+        use std::sync::atomic::Ordering;
+        let granted = self.granted.load(Ordering::Relaxed);
+        match wanted.cmp(&granted) {
+            std::cmp::Ordering::Greater => {
+                self.slots.add_permits((wanted - granted) as usize);
+                self.granted.store(wanted, Ordering::Relaxed);
+            }
+            std::cmp::Ordering::Less => {
+                // Only what is free can be taken back; the rest is taken back
+                // as connections close, because a permit is not returned to a
+                // semaphore that has forgotten it.
+                let removed = self.slots.forget_permits((granted - wanted) as usize);
+                self.granted.store(granted - removed as u32, Ordering::Relaxed);
+            }
+            std::cmp::Ordering::Equal => {}
         }
     }
 
@@ -56,6 +87,7 @@ impl Server {
             return;
         };
         let wanted = committed.runtime.addresses();
+        self.set_capacity(committed.runtime.limits.max_connections);
 
         let mut tasks = self.tasks.lock().await;
         for address in &wanted {
@@ -68,7 +100,8 @@ impl Server {
             let (stop, stopped) = watch::channel(false);
             let store = Arc::clone(&self.store);
             let address = *address;
-            let handle = tokio::spawn(accept_loop(listener, address, store, stopped));
+            let slots = Arc::clone(&self.slots);
+            let handle = tokio::spawn(accept_loop(listener, address, store, slots, stopped));
             tasks.insert(address, AcceptTask { stop, handle });
             tracing::info!(target: "gatel::listener", event = "listener_started", %address);
         }
@@ -109,10 +142,23 @@ async fn accept_loop(
     listener: Arc<TcpListener>,
     address: SocketAddr,
     store: Arc<Store>,
+    slots: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
 ) {
     let graceful = GracefulShutdown::new();
     loop {
+        // The slot is taken before accepting rather than after. A connection
+        // accepted and then closed has already cost a handshake and told the
+        // client it was welcome; leaving it in the backlog costs nothing and
+        // lets a load balancer notice.
+        let slot = tokio::select! {
+            _ = stop.changed() => break,
+            slot = Arc::clone(&slots).acquire_owned() => match slot {
+                Ok(slot) => slot,
+                // The semaphore is only closed when the process is going down.
+                Err(_) => break,
+            },
+        };
         let accepted = tokio::select! {
             _ = stop.changed() => break,
             accepted = listener.accept() => accepted,
@@ -141,7 +187,7 @@ async fn accept_loop(
         let _ = stream.set_nodelay(true);
         let watcher = graceful.watcher();
         tokio::spawn(async move {
-            serve_connection(stream, peer, address, runtime, committed, watcher).await;
+            serve_connection(stream, peer, address, runtime, committed, watcher, slot).await;
         });
     }
 
@@ -159,8 +205,10 @@ async fn serve_connection(
     runtime: Arc<crate::prepare::ListenerRuntime>,
     generation: Arc<Committed<Arc<Runtime>>>,
     watcher: hyper_util::server::graceful::Watcher,
+    // Held for the life of the connection: dropping it is what frees the slot.
+    _slot: OwnedSemaphorePermit,
 ) {
-    let handshake_deadline = generation.runtime.limits.header_timeout;
+    let limits = &generation.runtime.limits;
     let metrics = Arc::clone(&runtime.metrics);
     metrics.connections_total.increment();
     metrics.connections_active.increment();
@@ -177,7 +225,20 @@ async fn serve_connection(
         runtime
             .service
             .hyper_handler(local.into(), peer.into(), scheme, None, ConnCtrl::new(), None);
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    // What the head may cost, and how long a connection may go without one
+    // arriving. The second covers a keep-alive connection waiting for its next
+    // request and a client dribbling a head out a byte at a time, because from
+    // the socket those are the same thing.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.idle_timeout)
+        .max_buf_size(max_buf_size(limits.max_header.bytes()));
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .max_header_list_size(limits.max_header.bytes().min(u32::MAX as u64) as u32);
 
     // A client that opens a connection and never finishes the handshake must
     // not hold a slot: the deadline that bounds a slow request head bounds
@@ -190,7 +251,7 @@ async fn serve_connection(
         }
         Some(config) => {
             let acceptor = TlsAcceptor::from(Arc::clone(config));
-            match tokio::time::timeout(handshake_deadline, acceptor.accept(stream)).await {
+            match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream)).await {
                 Ok(Ok(stream)) => {
                     metrics.handshakes_ok.increment();
                     let connection =
@@ -216,7 +277,7 @@ async fn serve_connection(
                         target: "gatel::connection",
                         event = "tls_handshake_timeout",
                         %peer,
-                        after = ?handshake_deadline,
+                        after = ?limits.handshake_timeout,
                     );
                     return;
                 }
@@ -227,6 +288,13 @@ async fn serve_connection(
     if let Err(error) = result {
         tracing::debug!(target: "gatel::connection", event = "connection_closed", %peer, %error);
     }
+}
+
+/// Hyper reads a head into this buffer, so it bounds the head — but it also has
+/// to be big enough for hyper to make progress at all.
+fn max_buf_size(max_header: u64) -> usize {
+    const FLOOR: u64 = 8192;
+    max_header.clamp(FLOOR, usize::MAX as u64) as usize
 }
 
 /// Holds the active-connection gauge up for as long as the connection lives.

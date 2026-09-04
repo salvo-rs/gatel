@@ -173,6 +173,7 @@ pub fn prepare(
             sites,
             tls: listener_plan.listener.protocol.is_tls(),
             trusted_proxies: plan.spec.global.trusted_proxies.clone(),
+            max_body: plan.spec.global.limits.max_body.bytes(),
             metrics: Arc::clone(&listener_metrics),
         };
 

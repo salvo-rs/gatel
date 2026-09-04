@@ -640,11 +640,20 @@ fn global_limits_are_configuration_not_constants() {
         r#"
 global {
     http ":8080"
-    limits header="8KiB" body="1MiB" header-timeout="5s" idle="30s" connections=500
+    limits header="8KiB" body="1MiB" handshake-timeout="5s" idle="30s" connections=500
 }
 site "*" { route "/" { respond "hi" } }
 "#,
     );
+    assert_eq!(spec.global.limits.max_header, gatel_model::ByteSize::kib(8));
     assert_eq!(spec.global.limits.max_body, gatel_model::ByteSize::mib(1));
+    assert_eq!(
+        spec.global.limits.handshake_timeout,
+        std::time::Duration::from_secs(5)
+    );
+    assert_eq!(
+        spec.global.limits.idle_timeout,
+        std::time::Duration::from_secs(30)
+    );
     assert_eq!(spec.global.limits.max_connections, 500);
 }

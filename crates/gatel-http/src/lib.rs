@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bind;
+pub mod body;
 pub mod dispatch;
 pub mod measure;
 pub mod prepare;

@@ -190,6 +190,32 @@ rotation. Liveness answers yes as long as it can answer at all — a liveness
 probe that fails on a downstream condition restarts a process that was working,
 usually across every replica at once.
 
+## Limits that bite
+
+Every field in `global { limits ... }` maps to something a connection actually
+experiences, because a bound that is written down and not applied is worse than
+one that was never offered.
+
+| | What it bounds | How |
+|---|---|---|
+| `header` | the request head | hyper's read buffer for HTTP/1, `max_header_list_size` for HTTP/2 |
+| `body` | the request body | refused before reading when the length is declared, cut off mid-stream when it is not |
+| `handshake-timeout` | a TLS handshake | a deadline around the accept |
+| `idle` | a connection with no complete head | hyper's header read timeout |
+| `connections` | the whole process | a permit taken before `accept`, held for the connection |
+
+`idle` covers two things with one number on purpose. A keep-alive connection
+waiting for its next request and a client dribbling a head out one byte at a
+time are the same thing seen from the socket, and separating them would mean
+knowing which the peer intends.
+
+The connection cap is taken *before* accepting rather than after. A connection
+accepted and then closed has already cost a handshake and told the client it was
+welcome; one left in the backlog costs nothing and lets a load balancer notice.
+Lowering the cap never closes anything that is already open — it takes effect as
+connections end, because dropping a live request to satisfy a number somebody
+just typed is a worse surprise than being briefly over it.
+
 ## Why `proxy` is in the kernel
 
 Endpoint selection, health, connection reuse and retry are one correctness

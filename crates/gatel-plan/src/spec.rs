@@ -207,12 +207,21 @@ impl Site {
 /// with a default rather than a constant compiled into the data plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
+    /// The largest request head that will be read, in bytes.
     pub max_header: ByteSize,
+    /// The largest request body that will be accepted.
     pub max_body: ByteSize,
-    /// How long a client may take to send a complete request head.
-    pub header_timeout: Duration,
-    /// How long an idle keep-alive connection is kept.
+    /// How long a TLS handshake may take. A plaintext listener has none.
+    pub handshake_timeout: Duration,
+    /// How long a connection may go without a complete request head arriving.
+    ///
+    /// One number covers two things that look identical from the socket: a
+    /// keep-alive connection waiting for its next request, and a client
+    /// dribbling a head out one byte at a time. Splitting them would need to
+    /// know which the peer intends, which nothing does.
     pub idle_timeout: Duration,
+    /// How many connections the process will hold open at once, across every
+    /// listener.
     pub max_connections: u32,
 }
 
@@ -221,7 +230,7 @@ impl Default for Limits {
         Self {
             max_header: ByteSize::kib(64),
             max_body: ByteSize::mib(16),
-            header_timeout: Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(60),
             max_connections: 10_000,
         }
@@ -232,7 +241,7 @@ impl Limits {
     pub fn hash_into(&self, hasher: &mut Hasher) {
         hasher.update_u64(self.max_header.bytes());
         hasher.update_u64(self.max_body.bytes());
-        hasher.update_duration(self.header_timeout);
+        hasher.update_duration(self.handshake_timeout);
         hasher.update_duration(self.idle_timeout);
         hasher.update_u64(self.max_connections as u64);
     }

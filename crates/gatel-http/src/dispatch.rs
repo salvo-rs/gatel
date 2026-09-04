@@ -64,6 +64,8 @@ pub struct Dispatcher {
     pub tls: bool,
     /// Networks whose forwarding headers are believed.
     pub trusted_proxies: Vec<(IpAddr, u8)>,
+    /// The largest request body anything behind this listener will read.
+    pub max_body: u64,
     pub metrics: Arc<ListenerMetrics>,
 }
 
@@ -241,6 +243,20 @@ impl Handler for Dispatcher {
         }
         depot.insert("gatel.tls", self.tls);
 
+        // Before routing, because the limit belongs to the listener rather than
+        // to whichever route happens to claim the request, and because a client
+        // that declared too much should be told so without reading a byte.
+        if let crate::body::Declared::TooLarge(declared) = crate::body::limit(request, self.max_body) {
+            self.metrics.unmatched_requests.increment();
+            response.status_code(StatusCode::PAYLOAD_TOO_LARGE);
+            let _ = response.write_body(format!(
+                "413 request body of {declared} bytes is larger than the {} byte limit
+",
+                self.max_body
+            ));
+            return;
+        }
+
         let (chain, measure) = match self.resolve(request) {
             Ok((site, route)) => {
                 depot.insert("gatel.site", site.id.name().to_string());
@@ -309,6 +325,7 @@ mod tests {
             sites,
             tls: false,
             trusted_proxies: Vec::new(),
+            max_body: u64::MAX,
             metrics: Arc::new(ListenerMetrics::default()),
         }
     }
@@ -484,6 +501,7 @@ mod tests {
         );
 
         let trusting = Dispatcher {
+            max_body: u64::MAX,
             metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,
@@ -500,6 +518,7 @@ mod tests {
             .unwrap()
             .into();
         let trusting = Dispatcher {
+            max_body: u64::MAX,
             metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,
@@ -524,6 +543,7 @@ mod tests {
             .unwrap()
             .into();
         let trusting = Dispatcher {
+            max_body: u64::MAX,
             metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,

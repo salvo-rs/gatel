@@ -85,6 +85,7 @@ error[unknown-property]: `balance "round_robin"` has no property `header`
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
 | Directives | `respond`, `redirect`, `file-server`, `rewrite`, `headers`, `encode`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `metrics`, `health` |
 | Observability | Prometheus metrics whose label set is the size of the configuration, an access log in text/JSON/CLF to stderr or a rolled file, and readiness that distinguishes what is wrong from what a restart would fix |
+| Limits | request head and body size, TLS handshake and idle-connection timeouts, and a process-wide connection cap — each applied, not just declared |
 | Tooling | `validate`, `explain`, `diff`, `capabilities`, `trust` |
 
 Not yet: ACME, caching, forward authentication, the admin API, tracing,
