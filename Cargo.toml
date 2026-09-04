@@ -1,121 +1,84 @@
 [workspace]
-members = ["crates/gatel", "crates/core", "crates/passwd", "crates/precompress"]
 resolver = "3"
+members = [
+    "crates/gatel",
+    "crates/gatel-model",
+    "crates/gatel-macros",
+    "crates/gatel-kdl",
+    "crates/gatel-plan",
+    "crates/gatel-state",
+    "crates/gatel-http",
+    "crates/gatel-tls",
+    "crates/gatel-bundle-std",
+    "crates/gatel-observe",
+    "crates/gatel-testkit",
+    "xtask",
+]
 
 [workspace.package]
-version = "0.1.4"
+version = "2.0.0-alpha.1"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-description = "A high-performance, KDL-configured reverse proxy and web server"
 repository = "https://github.com/salvo-rs/gatel"
 homepage = "https://github.com/salvo-rs/gatel"
 readme = "README.md"
 
 [workspace.dependencies]
-gatel-core = { version = "0.1.0", path = "crates/core" }
-tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = [
-    "tokio",
-    "server-auto",
-    "client-legacy",
-    "http1",
-    "http2",
-] }
+gatel-model = { version = "2.0.0-alpha.1", path = "crates/gatel-model" }
+gatel-macros = { version = "2.0.0-alpha.1", path = "crates/gatel-macros" }
+gatel-kdl = { version = "2.0.0-alpha.1", path = "crates/gatel-kdl" }
+gatel-plan = { version = "2.0.0-alpha.1", path = "crates/gatel-plan" }
+gatel-state = { version = "2.0.0-alpha.1", path = "crates/gatel-state" }
+gatel-http = { version = "2.0.0-alpha.1", path = "crates/gatel-http" }
+gatel-tls = { version = "2.0.0-alpha.1", path = "crates/gatel-tls" }
+gatel-bundle-std = { version = "2.0.0-alpha.1", path = "crates/gatel-bundle-std" }
+gatel-observe = { version = "2.0.0-alpha.1", path = "crates/gatel-observe" }
+gatel-testkit = { version = "2.0.0-alpha.1", path = "crates/gatel-testkit" }
+
+blake3 = "1.8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-bytes = "1"
-tokio-rustls = { version = "0.26", default-features = false, features = [
-    "logging",
-    "ring",
-] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+kdl = "6"
+notify = "8"
+pin-project-lite = "0.2"
+proc-macro2 = "1"
+quote = "1"
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "logging",
     "std",
     "tls12",
 ] }
-hyper-rustls = { version = "0.27", default-features = false, features = [
-    "ring",
-    "http1",
-    "http2",
-    "logging",
-    "webpki-roots",
-] }
-certon = { version = "0.2.1" }
-rcgen = { version = "0.14", default-features = false, features = [
-    "pem",
-    "x509-parser",
-    "ring",
-] }
-time = "0.3"
-dirs = "6"
-kdl = "6"
-glob = "0.3"
-arc-swap = "1"
-clap = { version = "4", features = ["derive"] }
-clap_complete = "4"
-clap_mangen = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-thiserror = "2"
+rustls-pemfile = "2"
+salvo_core = { version = "0.96", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-async-compression = { version = "0.4", features = [
-    "tokio",
-    "gzip",
-    "zstd",
-    "brotli",
-    "deflate",
+syn = { version = "2", features = ["full", "extra-traits"] }
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
 ] }
-pin-project-lite = "0.2"
-futures-util = "0.3"
-async-trait = "0.1"
-reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
-    "json",
-    "query",
-] }
-h3 = { version = "0.0.8", features = ["tracing"] }
-h3-quinn = { version = "0.0.10", features = ["tracing"] }
-quinn = { version = "0.11", default-features = false, features = [
-    "rustls-ring",
-    "runtime-tokio",
-] }
-anyhow = "1"
-bcrypt = "0.19"
-flate2 = "1"
-brotli = "8"
-zstd = "0.13"
-rand = "0.10"
-dashmap = "6"
-regex = "1"
-mimalloc = { version = "0.1", default-features = false }
-argon2 = "0.5"
-scrypt = { version = "0.12", features = ["phc"] }
-pbkdf2 = { version = "0.12", features = ["simple"] }
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
-tracing-opentelemetry = "0.33"
-hickory-resolver = { version = "0.26", features = ["tokio"] }
-salvo = { version = "0.95.0", default-features = false, features = [
-    "fix-http1-request-uri",
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
     "logging",
-    "serve-static",
-    "compression",
-    "cors",
-    "timeout",
-    "request-id",
-    "force-https",
-    "trailing-slash",
+    "tls12",
 ] }
-tempfile = "3"
-tower-service = "0.3"
-windows-service = "0.8"
-schannel = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [profile.release]
 lto = true

@@ -15,4 +15,4 @@ use_try_shorthand = true
 imports_granularity = "Module"
 group_imports = "StdExternalCrate"
 
-ignore = ["src/proto/src/generated/*.rs"]
+max_width = 110

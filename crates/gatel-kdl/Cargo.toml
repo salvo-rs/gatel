@@ -1,0 +1,12 @@
+[package]
+name = "gatel-kdl"
+description = "The KDL file frontend for Gatel: text to format-neutral snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gatel-model.workspace = true
+kdl.workspace = true

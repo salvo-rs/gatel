@@ -1,4 +1,0 @@
-"*:8080" {
-    root "/srv/www"
-    compressed #false
-}
