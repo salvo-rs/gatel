@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access_log;
+pub mod file_server;
 pub mod headers;
 pub mod ip_filter;
 pub mod rate_limit;
@@ -28,6 +29,7 @@ pub fn bundle() -> Bundle {
         .with(request_id::RequestId)
         .with(ip_filter::IpFilter)
         .with(rate_limit::RateLimit)
+        .with(file_server::FileServerDirective)
 }
 
 #[cfg(test)]
@@ -44,6 +46,7 @@ mod tests {
             names,
             [
                 "access-log",
+                "file-server",
                 "headers",
                 "ip-filter",
                 "rate-limit",
@@ -61,7 +64,7 @@ mod tests {
             .names()
             .filter(|name| registry.get(name).unwrap().meta().role == Role::Terminal)
             .collect();
-        assert_eq!(terminals, ["redirect", "respond"]);
+        assert_eq!(terminals, ["file-server", "redirect", "respond"]);
     }
 
     #[test]

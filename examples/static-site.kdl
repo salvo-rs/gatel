@@ -1,0 +1,31 @@
+// A static site with an API behind the same host.
+global {
+    http ":8080"
+    limits body="8MiB"
+}
+
+site "*" {
+    access-log
+    request-id
+
+    // More specific paths win regardless of the order they are written in, so
+    // the catch-all below never shadows these.
+    route "/api/*" {
+        proxy "127.0.0.1:9000"
+    }
+
+    route "/assets/*" {
+        headers {
+            response {
+                set "cache-control" "public, max-age=31536000, immutable"
+            }
+        }
+        // Serves `app.js.br` or `app.js.gz` when the client accepts it and the
+        // file is already on disk. Nothing is compressed at request time.
+        file-server root="/var/www/site" precompressed=#true
+    }
+
+    route "/*" {
+        file-server root="/var/www/site" index="index.html"
+    }
+}
