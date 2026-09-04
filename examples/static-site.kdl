@@ -35,6 +35,9 @@ site "*" {
     }
 
     route "/*" {
+        // Range requests are answered, and anything past a small threshold is
+        // streamed off disk rather than read into memory — so one client
+        // downloading a large file costs a buffer, not the file.
         file-server root="/var/www/site" index="index.html"
     }
 }

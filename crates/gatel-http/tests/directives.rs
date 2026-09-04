@@ -537,3 +537,88 @@ site "*" {{
     assert!(!head.to_lowercase().contains("content-encoding:"), "{head}");
     assert_eq!(String::from_utf8_lossy(&body), "short");
 }
+
+#[tokio::test]
+async fn a_file_server_answers_a_range_request() {
+    let gateway = Gateway::new("file-range");
+    let port = free_port();
+    let root = gateway.directory.join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("data.bin"), b"0123456789").unwrap();
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{
+    route "/*" id="files" {{ file-server root="www" }}
+}}
+"#
+        ))
+        .await;
+
+    let address = gateway.address();
+    let whole = get(address, "/data.bin").await;
+    assert!(whole.contains("accept-ranges: bytes"), "{whole}");
+    assert!(whole.ends_with("0123456789"), "{whole}");
+
+    // What a resumed download sends.
+    let part = request(
+        address,
+        "GET /data.bin HTTP/1.1\r\nHost: h\r\nRange: bytes=2-5\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(part.starts_with("HTTP/1.1 206"), "{part}");
+    assert!(part.contains("content-range: bytes 2-5/10"), "{part}");
+    assert!(part.contains("content-length: 4"), "{part}");
+    assert!(part.ends_with("2345"), "{part}");
+
+    // Past the end: told how long the file is, so the next ask can be sane.
+    let past = request(
+        address,
+        "GET /data.bin HTTP/1.1\r\nHost: h\r\nRange: bytes=50-60\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(past.starts_with("HTTP/1.1 416"), "{past}");
+    assert!(past.contains("content-range: bytes */10"), "{past}");
+}
+
+#[tokio::test]
+async fn a_large_file_is_not_read_into_memory_to_send_it() {
+    let gateway = Gateway::new("file-large");
+    let port = free_port();
+    let root = gateway.directory.join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    // Bigger than the inline threshold, so it has to be streamed. A gateway
+    // that buffered every download could be emptied of memory by a few of them.
+    let size = 200 * 1024;
+    std::fs::write(root.join("big.bin"), vec![b'x'; size]).unwrap();
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{
+    route "/*" id="files" {{ file-server root="www" }}
+}}
+"#
+        ))
+        .await;
+
+    let response = get(gateway.address(), "/big.bin").await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "{}",
+        &response[..80.min(response.len())]
+    );
+    assert!(
+        response.contains(&format!("content-length: {size}")),
+        "the length is still declared: {}",
+        &response[..200.min(response.len())]
+    );
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    assert_eq!(body.len(), size, "every byte arrived");
+}

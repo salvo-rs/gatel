@@ -19,6 +19,7 @@ pub mod force_https;
 pub mod headers;
 pub mod ip_filter;
 pub mod observe;
+pub mod ranges;
 pub mod rate_limit;
 pub mod redirect;
 pub mod request_id;

@@ -281,27 +281,44 @@ impl Handler for FileServer {
 
         if request.method() == http::Method::HEAD {
             response.status_code(StatusCode::OK);
+            response.headers_mut().insert(
+                http::header::ACCEPT_RANGES,
+                http::HeaderValue::from_static("bytes"),
+            );
             return;
         }
 
-        match tokio::fs::read(&source).await {
-            Ok(bytes) => {
-                response.status_code(StatusCode::OK);
-                let _ = response.write_body(bytes);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "gatel::file",
-                    event = "read_failed",
-                    file = %source.display(),
-                    %error,
-                );
-                crate::generated(depot);
-                response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                let _ = response.write_body("500 could not read the file\n");
-            }
+        let size = match tokio::fs::metadata(&source).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) => return unreadable(&source, &error, depot, response),
+        };
+        // A range names bytes of the representation being sent, and a
+        // precompressed variant is a different representation with different
+        // offsets. Rather than reason about that, the whole thing is sent —
+        // which a server may always do.
+        let wanted = if encoding.is_some() {
+            crate::ranges::Wanted::Whole
+        } else {
+            crate::ranges::wanted(request, size, &tag)
+        };
+
+        if let Err(error) = crate::ranges::deliver(response, &source, size, wanted).await {
+            unreadable(&source, &error, depot, response);
         }
     }
+}
+
+/// The file was there a moment ago and cannot be read now.
+fn unreadable(source: &std::path::Path, error: &std::io::Error, depot: &mut Depot, response: &mut Response) {
+    tracing::warn!(
+        target: "gatel::file",
+        event = "read_failed",
+        file = %source.display(),
+        %error,
+    );
+    crate::generated(depot);
+    response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+    let _ = response.write_body("500 could not read the file\n");
 }
 
 /// Turn a request path into a relative path, or refuse it.

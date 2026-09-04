@@ -242,33 +242,39 @@ impl Drop for Gateway {
     }
 }
 
-/// A port nothing is using, and that this process has not already claimed.
+/// A port nothing is using, and that nothing else in this test run will take.
 ///
-/// Binding and releasing is the only way to ask the operating system for one,
-/// and it will hand the same one out again a moment later — so tests running in
-/// parallel would collide. Remembering what was given out removes that, which
-/// is the collision that actually happens.
+/// Asking the operating system for a free port hands the same one out again a
+/// moment later, and each test binary is its own process with its own memory of
+/// what it claimed — so two of them racing would collide, which is exactly the
+/// intermittent failure that is worth not having. Each process therefore works
+/// through a window of its own, derived from its id, and still checks that each
+/// port is actually free before using it.
 pub fn free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::atomic::{AtomicU16, Ordering};
 
-    static CLAIMED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-    let claimed = CLAIMED.get_or_init(|| Mutex::new(HashSet::new()));
-    for _ in 0..64 {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if claimed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(port)
-        {
+    const WINDOWS: u16 = 400;
+    const PER_WINDOW: u16 = 100;
+    const BASE: u16 = 20_000;
+
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let window = (std::process::id() as u16) % WINDOWS;
+    let start = BASE + window * PER_WINDOW;
+
+    for _ in 0..PER_WINDOW {
+        let offset = NEXT.fetch_add(1, Ordering::Relaxed) % PER_WINDOW;
+        let port = start + offset;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
-    panic!("no free port after 64 attempts");
+    // Every port in this window is busy, which means something else is using
+    // them. Fall back to asking rather than failing the test.
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// A minimal HTTP/1.1 client: raw enough that the test depends on the wire,

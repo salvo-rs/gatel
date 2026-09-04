@@ -90,6 +90,7 @@ carries; it is the same list, generated rather than written down.
 |---|---|---|---|
 | `respond`, `redirect` | yes | done | unit tests in each module |
 | `file-server` — containment, symlinks, ETag, conditional requests, precompressed | yes | done | `gatel-bundle-std/src/file_server.rs`, `gatel-http/tests/directives.rs` |
+| `file-server` — range requests, and large files streamed rather than buffered | yes | done | `gatel-bundle-std/src/ranges.rs`, `gatel-http/tests/directives.rs` |
 | `headers` | yes | done | unit tests; framing headers are protected |
 | `encode` — gzip, brotli, zstd, deflate, streaming, `Vary`, minimum size | yes | done | `gatel-bundle-std/src/encode.rs`, `tests/directives.rs` |
 | `rewrite` | yes | done | unit tests; runs after the guards |
