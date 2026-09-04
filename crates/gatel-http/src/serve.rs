@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use gatel_plan::{Committed, GenerationStore};
+use gatel_tls::TlsAcceptor;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -156,20 +157,64 @@ async fn serve_connection(
     peer: SocketAddr,
     local: SocketAddr,
     runtime: Arc<crate::prepare::ListenerRuntime>,
-    _generation: Arc<Committed<Arc<Runtime>>>,
+    generation: Arc<Committed<Arc<Runtime>>>,
     watcher: hyper_util::server::graceful::Watcher,
 ) {
-    let scheme = if runtime.tls { Scheme::HTTPS } else { Scheme::HTTP };
+    let handshake_deadline = generation.runtime.limits.header_timeout;
+    let scheme = if runtime.is_tls() {
+        Scheme::HTTPS
+    } else {
+        Scheme::HTTP
+    };
     let handler =
         runtime
             .service
             .hyper_handler(local.into(), peer.into(), scheme, None, ConnCtrl::new(), None);
-
     let builder = auto::Builder::new(TokioExecutor::new());
-    let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), handler);
-    let connection = watcher.watch(connection);
 
-    if let Err(error) = connection.await {
+    // A client that opens a connection and never finishes the handshake must
+    // not hold a slot: the deadline that bounds a slow request head bounds
+    // this too.
+    let result = match &runtime.tls {
+        None => {
+            let connection =
+                watcher.watch(builder.serve_connection_with_upgrades(TokioIo::new(stream), handler));
+            connection.await.map_err(|error| error.to_string())
+        }
+        Some(config) => {
+            let acceptor = TlsAcceptor::from(Arc::clone(config));
+            match tokio::time::timeout(handshake_deadline, acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => {
+                    let connection =
+                        watcher.watch(builder.serve_connection_with_upgrades(TokioIo::new(stream), handler));
+                    connection.await.map_err(|error| error.to_string())
+                }
+                Ok(Err(error)) => {
+                    // A failed handshake is ordinary on a public port — a
+                    // scanner, a wrong name, an old client — so it is not a
+                    // warning, but it is worth being able to see.
+                    tracing::debug!(
+                        target: "gatel::connection",
+                        event = "tls_handshake_failed",
+                        %peer,
+                        %error,
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        target: "gatel::connection",
+                        event = "tls_handshake_timeout",
+                        %peer,
+                        after = ?handshake_deadline,
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    if let Err(error) = result {
         tracing::debug!(target: "gatel::connection", event = "connection_closed", %peer, %error);
     }
 }

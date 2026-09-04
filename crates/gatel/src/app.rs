@@ -3,10 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gatel_http::{BindTable, Runtime, Server, prepare};
+use gatel_http::{BindTable, Resources, Runtime, Server, prepare};
 use gatel_model::{Diagnostics, Snapshot, SourceId, SourceSnapshot};
 use gatel_plan::{GenerationStore, Outcome, Registry};
-use gatel_state::StateRegistry;
+use gatel_state::{StateRegistry, Supervisor};
+use gatel_tls::{CertificateStore, InternalCa};
 
 /// Everything the process owns across generations.
 pub struct App {
@@ -15,6 +16,12 @@ pub struct App {
     pub binds: Arc<BindTable>,
     pub state: Arc<StateRegistry>,
     pub server: Arc<Server>,
+    /// Background workers. Reconciled after a commit, never before: a
+    /// candidate that fails must not have started anything.
+    pub supervisor: Arc<Supervisor>,
+    /// Certificates outlive generations: a renewal is not a configuration
+    /// change and must not produce one.
+    pub certificates: Arc<CertificateStore>,
     pub root: PathBuf,
     source: SourceId,
     /// The last snapshot, so an unchanged file keeps its revision.
@@ -33,6 +40,8 @@ impl App {
             binds,
             state: Arc::new(StateRegistry::new()),
             server,
+            supervisor: Arc::new(Supervisor::new()),
+            certificates: Arc::new(CertificateStore::new()),
             root,
             source: SourceId::file("main"),
             previous: std::sync::Mutex::new(None),
@@ -55,8 +64,19 @@ impl App {
         };
         let binds = Arc::clone(&self.binds);
         let state = Arc::clone(&self.state);
+        let certificates = Arc::clone(&self.certificates);
+        let root = self.root_directory().to_path_buf();
         self.store.attempt(&snapshot, &self.registry, move |preparation| {
-            prepare(&preparation, &binds, &state)
+            prepare(
+                &preparation,
+                &Resources {
+                    binds: &binds,
+                    state: &state,
+                    certificates: &certificates,
+                    root: &root,
+                    internal_ca: InternalCa::default_directory(),
+                },
+            )
         })
     }
 
@@ -65,6 +85,41 @@ impl App {
         let snapshot = self.observe()?;
         let spec = gatel_plan::normalize(&snapshot, &self.registry)?;
         Ok(Arc::new(gatel_plan::compile(Arc::new(spec), &self.registry)))
+    }
+
+    /// Bring background workers and accept loops in line with the generation
+    /// that was just committed, and release the state nothing needs any more.
+    pub async fn activate(&self) {
+        let Some(committed) = self.store.current() else {
+            return;
+        };
+        self.server.sync().await;
+        self.supervisor.reconcile(&committed.runtime.upstreams).await;
+        // Only after the new generation is live: anything still held by a
+        // draining request keeps working, it is simply no longer findable.
+        for retired in self.state.retain(&committed.plan.bindings) {
+            tracing::debug!(target: "gatel::runtime", event = "state_retired", state = %retired);
+        }
+        let sites: Vec<gatel_model::ResourceId> = committed
+            .plan
+            .spec
+            .sites
+            .iter()
+            .map(|site| site.id.clone())
+            .collect();
+        for forgotten in self.certificates.retain(&sites) {
+            tracing::debug!(
+                target: "gatel::certificate",
+                event = "certificate_forgotten",
+                site = forgotten.name(),
+            );
+        }
+    }
+
+    /// Stop accepting, stop probing, and let what is in flight finish.
+    pub async fn shutdown(&self) {
+        self.server.shutdown().await;
+        self.supervisor.shutdown().await;
     }
 
     /// Every file the configuration tree touched, so a watcher knows what to

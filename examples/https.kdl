@@ -1,0 +1,31 @@
+// HTTPS with the built-in development authority.
+//
+// The first run generates a certificate authority under the user data
+// directory and issues a short-lived certificate for the site. Run
+// `gatel trust` once to make this machine accept it.
+global {
+    http "plain" ":80"
+    https "secure" ":443"
+}
+
+site "app.localhost" listener="secure" {
+    access-log
+    tls internal
+    route "/*" { respond "served over TLS\n" }
+}
+
+// A production site names its own certificate files instead. They are
+// referenced, never inlined, and are loaded during a reload rather than on the
+// first handshake.
+site "api.example.com" listener="secure" {
+    tls cert="certs/api.pem" key="certs/api-key.pem"
+
+    // Ask for a client certificate, and verify it against this authority.
+    // `optional` would still verify one that is offered.
+    route "/*" { proxy "10.0.1.1:8080" }
+}
+
+// Everything on the plaintext port is pointed at the secure one.
+site "*" listener="plain" {
+    route "/*" { redirect "https://app.localhost/" }
+}

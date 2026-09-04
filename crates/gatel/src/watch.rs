@@ -85,7 +85,7 @@ pub async fn reload_once(app: &Arc<App>) -> Outcome {
     match &outcome {
         Outcome::NoOp { .. } => {}
         Outcome::Started { generation } | Outcome::Reloaded { generation, .. } => {
-            app.server.sync().await;
+            app.activate().await;
             tracing::info!(
                 target: "gatel::config",
                 event = "config_committed",

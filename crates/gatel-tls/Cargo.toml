@@ -1,0 +1,21 @@
+[package]
+name = "gatel-tls"
+description = "Gatel's TLS transport, certificate store and development certificate authority"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gatel-model.workspace = true
+gatel-plan.workspace = true
+
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true

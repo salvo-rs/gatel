@@ -19,6 +19,7 @@ gatel-kdl.workspace = true
 gatel-model.workspace = true
 gatel-plan.workspace = true
 gatel-state.workspace = true
+gatel-tls.workspace = true
 
 clap.workspace = true
 notify.workspace = true

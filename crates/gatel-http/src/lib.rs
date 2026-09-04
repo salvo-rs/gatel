@@ -16,6 +16,6 @@ pub mod serve;
 
 pub use bind::BindTable;
 pub use dispatch::{Dispatcher, NoRoute, PreparedRoute, PreparedSite, request_host};
-pub use prepare::{ListenerRuntime, Runtime, prepare};
+pub use prepare::{ListenerRuntime, Resources, Runtime, prepare};
 pub use proxy::ProxyTerminal;
 pub use serve::{Server, Store};

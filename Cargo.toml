@@ -8,6 +8,7 @@ members = [
     "crates/gatel-plan",
     "crates/gatel-state",
     "crates/gatel-http",
+    "crates/gatel-tls",
     "crates/gatel-bundle-std",
     "xtask",
 ]
@@ -28,6 +29,7 @@ gatel-kdl = { version = "2.0.0-alpha.1", path = "crates/gatel-kdl" }
 gatel-plan = { version = "2.0.0-alpha.1", path = "crates/gatel-plan" }
 gatel-state = { version = "2.0.0-alpha.1", path = "crates/gatel-state" }
 gatel-http = { version = "2.0.0-alpha.1", path = "crates/gatel-http" }
+gatel-tls = { version = "2.0.0-alpha.1", path = "crates/gatel-tls" }
 gatel-bundle-std = { version = "2.0.0-alpha.1", path = "crates/gatel-bundle-std" }
 
 blake3 = "1.8"
@@ -51,6 +53,8 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
 ] }
 rustls-pemfile = "2"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+webpki-roots = "1"
 salvo_core = { version = "0.96", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -66,6 +70,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+time = { version = "0.3", default-features = false, features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "logging",

@@ -10,12 +10,16 @@
 
 pub mod endpoint;
 pub mod pool;
+pub mod probe;
 pub mod registry;
 pub mod selector;
+pub mod supervisor;
 pub mod upstream;
 
 pub use endpoint::{Endpoint, EndpointSet, Health, InFlight, probe_delay};
 pub use pool::{Body, BoxError, CheckoutError, ConnectionPool, Lease, PoolStats};
+pub use probe::probe;
 pub use registry::{Resolution, StateKey, StateRegistry};
 pub use selector::{RequestKey, Selection, SelectorState, select};
+pub use supervisor::Supervisor;
 pub use upstream::{UpstreamResolution, UpstreamRuntime, UpstreamRuntimes};

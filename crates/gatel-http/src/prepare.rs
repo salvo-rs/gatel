@@ -7,22 +7,43 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use gatel_plan::{Limits, Plan, Preparation, Terminal};
 use gatel_state::{StateRegistry, UpstreamRuntimes};
+use gatel_tls::{CertificateStore, InternalCa, ServerConfig, TlsPreparation};
 use salvo_core::{Router, Service};
 
 use crate::bind::BindTable;
 use crate::dispatch::{Dispatcher, PreparedRoute, PreparedSite};
 
+/// What preparation is allowed to touch: everything that outlives a generation.
+pub struct Resources<'a> {
+    pub binds: &'a BindTable,
+    pub state: &'a StateRegistry,
+    pub certificates: &'a Arc<CertificateStore>,
+    /// The directory `file:` references resolve against.
+    pub root: &'a Path,
+    /// Where the development authority lives, if a site asks for one.
+    pub internal_ca: PathBuf,
+}
+
 /// One listener, ready to serve.
 pub struct ListenerRuntime {
     pub name: String,
     pub bind: SocketAddr,
-    pub tls: bool,
+    /// Present exactly when this listener terminates TLS. Immutable for the
+    /// life of the generation; the certificates it resolves are not.
+    pub tls: Option<Arc<ServerConfig>>,
     pub service: Arc<Service>,
+}
+
+impl ListenerRuntime {
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
 }
 
 impl std::fmt::Debug for ListenerRuntime {
@@ -30,7 +51,7 @@ impl std::fmt::Debug for ListenerRuntime {
         f.debug_struct("ListenerRuntime")
             .field("name", &self.name)
             .field("bind", &self.bind)
-            .field("tls", &self.tls)
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
@@ -53,8 +74,7 @@ impl Runtime {
 /// Build a runtime for a candidate plan.
 pub fn prepare(
     preparation: &Preparation<'_, Arc<Runtime>>,
-    binds: &BindTable,
-    state: &StateRegistry,
+    resources: &Resources<'_>,
 ) -> Result<Arc<Runtime>, String> {
     let plan: &Arc<Plan> = preparation.plan;
 
@@ -65,9 +85,9 @@ pub fn prepare(
         .iter()
         .map(|listener| listener.listener.bind)
         .collect();
-    binds.ensure(&wanted)?;
+    resources.binds.ensure(&wanted)?;
 
-    let (upstreams, resolutions) = UpstreamRuntimes::resolve(plan, state);
+    let (upstreams, resolutions) = UpstreamRuntimes::resolve(plan, resources.state);
     let upstreams = Arc::new(upstreams);
     for (id, resolution) in &resolutions {
         if !resolution.all_reused() {
@@ -83,8 +103,22 @@ pub fn prepare(
         }
     }
 
+    let internal_ca_directory = resources.internal_ca.clone();
+    let internal = move || InternalCa::load_or_create(&internal_ca_directory).map(Arc::new);
+
     let mut listeners = BTreeMap::new();
     for listener_plan in &plan.listeners {
+        // Certificates load here, so a bad one stops the reload rather than
+        // breaking the first handshake after it.
+        let tls = gatel_tls::prepare_listener(
+            listener_plan,
+            &TlsPreparation {
+                store: resources.certificates,
+                internal: &internal,
+                root: resources.root,
+            },
+        )?;
+
         let mut sites = Vec::with_capacity(listener_plan.sites.len());
         for site in &listener_plan.sites {
             let mut routes = Vec::with_capacity(site.routes.len());
@@ -127,7 +161,7 @@ pub fn prepare(
             Arc::new(ListenerRuntime {
                 name: listener_plan.listener.name.clone(),
                 bind: listener_plan.listener.bind,
-                tls: listener_plan.listener.protocol.is_tls(),
+                tls,
                 service: Arc::new(Service::new(root_router(dispatcher))),
             }),
         );

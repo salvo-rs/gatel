@@ -8,6 +8,7 @@
 
 mod app;
 mod explain;
+mod trust;
 mod watch;
 
 use std::path::PathBuf;
@@ -58,6 +59,20 @@ enum Command {
     Diff { before: PathBuf, after: PathBuf },
     /// List the directives this build contains.
     Capabilities,
+    /// Trust the development certificate authority on this machine.
+    ///
+    /// Only needed for `tls internal`. It changes what every program here
+    /// believes, which is why it is a separate step.
+    Trust {
+        /// Where the authority lives, if not the default location.
+        #[arg(long)]
+        directory: Option<PathBuf>,
+    },
+    /// Stop trusting the development certificate authority.
+    Untrust {
+        #[arg(long)]
+        directory: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -70,6 +85,31 @@ fn main() -> ExitCode {
         Command::Explain { config } => explain(config),
         Command::Diff { before, after } => diff(before, after),
         Command::Capabilities => capabilities(),
+        Command::Trust { directory } => trust(directory, true),
+        Command::Untrust { directory } => trust(directory, false),
+    }
+}
+
+fn trust(directory: Option<PathBuf>, install: bool) -> ExitCode {
+    let outcome = if install {
+        trust::install(directory.as_deref())
+    } else {
+        trust::remove(directory.as_deref())
+    };
+    match outcome {
+        Ok(trust::Outcome::Installed { store, path }) => {
+            println!("installed {path} into {store}");
+            println!("browsers already running may need a restart to notice");
+            ExitCode::SUCCESS
+        }
+        Ok(trust::Outcome::Removed { store }) => {
+            println!("removed the development authority from {store}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gatel: {error}");
+            ExitCode::from(RUNTIME_FAILURE)
+        }
     }
 }
 
@@ -212,7 +252,7 @@ fn run(config: PathBuf, dry_run: bool) -> ExitCode {
 
         match app.attempt() {
             Outcome::Started { generation } => {
-                app.server.sync().await;
+                app.activate().await;
                 for address in app.server.active_addresses().await {
                     tracing::info!(target: "gatel::listener", event = "serving", %address);
                 }
@@ -234,7 +274,7 @@ fn run(config: PathBuf, dry_run: bool) -> ExitCode {
         }
 
         if dry_run {
-            app.server.shutdown().await;
+            app.shutdown().await;
             println!("ok: bound and ready, exiting because of --dry-run");
             return ExitCode::SUCCESS;
         }
@@ -242,7 +282,7 @@ fn run(config: PathBuf, dry_run: bool) -> ExitCode {
         watch::reload_on_change(Arc::clone(&app)).await;
 
         tracing::info!(target: "gatel::process", event = "shutdown_started");
-        app.server.shutdown().await;
+        app.shutdown().await;
         tracing::info!(target: "gatel::process", event = "shutdown_complete");
         ExitCode::SUCCESS
     })
