@@ -51,10 +51,13 @@ impl DirectiveConfig for Config {
         hasher.update_bool(self.precompressed);
     }
 
-    fn build(&self, _cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
+    fn build(&self, cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         // Resolve the root once, here, so every request compares against a
-        // path that is already canonical.
-        let root = std::fs::canonicalize(&self.root)
+        // path that is already canonical. A relative path is relative to the
+        // configuration, like every other path in it — otherwise the same file
+        // would mean different things depending on where the process was
+        // started from.
+        let root = std::fs::canonicalize(cx.root.join(&self.root))
             .map_err(|error| format!("cannot serve from `{}`: {error}", self.root.display()))?;
         if !root.is_dir() {
             return Err(format!("`{}` is not a directory", self.root.display()));
@@ -691,5 +694,31 @@ mod tests {
     #[test]
     fn it_is_a_terminal() {
         assert_eq!(FileServerDirective.meta().role, gatel_plan::Role::Terminal);
+    }
+    #[test]
+    fn a_relative_root_is_relative_to_the_configuration() {
+        // Not to wherever the process happened to be started, or the same file
+        // would mean different things in a shell and under a service manager.
+        let directory = std::env::temp_dir().join("gatel-file-server-relative");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("www")).unwrap();
+        std::fs::write(directory.join("www/index.html"), "hello").unwrap();
+
+        let node = Node::new("file-server", origin()).with_prop("root", Value::string("www", origin()));
+        let mut diagnostics = Diagnostics::new();
+        let config = FileServerDirective
+            .decode(&node, &mut diagnostics)
+            .expect("the configuration is valid");
+        assert!(
+            config
+                .build(gatel_plan::BuildContext {
+                    root: &directory,
+                    state: None,
+                    telemetry: crate::testing::telemetry(),
+                })
+                .is_ok(),
+            "the root is `www` under the configuration, not under the current directory"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
