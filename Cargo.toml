@@ -6,6 +6,7 @@ members = [
     "crates/gatel-macros",
     "crates/gatel-kdl",
     "crates/gatel-plan",
+    "crates/gatel-observe",
     "crates/gatel-state",
     "crates/gatel-http",
     "crates/gatel-tls",
@@ -27,6 +28,7 @@ gatel-model = { version = "2.0.0-alpha.1", path = "crates/gatel-model" }
 gatel-macros = { version = "2.0.0-alpha.1", path = "crates/gatel-macros" }
 gatel-kdl = { version = "2.0.0-alpha.1", path = "crates/gatel-kdl" }
 gatel-plan = { version = "2.0.0-alpha.1", path = "crates/gatel-plan" }
+gatel-observe = { version = "2.0.0-alpha.1", path = "crates/gatel-observe" }
 gatel-state = { version = "2.0.0-alpha.1", path = "crates/gatel-state" }
 gatel-http = { version = "2.0.0-alpha.1", path = "crates/gatel-http" }
 gatel-tls = { version = "2.0.0-alpha.1", path = "crates/gatel-tls" }

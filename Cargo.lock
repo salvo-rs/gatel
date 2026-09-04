@@ -641,6 +641,7 @@ dependencies = [
  "gatel-http",
  "gatel-kdl",
  "gatel-model",
+ "gatel-observe",
  "gatel-plan",
  "gatel-state",
  "gatel-tls",
@@ -660,6 +661,7 @@ dependencies = [
  "futures-util",
  "gatel-macros",
  "gatel-model",
+ "gatel-observe",
  "gatel-plan",
  "http",
  "http-body",
@@ -682,6 +684,7 @@ dependencies = [
  "gatel-bundle-std",
  "gatel-kdl",
  "gatel-model",
+ "gatel-observe",
  "gatel-plan",
  "gatel-state",
  "gatel-tls",
@@ -723,12 +726,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gatel-observe"
+version = "2.0.0-alpha.1"
+dependencies = [
+ "gatel-model",
+]
+
+[[package]]
 name = "gatel-plan"
 version = "2.0.0-alpha.1"
 dependencies = [
  "gatel-kdl",
  "gatel-macros",
  "gatel-model",
+ "gatel-observe",
  "salvo_core",
 ]
 
@@ -739,6 +750,7 @@ dependencies = [
  "bytes",
  "gatel-kdl",
  "gatel-model",
+ "gatel-observe",
  "gatel-plan",
  "http",
  "http-body-util",

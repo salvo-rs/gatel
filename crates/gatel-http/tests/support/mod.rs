@@ -25,6 +25,7 @@ pub struct Gateway {
     pub binds: Arc<BindTable>,
     pub state: Arc<StateRegistry>,
     pub certificates: Arc<gatel_tls::CertificateStore>,
+    pub telemetry: Arc<gatel_observe::Telemetry>,
     pub server: Arc<Server>,
     pub registry: Registry,
     pub directory: PathBuf,
@@ -50,6 +51,7 @@ impl Gateway {
             binds,
             state: Arc::new(StateRegistry::new()),
             certificates: Arc::new(gatel_tls::CertificateStore::new()),
+            telemetry: gatel_observe::Telemetry::new(),
             registry: Registry::builder()
                 .bundle(gatel_bundle_std::bundle())
                 .build()
@@ -77,12 +79,17 @@ impl Gateway {
         );
         let snapshot = match source {
             Ok(source) => Snapshot::new().with(source),
-            Err(diagnostics) => return Outcome::Rejected(diagnostics),
+            Err(diagnostics) => {
+                let outcome = Outcome::Rejected(diagnostics);
+                outcome.record(&self.telemetry);
+                return outcome;
+            }
         };
 
         let binds = Arc::clone(&self.binds);
         let state = Arc::clone(&self.state);
         let certificates = Arc::clone(&self.certificates);
+        let telemetry = Arc::clone(&self.telemetry);
         let root = self.directory.clone();
         let ca_directory = self.directory.join("ca");
         let outcome = self.store.attempt(&snapshot, &self.registry, move |preparation| {
@@ -92,15 +99,43 @@ impl Gateway {
                     binds: &binds,
                     state: &state,
                     certificates: &certificates,
+                    telemetry: &telemetry,
                     root: &root,
                     internal_ca: ca_directory.clone(),
                 },
             )
         });
+        outcome.record(&self.telemetry);
         if matches!(outcome, Outcome::Started { .. } | Outcome::Reloaded { .. }) {
             self.server.sync().await;
+            // What `App::activate` does, so readiness in a test means what it
+            // means in the binary: bound addresses, not intended ones.
+            self.telemetry
+                .health
+                .committed(self.server.active_addresses().await.len());
         }
         outcome
+    }
+
+    /// Forget the metric series the current generation no longer names, the way
+    /// `App::activate` does after a commit.
+    pub fn retain_series(&self) {
+        let Some(committed) = self.store.current() else {
+            return;
+        };
+        let mut live = gatel_observe::Live::default();
+        for listener in &committed.plan.listeners {
+            live.listener(&listener.listener.name);
+            for site in &listener.sites {
+                for route in &site.routes {
+                    live.route(site.id.name(), route.id.name());
+                }
+            }
+        }
+        for upstream in &committed.plan.spec.upstreams {
+            live.upstream(upstream.id.name());
+        }
+        self.telemetry.metrics.retain(&live);
     }
 
     pub fn address(&self) -> SocketAddr {

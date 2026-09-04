@@ -10,6 +10,7 @@
 
 pub mod bind;
 pub mod dispatch;
+pub mod measure;
 pub mod prepare;
 pub mod proxy;
 pub mod serve;

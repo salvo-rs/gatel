@@ -44,6 +44,7 @@ declared dependencies and compares them against a whitelist.
 | `gatel-model` | any async runtime, any I/O, KDL, HTTP |
 | `gatel-macros` | anything but syn/quote and the model |
 | `gatel-kdl` | anything but the model and `kdl` |
+| `gatel-observe` | everything but the model — it is written to from the data plane, so it must sit under all of it |
 | `gatel-plan` | hyper, rustls, `tokio::net` — it may name `salvo_core::Handler`, but it cannot open a socket |
 | `gatel-state` | Salvo routing; it owns transport to backends, not request dispatch |
 
@@ -142,6 +143,43 @@ Routes are sorted by specificity at compile time — exact host over wildcard ov
 catch-all, exact path over longest prefix — so the request path walks a fixed
 list and takes the first match. Two routes that would claim the same request are
 a compile error, because otherwise the winner would depend on declaration order.
+
+## What the process says about itself
+
+Metrics and health are served by ordinary routes — `metrics` and `health` are
+directives like any other. There is no admin port, which means there is no
+second surface serving privileged information on every interface because
+somebody left a default alone. A scrape route can be put on a loopback listener,
+behind `ip-filter` or `basic-auth`, at a path nobody guesses, and the rules that
+apply to it are the ones written next to it.
+
+**A series is created from a name in the plan, never from a request.** A route,
+an upstream and a listener each resolve their instruments during prepare and
+hold them for the life of the generation. What the request path has is that
+handle, with no way back to the registry — so a path, a header, a client address
+or an invented status code cannot become a label, however much traffic arrives.
+Status is reported by class rather than by code for the same reason. After a
+commit, series the new plan no longer names are dropped, and ones it still names
+keep their values: a counter that restarted at zero on every reload would make
+every rate wrong precisely when someone is watching a deploy.
+
+A request is counted where its **body ends**, not where the handler returned —
+otherwise a streaming download reads as instant, a cancelled one as a success,
+and a compressed body at its uncompressed size.
+
+Readiness distinguishes two kinds of problem, because they call for opposite
+responses:
+
+| Condition | Readiness | Why |
+|---|---|---|
+| Nothing committed yet, no listener bound, draining | **not ready** | Local to this instance. Another one is fine; move the traffic. |
+| Reloads failing while the last good configuration serves | **degraded**, still 200 | Every replica reads the same file. Failing readiness here turns one bad edit into a total outage. |
+| Every endpoint of an upstream unusable | **degraded**, still 200 | Shared by every replica. Removing this one moves traffic to another that cannot reach the backend either. |
+
+Both kinds are named in the body; only the first takes the instance out of
+rotation. Liveness answers yes as long as it can answer at all — a liveness
+probe that fails on a downstream condition restarts a process that was working,
+usually across every replica at once.
 
 ## Why `proxy` is in the kernel
 

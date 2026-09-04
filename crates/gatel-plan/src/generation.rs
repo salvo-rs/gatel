@@ -88,6 +88,45 @@ impl Outcome {
     pub fn is_failure(&self) -> bool {
         matches!(self, Outcome::Rejected(_) | Outcome::PrepareFailed(_))
     }
+
+    /// Publish what this transaction did.
+    ///
+    /// The counter and readiness are told separately, because they answer
+    /// different questions: one says what happened, the other whether this
+    /// instance should still be sent traffic. A refused configuration moves the
+    /// first and deliberately does not remove the instance — every replica
+    /// reads the same file, and each of them is still serving the last one that
+    /// worked.
+    pub fn record(&self, telemetry: &gatel_observe::Telemetry) {
+        telemetry.metrics.process.reloaded(match self {
+            Outcome::Started { .. } => gatel_observe::Reload::Started,
+            Outcome::Reloaded { .. } => gatel_observe::Reload::Reloaded,
+            Outcome::NoOp { .. } => gatel_observe::Reload::NoOp,
+            Outcome::Rejected(_) => gatel_observe::Reload::Rejected,
+            Outcome::PrepareFailed(_) => gatel_observe::Reload::PrepareFailed,
+            Outcome::Stale(_) => gatel_observe::Reload::Stale,
+        });
+        if let Some(generation) = self.generation() {
+            telemetry
+                .metrics
+                .process
+                .generation
+                .set(generation.number() as i64);
+        }
+        match self {
+            Outcome::Rejected(diagnostics) => telemetry.health.reload_failed(
+                diagnostics
+                    .iter()
+                    .next()
+                    .map(|first| first.message.clone())
+                    .unwrap_or_else(|| "invalid configuration".to_string()),
+            ),
+            Outcome::PrepareFailed(detail) => telemetry.health.reload_failed(detail.clone()),
+            // A stale candidate is not a failure: something newer was observed,
+            // and that one reports for itself.
+            _ => {}
+        }
+    }
 }
 
 /// Why the last attempt failed, kept so readiness can distinguish "never

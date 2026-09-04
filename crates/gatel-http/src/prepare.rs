@@ -24,6 +24,9 @@ pub struct Resources<'a> {
     pub binds: &'a BindTable,
     pub state: &'a StateRegistry,
     pub certificates: &'a Arc<CertificateStore>,
+    /// What the process measures. Older than any generation, which is why a
+    /// counter reads across a reload rather than restarting at zero.
+    pub telemetry: &'a Arc<gatel_observe::Telemetry>,
     /// The directory `file:` references resolve against.
     pub root: &'a Path,
     /// Where the development authority lives, if a site asks for one.
@@ -38,6 +41,9 @@ pub struct ListenerRuntime {
     /// life of the generation; the certificates it resolves are not.
     pub tls: Option<Arc<ServerConfig>>,
     pub service: Arc<Service>,
+    /// Transport counters. Shared with every generation that keeps this
+    /// listener, so accepting a connection does not restart the count.
+    pub metrics: Arc<gatel_observe::metrics::Listener>,
 }
 
 impl ListenerRuntime {
@@ -108,6 +114,7 @@ pub fn prepare(
 
     let mut listeners = BTreeMap::new();
     for listener_plan in &plan.listeners {
+        let listener_metrics = resources.telemetry.metrics.listener(&listener_plan.listener.name);
         // Certificates load here, so a bad one stops the reload rather than
         // breaking the first handshake after it.
         let tls = gatel_tls::prepare_listener(
@@ -129,6 +136,7 @@ pub fn prepare(
                     let cx = gatel_plan::BuildContext {
                         root: resources.root,
                         state,
+                        telemetry: resources.telemetry,
                     };
                     chain.push(directive.config.build(cx).map_err(|error| {
                         format!(
@@ -151,6 +159,7 @@ pub fn prepare(
                     matchers: route.matchers.clone(),
                     chain,
                     terminal_name: terminal_name(&route.terminal),
+                    metrics: resources.telemetry.metrics.route(site.id.name(), route.id.name()),
                 });
             }
             sites.push(PreparedSite {
@@ -164,6 +173,7 @@ pub fn prepare(
             sites,
             tls: listener_plan.listener.protocol.is_tls(),
             trusted_proxies: plan.spec.global.trusted_proxies.clone(),
+            metrics: Arc::clone(&listener_metrics),
         };
 
         listeners.insert(
@@ -173,6 +183,7 @@ pub fn prepare(
                 bind: listener_plan.listener.bind,
                 tls,
                 service: Arc::new(Service::new(root_router(dispatcher))),
+                metrics: listener_metrics,
             }),
         );
     }
@@ -229,13 +240,17 @@ fn build_terminal(
             let runtime = upstreams.get(upstream).ok_or_else(|| {
                 format!("route `{route}` refers to upstream `{upstream}`, which has no runtime")
             })?;
-            Ok(Arc::new(crate::proxy::ProxyTerminal::new(Arc::clone(runtime))))
+            Ok(Arc::new(crate::proxy::ProxyTerminal::new(
+                Arc::clone(runtime),
+                resources.telemetry.metrics.upstream(upstream.name()),
+            )))
         }
         Terminal::Directive(instance) => {
             let state = resolve_state(instance, resources.state);
             let cx = gatel_plan::BuildContext {
                 root: resources.root,
                 state,
+                telemetry: resources.telemetry,
             };
             instance
                 .config

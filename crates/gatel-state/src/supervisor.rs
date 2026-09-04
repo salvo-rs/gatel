@@ -13,8 +13,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gatel_model::{Fingerprint, Hasher, ResourceId};
+use gatel_observe::Telemetry;
 use tokio::sync::watch;
 
+use crate::census::{self, Census};
 use crate::endpoint::{EndpointSet, probe_delay};
 use crate::probe::probe;
 use crate::upstream::{UpstreamRuntime, UpstreamRuntimes};
@@ -27,9 +29,11 @@ struct Worker {
 }
 
 /// Owns every background task, and keeps them in step with the current plan.
-#[derive(Default)]
 pub struct Supervisor {
     workers: tokio::sync::Mutex<BTreeMap<ResourceId, Worker>>,
+    /// Sampling what probing does not report. One task for the whole process.
+    census: Census,
+    telemetry: Arc<Telemetry>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -39,14 +43,19 @@ impl std::fmt::Debug for Supervisor {
 }
 
 impl Supervisor {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(telemetry: Arc<Telemetry>) -> Self {
+        Self {
+            workers: tokio::sync::Mutex::new(BTreeMap::new()),
+            census: Census::new(),
+            telemetry,
+        }
     }
 
     /// Start, keep or stop probes so they match the committed generation.
     ///
     /// Called after a commit, never before.
-    pub async fn reconcile(&self, runtimes: &UpstreamRuntimes) {
+    pub async fn reconcile(&self, runtimes: &Arc<UpstreamRuntimes>) {
+        self.census.follow(runtimes, &self.telemetry).await;
         let mut workers = self.workers.lock().await;
 
         let wanted: Vec<(&ResourceId, Fingerprint, &Arc<UpstreamRuntime>)> = runtimes
@@ -68,7 +77,11 @@ impl Supervisor {
                 None => {}
             }
             let (sender, receiver) = watch::channel(false);
-            let handle = tokio::spawn(probe_loop(Arc::clone(runtime), receiver));
+            let handle = tokio::spawn(probe_loop(
+                Arc::clone(runtime),
+                Arc::clone(&self.telemetry),
+                receiver,
+            ));
             workers.insert(
                 (*id).clone(),
                 Worker {
@@ -104,6 +117,7 @@ impl Supervisor {
     /// Stop every worker and wait for it, so a process exit leaves nothing
     /// half-done.
     pub async fn shutdown(&self) {
+        self.census.shutdown().await;
         let mut workers = self.workers.lock().await;
         for (_, worker) in std::mem::take(&mut *workers) {
             stop(worker).await;
@@ -140,7 +154,11 @@ fn worker_identity(runtime: &UpstreamRuntime) -> Fingerprint {
     hasher.finish()
 }
 
-async fn probe_loop(runtime: Arc<UpstreamRuntime>, mut stop: watch::Receiver<bool>) {
+async fn probe_loop(
+    runtime: Arc<UpstreamRuntime>,
+    telemetry: Arc<Telemetry>,
+    mut stop: watch::Receiver<bool>,
+) {
     let Some(policy) = runtime.spec.health.clone() else {
         return;
     };
@@ -164,6 +182,9 @@ async fn probe_loop(runtime: Arc<UpstreamRuntime>, mut stop: watch::Receiver<boo
         for (id, _, result) in &results {
             report(&runtime.endpoints, &upstream, id, result);
         }
+        // Immediately, not on the census tick: a backend going down is exactly
+        // the moment readiness should change.
+        census::publish_one(&runtime, &telemetry);
 
         // Spread the next round so a large set does not probe in lockstep.
         let delay = probe_delay(&policy, round as usize, round);
@@ -345,8 +366,8 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
         let endpoints = Arc::clone(&runtimes.iter().next().unwrap().endpoints);
         assert_eq!(endpoints.all()[0].health(), Health::Unknown);
 
-        let supervisor = Supervisor::new();
-        supervisor.reconcile(&runtimes).await;
+        let supervisor = Supervisor::new(Telemetry::new());
+        supervisor.reconcile(&Arc::new(runtimes)).await;
         assert!(
             eventually(|| endpoints.all()[0].health() == Health::Healthy).await,
             "the probe should have reported success"
@@ -365,8 +386,8 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
         let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state);
         let endpoints = Arc::clone(&runtimes.iter().next().unwrap().endpoints);
 
-        let supervisor = Supervisor::new();
-        supervisor.reconcile(&runtimes).await;
+        let supervisor = Supervisor::new(Telemetry::new());
+        supervisor.reconcile(&Arc::new(runtimes)).await;
         assert!(
             eventually(|| endpoints.eligible().is_empty()).await,
             "a 503 backend is not eligible"
@@ -380,8 +401,9 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
         let state = StateRegistry::new();
         let check = r#""tcp" interval="50ms" timeout="40ms" healthy-threshold=2"#;
         let (runtimes, _) = UpstreamRuntimes::resolve(&plan(&config(backend.address, check)), &state);
+        let runtimes = Arc::new(runtimes);
 
-        let supervisor = Supervisor::new();
+        let supervisor = Supervisor::new(Telemetry::new());
         supervisor.reconcile(&runtimes).await;
         let endpoints = Arc::clone(&runtimes.iter().next().unwrap().endpoints);
         assert!(eventually(|| endpoints.all()[0].health() == Health::Healthy).await);
@@ -389,7 +411,7 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
         // Same upstream, same check: reconciling again must leave the worker
         // alone rather than restart its counters.
         let (again, _) = UpstreamRuntimes::resolve(&plan(&config(backend.address, check)), &state);
-        supervisor.reconcile(&again).await;
+        supervisor.reconcile(&Arc::new(again)).await;
         assert_eq!(
             endpoints.all()[0].health(),
             Health::Healthy,
@@ -411,8 +433,8 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
             &state,
         );
 
-        let supervisor = Supervisor::new();
-        supervisor.reconcile(&with).await;
+        let supervisor = Supervisor::new(Telemetry::new());
+        supervisor.reconcile(&Arc::new(with)).await;
         assert_eq!(supervisor.running().await.len(), 1);
 
         let without = format!(
@@ -424,7 +446,7 @@ site "*" {{ route "/" {{ proxy upstream="api" }} }}
             backend.address
         );
         let (plain, _) = UpstreamRuntimes::resolve(&plan(&without), &state);
-        supervisor.reconcile(&plain).await;
+        supervisor.reconcile(&Arc::new(plain)).await;
         assert!(supervisor.running().await.is_empty(), "no check means no worker");
         supervisor.shutdown().await;
     }
@@ -440,8 +462,8 @@ site "*" { route "/" { proxy upstream="api" } }
 "#,
         );
         let (runtimes, _) = UpstreamRuntimes::resolve(&plan, &state);
-        let supervisor = Supervisor::new();
-        supervisor.reconcile(&runtimes).await;
+        let supervisor = Supervisor::new(Telemetry::new());
+        supervisor.reconcile(&Arc::new(runtimes)).await;
         assert!(supervisor.running().await.is_empty());
     }
 }

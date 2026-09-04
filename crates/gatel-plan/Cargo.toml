@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 gatel-model.workspace = true
+gatel-observe.workspace = true
 gatel-macros.workspace = true
 # salvo_core is the project's HTTP execution vocabulary, not transport. This
 # crate may name `Handler`; it may not depend on hyper, rustls or tokio::net.

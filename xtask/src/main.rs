@@ -22,17 +22,26 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("gatel-model", &["blake3"]),
     ("gatel-macros", &["proc-macro2", "quote", "syn", "gatel-model"]),
     ("gatel-kdl", &["gatel-model", "kdl"]),
+    // Below everything that can open a socket, so the data plane can write to it.
+    ("gatel-observe", &["gatel-model"]),
     (
         "gatel-plan",
         // salvo_core is the project's execution vocabulary; hyper, rustls and
         // tokio::net are transport and belong below.
-        &["gatel-model", "gatel-macros", "gatel-kdl", "salvo_core"],
+        &[
+            "gatel-model",
+            "gatel-macros",
+            "gatel-kdl",
+            "gatel-observe",
+            "salvo_core",
+        ],
     ),
     (
         "gatel-state",
         &[
             "gatel-model",
             "gatel-plan",
+            "gatel-observe",
             "gatel-kdl",
             "bytes",
             "http",
@@ -50,6 +59,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "gatel-model",
             "gatel-macros",
             "gatel-plan",
+            "gatel-observe",
             "async-compression",
             "bcrypt",
             "bytes",
@@ -70,6 +80,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
         &[
             "gatel-model",
             "gatel-plan",
+            "gatel-observe",
             "gatel-state",
             "gatel-tls",
             "gatel-kdl",

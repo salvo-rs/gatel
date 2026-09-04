@@ -14,11 +14,14 @@ pub mod encode;
 pub mod file_server;
 pub mod headers;
 pub mod ip_filter;
+pub mod observe;
 pub mod rate_limit;
 pub mod redirect;
 pub mod request_id;
 pub mod respond;
 pub mod rewrite;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use gatel_plan::Bundle;
 
@@ -36,6 +39,8 @@ pub fn bundle() -> Bundle {
         .with(encode::Encode)
         .with(rewrite::Rewrite)
         .with(basic_auth::BasicAuth)
+        .with(observe::Metrics)
+        .with(observe::Health)
 }
 
 #[cfg(test)]
@@ -56,7 +61,9 @@ mod tests {
                 "encode",
                 "file-server",
                 "headers",
+                "health",
                 "ip-filter",
+                "metrics",
                 "rate-limit",
                 "redirect",
                 "request-id",
@@ -73,7 +80,10 @@ mod tests {
             .names()
             .filter(|name| registry.get(name).unwrap().meta().role == Role::Terminal)
             .collect();
-        assert_eq!(terminals, ["file-server", "redirect", "respond"]);
+        assert_eq!(
+            terminals,
+            ["file-server", "health", "metrics", "redirect", "respond"]
+        );
     }
 
     #[test]

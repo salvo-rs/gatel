@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gatel_http::{BindTable, Resources, Runtime, Server, prepare};
 use gatel_model::{Diagnostics, Snapshot, SourceId, SourceSnapshot};
+use gatel_observe::{Live, Telemetry};
 use gatel_plan::{GenerationStore, Outcome, Registry};
 use gatel_state::{StateRegistry, Supervisor};
 use gatel_tls::{CertificateStore, InternalCa};
@@ -22,6 +23,9 @@ pub struct App {
     /// Certificates outlive generations: a renewal is not a configuration
     /// change and must not produce one.
     pub certificates: Arc<CertificateStore>,
+    /// What the process measures and reports about itself. Older than any
+    /// generation, so a counter reads across a reload.
+    pub telemetry: Arc<Telemetry>,
     pub root: PathBuf,
     source: SourceId,
     /// The last snapshot, so an unchanged file keeps its revision.
@@ -30,6 +34,7 @@ pub struct App {
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self, String> {
+        let telemetry = Telemetry::new();
         let registry = Registry::builder().bundle(gatel_bundle_std::bundle()).build()?;
         let store = Arc::new(GenerationStore::new());
         let binds = Arc::new(BindTable::new());
@@ -40,8 +45,9 @@ impl App {
             binds,
             state: Arc::new(StateRegistry::new()),
             server,
-            supervisor: Arc::new(Supervisor::new()),
+            supervisor: Arc::new(Supervisor::new(Arc::clone(&telemetry))),
             certificates: Arc::new(CertificateStore::new()),
+            telemetry,
             root,
             source: SourceId::file("main"),
             previous: std::sync::Mutex::new(None),
@@ -60,24 +66,32 @@ impl App {
     pub fn attempt(&self) -> Outcome {
         let snapshot = match self.observe() {
             Ok(snapshot) => snapshot,
-            Err(diagnostics) => return Outcome::Rejected(diagnostics),
+            Err(diagnostics) => {
+                let outcome = Outcome::Rejected(diagnostics);
+                outcome.record(&self.telemetry);
+                return outcome;
+            }
         };
         let binds = Arc::clone(&self.binds);
         let state = Arc::clone(&self.state);
         let certificates = Arc::clone(&self.certificates);
+        let telemetry = Arc::clone(&self.telemetry);
         let root = self.root_directory().to_path_buf();
-        self.store.attempt(&snapshot, &self.registry, move |preparation| {
+        let outcome = self.store.attempt(&snapshot, &self.registry, move |preparation| {
             prepare(
                 &preparation,
                 &Resources {
                     binds: &binds,
                     state: &state,
                     certificates: &certificates,
+                    telemetry: &telemetry,
                     root: &root,
                     internal_ca: InternalCa::default_directory(),
                 },
             )
-        })
+        });
+        outcome.record(&self.telemetry);
+        outcome
     }
 
     /// Compile without preparing anything, for `validate` and `explain`.
@@ -95,6 +109,12 @@ impl App {
         };
         self.server.sync().await;
         self.supervisor.reconcile(&committed.runtime.upstreams).await;
+        // Readiness counts what is actually accepting, not what was asked for:
+        // a generation whose addresses all failed to bind is not serving.
+        self.telemetry
+            .health
+            .committed(self.server.active_addresses().await.len());
+        self.telemetry.metrics.retain(&live_series(&committed.plan));
         // Only after the new generation is live: anything still held by a
         // draining request keeps working, it is simply no longer findable.
         for retired in self.state.retain(&committed.plan.bindings) {
@@ -118,6 +138,9 @@ impl App {
 
     /// Stop accepting, stop probing, and let what is in flight finish.
     pub async fn shutdown(&self) {
+        // Before the accept loops stop, so a load balancer reading readiness
+        // has the grace period to take this instance out.
+        self.telemetry.health.draining();
         self.server.shutdown().await;
         self.supervisor.shutdown().await;
     }
@@ -136,4 +159,23 @@ impl App {
     pub fn root_directory(&self) -> &Path {
         self.root.parent().unwrap_or(Path::new("."))
     }
+}
+
+/// The metric series a plan still names. Anything else is forgotten after the
+/// commit, so a deleted route stops being reported rather than sitting at a
+/// value that will never change again.
+fn live_series(plan: &gatel_plan::Plan) -> Live {
+    let mut live = Live::default();
+    for listener in &plan.listeners {
+        live.listener(&listener.listener.name);
+        for site in &listener.sites {
+            for route in &site.routes {
+                live.route(site.id.name(), route.id.name());
+            }
+        }
+    }
+    for upstream in &plan.spec.upstreams {
+        live.upstream(upstream.id.name());
+    }
+    live
 }

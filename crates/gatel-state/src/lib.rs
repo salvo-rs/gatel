@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod census;
 pub mod endpoint;
 pub mod pool;
 pub mod probe;

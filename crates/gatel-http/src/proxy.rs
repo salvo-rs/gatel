@@ -33,6 +33,7 @@ const HOP_BY_HOP: [&str; 8] = [
 /// A proxy terminal bound to one upstream's runtime.
 pub struct ProxyTerminal {
     upstream: Arc<UpstreamRuntime>,
+    metrics: Arc<gatel_observe::metrics::Upstream>,
 }
 
 impl std::fmt::Debug for ProxyTerminal {
@@ -44,8 +45,14 @@ impl std::fmt::Debug for ProxyTerminal {
 }
 
 impl ProxyTerminal {
-    pub fn new(upstream: Arc<UpstreamRuntime>) -> Self {
-        Self { upstream }
+    pub fn new(upstream: Arc<UpstreamRuntime>, metrics: Arc<gatel_observe::metrics::Upstream>) -> Self {
+        Self { upstream, metrics }
+    }
+
+    /// Record one attempt. Every path out of the attempt loop passes through
+    /// here, so the four counters add up to the attempts actually made.
+    fn attempted(&self, outcome: gatel_observe::Attempt, since: tokio::time::Instant) {
+        self.metrics.attempted(outcome, since.elapsed());
     }
 }
 
@@ -194,6 +201,7 @@ impl ProxyTerminal {
         let mut last: Option<ProxyError> = None;
 
         for attempt in 1..=max_attempts {
+            let attempt_started = tokio::time::Instant::now();
             let eligible: Vec<Arc<Endpoint>> = self
                 .upstream
                 .endpoints
@@ -203,6 +211,7 @@ impl ProxyTerminal {
                 .collect();
 
             let Some(selection) = select(&spec.balance, &eligible, &self.upstream.selector, &key) else {
+                self.attempted(gatel_observe::Attempt::Unavailable, attempt_started);
                 return Err(last.unwrap_or(ProxyError::NoEndpoint));
             };
             let endpoint = Arc::clone(&selection.endpoint);
@@ -227,10 +236,23 @@ impl ProxyTerminal {
                     );
                     self.upstream.endpoints.report_traffic(&endpoint.id, true);
                     excluded.push(endpoint.id.clone());
+                    // A connection that could not be made is a failure; a queue
+                    // that was full is capacity. Telling them apart is the
+                    // difference between fixing a backend and adding one.
+                    self.attempted(
+                        match error {
+                            CheckoutError::Connect(_) => gatel_observe::Attempt::Failed,
+                            _ => gatel_observe::Attempt::Unavailable,
+                        },
+                        attempt_started,
+                    );
                     last = Some(ProxyError::Checkout(error));
                     continue;
                 }
-                Err(_) => return Err(ProxyError::Timeout("overall", timeouts.overall)),
+                Err(_) => {
+                    self.attempted(gatel_observe::Attempt::TimedOut, attempt_started);
+                    return Err(ProxyError::Timeout("overall", timeouts.overall));
+                }
             };
 
             let outbound =
@@ -243,15 +265,21 @@ impl ProxyTerminal {
                     // The request was already on the wire: the upstream may
                     // have acted on it, so this is never retried.
                     self.upstream.endpoints.report_traffic(&endpoint.id, true);
+                    self.attempted(gatel_observe::Attempt::Failed, attempt_started);
                     return Err(ProxyError::Upstream(error.to_string()));
                 }
                 Err(_) => {
                     self.upstream.endpoints.report_traffic(&endpoint.id, true);
+                    self.attempted(gatel_observe::Attempt::TimedOut, attempt_started);
                     return Err(ProxyError::Timeout("response-head", timeouts.response_head));
                 }
             };
 
             let status = upstream_response.status().as_u16();
+            // Answered means the head came back, whatever it said: a 500 from a
+            // backend that is reachable is a different problem from one that is
+            // not, and the status class already carries the first.
+            self.attempted(gatel_observe::Attempt::Answered, attempt_started);
 
             // A backend that agreed to upgrade means this connection stops
             // being HTTP. It leaves the pool and becomes a tunnel.

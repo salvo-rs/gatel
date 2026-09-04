@@ -161,6 +161,13 @@ async fn serve_connection(
     watcher: hyper_util::server::graceful::Watcher,
 ) {
     let handshake_deadline = generation.runtime.limits.header_timeout;
+    let metrics = Arc::clone(&runtime.metrics);
+    metrics.connections_total.increment();
+    metrics.connections_active.increment();
+    // A guard rather than a decrement at the end: this function returns from
+    // four places, and one of them being forgotten would make the gauge climb
+    // forever.
+    let _open = Open(Arc::clone(&metrics));
     let scheme = if runtime.is_tls() {
         Scheme::HTTPS
     } else {
@@ -185,11 +192,13 @@ async fn serve_connection(
             let acceptor = TlsAcceptor::from(Arc::clone(config));
             match tokio::time::timeout(handshake_deadline, acceptor.accept(stream)).await {
                 Ok(Ok(stream)) => {
+                    metrics.handshakes_ok.increment();
                     let connection =
                         watcher.watch(builder.serve_connection_with_upgrades(TokioIo::new(stream), handler));
                     connection.await.map_err(|error| error.to_string())
                 }
                 Ok(Err(error)) => {
+                    metrics.handshakes_failed.increment();
                     // A failed handshake is ordinary on a public port — a
                     // scanner, a wrong name, an old client — so it is not a
                     // warning, but it is worth being able to see.
@@ -202,6 +211,7 @@ async fn serve_connection(
                     return;
                 }
                 Err(_) => {
+                    metrics.handshakes_failed.increment();
                     tracing::debug!(
                         target: "gatel::connection",
                         event = "tls_handshake_timeout",
@@ -216,5 +226,14 @@ async fn serve_connection(
 
     if let Err(error) = result {
         tracing::debug!(target: "gatel::connection", event = "connection_closed", %peer, %error);
+    }
+}
+
+/// Holds the active-connection gauge up for as long as the connection lives.
+struct Open(Arc<gatel_observe::metrics::Listener>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.connections_active.decrement();
     }
 }

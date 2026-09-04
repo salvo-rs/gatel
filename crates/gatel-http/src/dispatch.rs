@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use gatel_model::ResourceId;
+use gatel_observe::metrics::{Listener as ListenerMetrics, Route as RouteMetrics};
 use gatel_plan::{HeaderLookup, HostMatch, MatchContext, Matcher, MethodMatch, PathMatch};
 use salvo_core::http::{Request, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
@@ -24,6 +25,9 @@ pub struct PreparedRoute {
     /// generation; a request never assembles a chain.
     pub chain: Vec<Arc<dyn Handler>>,
     pub terminal_name: &'static str,
+    /// Resolved once, during prepare. The request path holds this handle and
+    /// has no way to name a different one.
+    pub metrics: Arc<RouteMetrics>,
 }
 
 impl std::fmt::Debug for PreparedRoute {
@@ -60,6 +64,7 @@ pub struct Dispatcher {
     pub tls: bool,
     /// Networks whose forwarding headers are believed.
     pub trusted_proxies: Vec<(IpAddr, u8)>,
+    pub metrics: Arc<ListenerMetrics>,
 }
 
 /// Why a request did not reach a terminal, so the two cases can be told apart
@@ -236,13 +241,19 @@ impl Handler for Dispatcher {
         }
         depot.insert("gatel.tls", self.tls);
 
-        let chain = match self.resolve(request) {
+        let (chain, measure) = match self.resolve(request) {
             Ok((site, route)) => {
                 depot.insert("gatel.site", site.id.name().to_string());
                 depot.insert("gatel.route", route.id.name().to_string());
-                route.chain.clone()
+                (
+                    route.chain.clone(),
+                    crate::measure::Measure::start(Arc::clone(&route.metrics)),
+                )
             }
             Err(reason) => {
+                // No route means no series to attribute this to, and a path is
+                // not a label. It is counted on the listener instead.
+                self.metrics.unmatched_requests.increment();
                 write_not_found(response, reason);
                 return;
             }
@@ -251,6 +262,8 @@ impl Handler for Dispatcher {
         // handlers this route declared, in the order the compiler fixed.
         let mut flow = FlowCtrl::new(chain);
         flow.call_next(request, depot, response).await;
+        // Outermost, so what is counted is the body that actually goes out.
+        crate::measure::observe(response, measure);
     }
 }
 
@@ -279,6 +292,7 @@ mod tests {
             matchers,
             chain: Vec::new(),
             terminal_name: "respond",
+            metrics: Arc::new(RouteMetrics::default()),
         }
     }
 
@@ -295,6 +309,7 @@ mod tests {
             sites,
             tls: false,
             trusted_proxies: Vec::new(),
+            metrics: Arc::new(ListenerMetrics::default()),
         }
     }
 
@@ -469,6 +484,7 @@ mod tests {
         );
 
         let trusting = Dispatcher {
+            metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,
             trusted_proxies: vec![("198.51.100.0".parse().unwrap(), 24)],
@@ -484,6 +500,7 @@ mod tests {
             .unwrap()
             .into();
         let trusting = Dispatcher {
+            metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,
             trusted_proxies: vec![("198.51.100.0".parse().unwrap(), 24)],
@@ -507,6 +524,7 @@ mod tests {
             .unwrap()
             .into();
         let trusting = Dispatcher {
+            metrics: Arc::new(ListenerMetrics::default()),
             sites: vec![],
             tls: false,
             trusted_proxies: vec![("198.51.100.0".parse().unwrap(), 24)],

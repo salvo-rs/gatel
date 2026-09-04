@@ -427,6 +427,7 @@ mod tests {
         let (config, diagnostics) = decode(node);
         assert!(!diagnostics.has_errors(), "{diagnostics}");
         let error = match config.unwrap().build(BuildContext {
+            telemetry: crate::testing::telemetry(),
             root: std::path::Path::new("."),
             state: None,
         }) {

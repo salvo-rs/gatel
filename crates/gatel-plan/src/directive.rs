@@ -243,6 +243,10 @@ pub struct BuildContext<'a> {
     /// Whatever [`DirectiveConfig::state`] asked for, resolved against what is
     /// already running. `None` for a directive that asked for nothing.
     pub state: Option<Arc<dyn Any + Send + Sync>>,
+    /// What the process measures and reports about itself. Process-wide and
+    /// older than any generation, like a socket: a directive that exposes it
+    /// captures the handle, it is never rebuilt for a reload.
+    pub telemetry: &'a Arc<gatel_observe::Telemetry>,
 }
 
 impl BuildContext<'_> {

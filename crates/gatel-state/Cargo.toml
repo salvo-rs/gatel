@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 gatel-model.workspace = true
+gatel-observe.workspace = true
 gatel-plan.workspace = true
 
 bytes.workspace = true

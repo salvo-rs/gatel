@@ -1,0 +1,33 @@
+// Metrics and health as ordinary routes.
+//
+// There is no admin port. Everything a process says about itself is served by
+// a route, on a listener the operator chose, subject to the guards written on
+// it — because a second port serving privileged information on every interface
+// is a security decision nobody remembers making.
+global {
+    http "public" ":8080"
+    // Bound to loopback: a scrape comes from the machine or from a sidecar.
+    http "internal" "127.0.0.1:9090"
+}
+
+site "*" id="app" listener="public" {
+    access-log
+    route "/*" id="hello" {
+        respond "hello\n"
+    }
+}
+
+site "*" id="observability" listener="internal" {
+    // Readiness decides whether this instance keeps receiving traffic.
+    // A refused reload does not fail it: every replica reads the same file,
+    // and each is still serving the last configuration that worked.
+    route "/readyz" id="readyz" { health "ready" }
+
+    // Liveness decides whether to restart the process. It answers yes as long
+    // as it can answer at all, which is the only thing a restart could fix.
+    route "/healthz" id="healthz" { health "live" }
+
+    // One series per route, per upstream, per listener. Nothing a client sends
+    // can add one: a path, a status code and a header are never labels.
+    route "/metrics" id="metrics" { metrics }
+}

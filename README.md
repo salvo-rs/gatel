@@ -83,10 +83,11 @@ error[unknown-property]: `balance "round_robin"` has no property `header`
 | Reverse proxy | 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, active and passive health, safe retry |
 | TLS | manual PEM certificates, SNI, mutual TLS, and a built-in development authority with `gatel trust` |
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
-| Directives | `respond`, `redirect`, `file-server`, `rewrite`, `headers`, `encode`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit` |
+| Directives | `respond`, `redirect`, `file-server`, `rewrite`, `headers`, `encode`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `metrics`, `health` |
+| Observability | Prometheus metrics whose label set is the size of the configuration, and readiness that distinguishes what is wrong from what a restart would fix |
 | Tooling | `validate`, `explain`, `diff`, `capabilities`, `trust` |
 
-Not yet: ACME, caching, forward authentication, the admin API, metrics,
+Not yet: ACME, caching, forward authentication, the admin API, tracing,
 HTTP/3, and the CGI family. The plan for those is in `docs/`.
 
 ## Building
@@ -104,6 +105,7 @@ crates/
   gatel-model        the format-neutral configuration tree, diagnostics, identity
   gatel-macros       #[derive(FromNode)]: a struct becomes a strict decoder
   gatel-kdl          the KDL frontend — the only crate that knows KDL exists
+  gatel-observe      metrics and health — below everything that can open a socket
   gatel-plan         normalize, compile, and the configuration transaction
   gatel-state        endpoints, health, balancing, connection pools
   gatel-http         listeners, routing, the reverse proxy terminal

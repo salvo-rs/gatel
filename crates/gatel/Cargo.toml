@@ -17,6 +17,7 @@ gatel-bundle-std.workspace = true
 gatel-http.workspace = true
 gatel-kdl.workspace = true
 gatel-model.workspace = true
+gatel-observe.workspace = true
 gatel-plan.workspace = true
 gatel-state.workspace = true
 gatel-tls.workspace = true

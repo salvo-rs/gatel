@@ -1,0 +1,11 @@
+[package]
+name = "gatel-observe"
+description = "Gatel's metrics and health: bounded instruments, resolved once and handed out closed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gatel-model.workspace = true
