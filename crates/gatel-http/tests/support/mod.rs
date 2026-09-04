@@ -228,3 +228,65 @@ pub fn manual_certificate(gateway: &Gateway, host: &str) -> String {
     .unwrap();
     "tls cert=\"cert.pem\" key=\"key.pem\"".to_string()
 }
+
+/// A backend that accepts an upgrade and then echoes bytes back.
+///
+/// Deliberately not a WebSocket implementation: what the gateway must get right
+/// is the handshake and the byte pipe, and a real framing library would only
+/// hide whether it did.
+pub async fn upgrade_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                // Read exactly the request head, so whatever follows belongs to
+                // the tunnel rather than being swallowed here.
+                while stream.read_exact(&mut byte).await.is_ok() {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                if !text.contains("upgrade: websocket") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\n\
+                          Connection: Upgrade\r\nUpgrade: websocket\r\n\
+                          Sec-WebSocket-Accept: test\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let mut buffer = [0u8; 1024];
+                while let Ok(read) = stream.read(&mut buffer).await {
+                    if read == 0 {
+                        return;
+                    }
+                    let echoed: Vec<u8> = b"echo:"
+                        .iter()
+                        .copied()
+                        .chain(buffer[..read].iter().copied())
+                        .collect();
+                    if stream.write_all(&echoed).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}

@@ -13,9 +13,11 @@ pub mod dispatch;
 pub mod prepare;
 pub mod proxy;
 pub mod serve;
+pub mod upgrade;
 
 pub use bind::BindTable;
 pub use dispatch::{Dispatcher, NoRoute, PreparedRoute, PreparedSite, request_host};
 pub use prepare::{ListenerRuntime, Resources, Runtime, prepare};
 pub use proxy::ProxyTerminal;
 pub use serve::{Server, Store};
+pub use upgrade::{Ended, requested_protocol};

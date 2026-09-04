@@ -179,7 +179,7 @@ pub(super) struct EndpointNode {
 }
 
 /// Per-stage deadlines for one proxied request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     /// Waiting for a pool slot.
     pub queue: Duration,

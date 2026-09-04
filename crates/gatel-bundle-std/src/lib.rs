@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access_log;
+pub mod encode;
 pub mod file_server;
 pub mod headers;
 pub mod ip_filter;
@@ -30,6 +31,7 @@ pub fn bundle() -> Bundle {
         .with(ip_filter::IpFilter)
         .with(rate_limit::RateLimit)
         .with(file_server::FileServerDirective)
+        .with(encode::Encode)
 }
 
 #[cfg(test)]
@@ -46,6 +48,7 @@ mod tests {
             names,
             [
                 "access-log",
+                "encode",
                 "file-server",
                 "headers",
                 "ip-filter",

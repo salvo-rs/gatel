@@ -78,16 +78,16 @@ error[unknown-property]: `balance "round_robin"` has no property `header`
 
 | | |
 |---|---|
-| Serving | HTTP/1.1 and HTTP/2, keep-alive, graceful drain |
+| Serving | HTTP/1.1 and HTTP/2, keep-alive, graceful drain, WebSocket and other upgrades |
 | Routing | host (exact, wildcard, catch-all), path (exact, prefix), method, header/query/cookie/client-ip matchers |
 | Reverse proxy | 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, active and passive health, safe retry |
 | TLS | manual PEM certificates, SNI, mutual TLS, and a built-in development authority with `gatel trust` |
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
-| Directives | `respond`, `redirect`, `headers`, `access-log`, `request-id`, `ip-filter`, `rate-limit` |
+| Directives | `respond`, `redirect`, `file-server`, `headers`, `encode`, `access-log`, `request-id`, `ip-filter`, `rate-limit` |
 | Tooling | `validate`, `explain`, `diff`, `capabilities`, `trust` |
 
-Not yet: ACME, static files, compression, authentication, caching, the admin
-API, HTTP/3, and the CGI family. The plan for those is in `docs/`.
+Not yet: ACME, authentication, caching, rewriting, the admin API, HTTP/3, and
+the CGI family. The plan for those is in `docs/`.
 
 ## Building
 

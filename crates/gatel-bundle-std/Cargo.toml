@@ -12,10 +12,15 @@ gatel-model.workspace = true
 gatel-macros.workspace = true
 gatel-plan.workspace = true
 
+async-compression.workspace = true
 bytes.workspace = true
 http.workspace = true
+futures-util.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
 pin-project-lite.workspace = true
 salvo_core.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true

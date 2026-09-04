@@ -2,6 +2,8 @@
 
 mod support;
 
+use std::net::SocketAddr;
+
 use gatel_plan::Outcome;
 use support::*;
 
@@ -375,4 +377,163 @@ async fn a_missing_root_stops_the_reload_rather_than_404ing_everything() {
         get(gateway.address(), "/").await.contains("home"),
         "the previous generation still serves"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Compression
+// ---------------------------------------------------------------------------
+
+/// Read a response and split it into the head and the raw body bytes, because
+/// a compressed body is not text.
+async fn raw(address: SocketAddr, path: &str, accept: &str) -> (String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: {accept}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(Ok(read)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut chunk)).await
+    {
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let split = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .unwrap_or(buffer.len());
+    let head = String::from_utf8_lossy(&buffer[..split]).into_owned();
+    let body = buffer[split..].to_vec();
+    // A compressed response has no length until it ends, so it arrives chunked.
+    let body = if head.to_lowercase().contains("transfer-encoding: chunked") {
+        dechunk(&body)
+    } else {
+        body
+    };
+    (head, body)
+}
+
+/// Undo chunked framing, so a test can look at the bytes the client sees.
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    loop {
+        let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") else {
+            return out;
+        };
+        let size = std::str::from_utf8(&rest[..line_end])
+            .ok()
+            .and_then(|text| usize::from_str_radix(text.trim(), 16).ok());
+        let Some(size) = size else { return out };
+        if size == 0 {
+            return out;
+        }
+        let start = line_end + 2;
+        let end = start + size;
+        if end > rest.len() {
+            return out;
+        }
+        out.extend_from_slice(&rest[start..end]);
+        // Skip the CRLF that closes the chunk.
+        rest = &rest[(end + 2).min(rest.len())..];
+    }
+}
+
+#[tokio::test]
+async fn a_large_text_response_is_compressed_for_a_client_that_accepts_it() {
+    let gateway = Gateway::new("encode");
+    let port = free_port();
+    let root = gateway.directory.join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    // Highly compressible, and well over the threshold.
+    let original = "compress me. ".repeat(500);
+    std::fs::write(root.join("page.html"), &original).unwrap();
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" {{
+    route "/*" {{
+        encode "gzip"
+        file-server root="{}"
+    }}
+}}
+"#,
+            root.display().to_string().replace('\\', "/")
+        ))
+        .await;
+
+    let address = gateway.address();
+    let (head, body) = raw(address, "/page.html", "gzip").await;
+    assert!(head.to_lowercase().contains("content-encoding: gzip"), "{head}");
+    assert!(head.to_lowercase().contains("vary: accept-encoding"), "{head}");
+    assert!(
+        !head.to_lowercase().contains("content-length:"),
+        "the length is not known until the body ends: {head}"
+    );
+    assert!(
+        body.len() < original.len() / 2,
+        "compressed {} of {}",
+        body.len(),
+        original.len()
+    );
+    assert_eq!(
+        &body[..2],
+        &[0x1f, 0x8b],
+        "a gzip member starts with its magic bytes"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_does_not_accept_compression_gets_the_original() {
+    let gateway = Gateway::new("encode-plain");
+    let port = free_port();
+    let root = gateway.directory.join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    let original = "plain text. ".repeat(500);
+    std::fs::write(root.join("page.html"), &original).unwrap();
+
+    gateway
+        .apply(&format!(
+            "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ encode \"gzip\"\n file-server root=\"{}\" }} }}\n",
+            root.display().to_string().replace('\\', "/")
+        ))
+        .await;
+
+    let (head, body) = raw(gateway.address(), "/page.html", "identity").await;
+    assert!(!head.to_lowercase().contains("content-encoding:"), "{head}");
+    // Vary is still set: a cache must not serve this copy to a client that
+    // would have received a compressed one.
+    assert!(head.to_lowercase().contains("vary: accept-encoding"), "{head}");
+    assert_eq!(String::from_utf8_lossy(&body), original);
+}
+
+#[tokio::test]
+async fn a_small_response_is_not_worth_compressing() {
+    let gateway = Gateway::new("encode-small");
+    let port = free_port();
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" {{
+    route "/*" {{
+        encode "gzip" min-size="1KiB"
+        respond "short"
+    }}
+}}
+"#
+        ))
+        .await;
+
+    let (head, body) = raw(gateway.address(), "/", "gzip").await;
+    assert!(!head.to_lowercase().contains("content-encoding:"), "{head}");
+    assert_eq!(String::from_utf8_lossy(&body), "short");
 }

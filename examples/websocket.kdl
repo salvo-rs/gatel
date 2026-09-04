@@ -1,0 +1,26 @@
+// WebSocket and compression on the same site.
+global { http ":8080" }
+
+upstream "app" {
+    endpoint "127.0.0.1:9000"
+
+    // An upgraded connection leaves the pool, so these bound it instead of the
+    // ordinary request timeouts.
+    timeouts upgrade-idle="5m" upgrade-duration="24h"
+}
+
+site "*" {
+    access-log
+
+    // An upgrade is proxied by the same `proxy` — there is no separate
+    // WebSocket directive, because to a gateway it is the same request until
+    // the backend agrees to switch.
+    route "/ws/*" { proxy upstream="app" }
+
+    route "/*" {
+        // Streaming, so a large page never sits in memory. Already-compressed
+        // types and small responses are skipped.
+        encode "zstd" "br" "gzip" min-size="1KiB"
+        proxy upstream="app"
+    }
+}

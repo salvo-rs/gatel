@@ -32,6 +32,7 @@ gatel-http = { version = "2.0.0-alpha.1", path = "crates/gatel-http" }
 gatel-tls = { version = "2.0.0-alpha.1", path = "crates/gatel-tls" }
 gatel-bundle-std = { version = "2.0.0-alpha.1", path = "crates/gatel-bundle-std" }
 
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd", "deflate"] }
 blake3 = "1.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -71,6 +72,7 @@ tokio = { version = "1", features = [
     "time",
 ] }
 time = { version = "0.3", default-features = false, features = ["std"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "logging",

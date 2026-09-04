@@ -16,6 +16,7 @@ use salvo_core::http::{Request, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 
 use crate::dispatch::request_host;
+use crate::upgrade;
 
 /// Headers that describe one hop and must never be forwarded to the next one.
 const HOP_BY_HOP: [&str; 8] = [
@@ -149,9 +150,25 @@ impl ProxyTerminal {
             .to_string();
         let host = request_host(request);
 
+        let upgrade_to = upgrade::requested_protocol(request.headers());
+        if upgrade_to.is_some() && spec.protocol == gatel_plan::UpstreamProtocol::Http2 {
+            // An upgrade over HTTP/2 is extended CONNECT, which is a different
+            // mechanism. Saying so beats sending a request the backend will
+            // answer confusingly.
+            return Err(ProxyError::Upstream(
+                "the upstream speaks HTTP/2, which does not carry an upgrade".into(),
+            ));
+        }
+        // Taken before the outbound request is built, because the outbound
+        // request must not inherit the client's upgrade handle.
+        let client_upgrade = upgrade_to
+            .as_ref()
+            .and(request.extensions_mut().remove::<hyper::upgrade::OnUpgrade>());
+
         // Only a request whose body is known to be absent may be retried on
-        // another endpoint, and only when nothing was sent yet.
-        let retriable_body = !has_body(request);
+        // another endpoint, and only when nothing was sent yet. An upgrade is
+        // never retried: the client is already committed to one connection.
+        let retriable_body = !has_body(request) && upgrade_to.is_none();
         let max_attempts = match &spec.retry {
             Some(retry) if retriable_body => retry.attempts.max(1),
             _ => 1,
@@ -216,7 +233,8 @@ impl ProxyTerminal {
                 Err(_) => return Err(ProxyError::Timeout("overall", timeouts.overall)),
             };
 
-            let outbound = self.build_request(request, &target, &host, client_ip, tls)?;
+            let outbound =
+                self.build_request(request, &target, &host, client_ip, tls, upgrade_to.as_deref())?;
             let sent = tokio::time::timeout(timeouts.response_head, lease.send(outbound)).await;
 
             let upstream_response = match sent {
@@ -234,6 +252,22 @@ impl ProxyTerminal {
             };
 
             let status = upstream_response.status().as_u16();
+
+            // A backend that agreed to upgrade means this connection stops
+            // being HTTP. It leaves the pool and becomes a tunnel.
+            if status == 101 && upgrade_to.is_some() {
+                self.upstream.endpoints.report_traffic(&endpoint.id, false);
+                lease.poison();
+                self.start_tunnel(
+                    response,
+                    upstream_response,
+                    client_upgrade,
+                    in_flight,
+                    &endpoint.id,
+                );
+                return Ok(attempt);
+            }
+
             let failed = self.upstream.endpoints.counts_as_failure(status);
             if self.upstream.endpoints.report_traffic(&endpoint.id, failed) {
                 tracing::info!(
@@ -259,6 +293,7 @@ impl ProxyTerminal {
         host: &str,
         client_ip: Option<std::net::IpAddr>,
         tls: bool,
+        upgrade_to: Option<&str>,
     ) -> Result<http::Request<Body>, ProxyError> {
         let mut builder = http::Request::builder()
             .method(request.method().clone())
@@ -296,6 +331,18 @@ impl ProxyTerminal {
             "x-forwarded-proto",
             http::HeaderValue::from_static(if tls { "https" } else { "http" }),
         );
+        // `Connection` and `Upgrade` are hop-by-hop and were stripped above.
+        // For an upgrade they are the point of the request, so they go back —
+        // narrowed to exactly the protocol that was asked for.
+        if let Some(protocol) = upgrade_to
+            && let Ok(value) = http::HeaderValue::from_str(protocol)
+        {
+            headers.insert(http::header::UPGRADE, value);
+            headers.insert(
+                http::header::CONNECTION,
+                http::HeaderValue::from_static("upgrade"),
+            );
+        }
 
         let body = request
             .take_body()
@@ -304,6 +351,87 @@ impl ProxyTerminal {
         builder
             .body(body)
             .map_err(|error| ProxyError::Upstream(error.to_string()))
+    }
+
+    /// Answer the client with the backend's 101 and hand both halves to the
+    /// tunnel once hyper has switched the connection.
+    fn start_tunnel(
+        &self,
+        response: &mut Response,
+        upstream_response: http::Response<hyper::body::Incoming>,
+        client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+        in_flight: gatel_state::InFlight,
+        endpoint: &str,
+    ) {
+        let (parts, _) = upstream_response.into_parts();
+        response.status_code(StatusCode::SWITCHING_PROTOCOLS);
+        // A 101 carries only the framing headers that describe the switch.
+        for name in [http::header::CONNECTION, http::header::UPGRADE] {
+            if let Some(value) = parts.headers.get(&name) {
+                response.headers_mut().insert(name, value.clone());
+            }
+        }
+        for (name, value) in &parts.headers {
+            let lower = name.as_str().to_ascii_lowercase();
+            if HOP_BY_HOP.contains(&lower.as_str()) {
+                continue;
+            }
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+
+        let mut extensions = parts.extensions;
+        let Some(backend_upgrade) = extensions.remove::<hyper::upgrade::OnUpgrade>() else {
+            tracing::warn!(
+                target: "gatel::upstream",
+                event = "upgrade_unavailable",
+                upstream = self.upstream.spec.id.name(),
+                endpoint,
+            );
+            return;
+        };
+        let Some(client_upgrade) = client_upgrade else {
+            tracing::warn!(
+                target: "gatel::connection",
+                event = "upgrade_unavailable",
+                detail = "the client connection cannot be upgraded",
+            );
+            return;
+        };
+
+        let timeouts = self.upstream.spec.timeouts;
+        let upstream = self.upstream.spec.id.name().to_string();
+        let endpoint = endpoint.to_string();
+        tokio::spawn(async move {
+            // Both futures resolve only after the 101 has actually been sent,
+            // which is why this waits rather than upgrading in place.
+            let (client, backend) = match tokio::join!(client_upgrade, backend_upgrade) {
+                (Ok(client), Ok(backend)) => (client, backend),
+                (client, backend) => {
+                    tracing::debug!(
+                        target: "gatel::connection",
+                        event = "upgrade_failed",
+                        client_error = client.err().map(|error| error.to_string()),
+                        backend_error = backend.err().map(|error| error.to_string()),
+                    );
+                    return;
+                }
+            };
+            let reason = upgrade::tunnel(
+                client,
+                backend,
+                timeouts.upgrade_idle,
+                timeouts.upgrade_duration,
+                in_flight,
+            )
+            .await;
+            tracing::debug!(
+                target: "gatel::connection",
+                event = "tunnel_closed",
+                upstream,
+                endpoint,
+                reason = reason.as_str(),
+            );
+        });
     }
 
     fn write_response(
