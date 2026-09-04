@@ -108,15 +108,20 @@ pub enum ResourceKind {
     Route,
     Upstream,
     TlsPolicy,
+    /// One directive at one place in the configuration. It is a resource
+    /// because it can own state, and state needs an owner that survives a
+    /// reload.
+    Directive,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 5] = [
+    pub const ALL: [ResourceKind; 6] = [
         ResourceKind::Listener,
         ResourceKind::Site,
         ResourceKind::Route,
         ResourceKind::Upstream,
         ResourceKind::TlsPolicy,
+        ResourceKind::Directive,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -126,6 +131,7 @@ impl ResourceKind {
             ResourceKind::Route => "route",
             ResourceKind::Upstream => "upstream",
             ResourceKind::TlsPolicy => "tls-policy",
+            ResourceKind::Directive => "directive",
         }
     }
 }

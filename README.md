@@ -61,8 +61,9 @@ compile error rather than a race between them.
 
 **State outlives configuration where it should.** Raising a pool's size limit
 keeps every live connection. Changing the backend list does not, and says so.
-Changing the balancing strategy resets only the balancer's cursor. `gatel diff`
-shows which, before you apply anything.
+Changing the balancing strategy resets only the balancer's cursor. Raising a
+rate limit keeps what each client has already spent; changing what is counted
+starts a fresh count. `gatel diff` shows which, before you apply anything.
 
 **Nothing is silently ignored.** An unknown node, an unknown property, a
 misspelled strategy, a reference that does not resolve: each is an error with a
@@ -79,14 +80,14 @@ error[unknown-property]: `balance "round_robin"` has no property `header`
 |---|---|
 | Serving | HTTP/1.1 and HTTP/2, keep-alive, graceful drain |
 | Routing | host (exact, wildcard, catch-all), path (exact, prefix), method, header/query/cookie/client-ip matchers |
-| Reverse proxy | 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, passive health, safe retry |
+| Reverse proxy | 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, active and passive health, safe retry |
+| TLS | manual PEM certificates, SNI, mutual TLS, and a built-in development authority with `gatel trust` |
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
-| Directives | `respond`, `redirect`, `headers`, `access-log` |
-| Tooling | `validate`, `explain`, `diff`, `capabilities` |
+| Directives | `respond`, `redirect`, `headers`, `access-log`, `request-id`, `ip-filter`, `rate-limit` |
+| Tooling | `validate`, `explain`, `diff`, `capabilities`, `trust` |
 
-Not yet: TLS and ACME, static files, compression, authentication, rate limiting,
-caching, the admin API, HTTP/3, and the CGI family. The plan for those is in
-`docs/`.
+Not yet: ACME, static files, compression, authentication, caching, the admin
+API, HTTP/3, and the CGI family. The plan for those is in `docs/`.
 
 ## Building
 
@@ -106,6 +107,7 @@ crates/
   gatel-plan         normalize, compile, and the configuration transaction
   gatel-state        endpoints, health, balancing, connection pools
   gatel-http         listeners, routing, the reverse proxy terminal
+  gatel-tls          TLS transport, the certificate store, the development CA
   gatel-bundle-std   the standard directives
   gatel              the command line
 xtask/               checks cargo cannot express

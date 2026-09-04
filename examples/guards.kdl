@@ -1,0 +1,42 @@
+// Guards: the directives that refuse a request.
+//
+// All three are written after the terminal here, on purpose. Their phase puts
+// them ahead of it regardless — where a directive appears in the file cannot
+// move authentication or a rate limit after the thing they protect.
+global {
+    http ":8080"
+    trusted-proxy "10.0.0.0/8"
+}
+
+site "*" {
+    // Outermost, so every rejection below still gets a log line and an id.
+    access-log format="json"
+    request-id
+
+    route "/public/*" {
+        respond "anyone may read this\n"
+    }
+
+    route "/api/*" {
+        proxy "10.0.1.1:8080"
+
+        // 100 requests per minute, counted per client address.
+        rate-limit max=100 window="1m" key="ip"
+    }
+
+    route "/tenant/*" {
+        proxy "10.0.2.1:8080"
+
+        // Counted per API key instead. A request without one is refused
+        // rather than given an unlimited lane.
+        rate-limit max=1000 window="1m" key="header:x-api-key"
+    }
+
+    route "/admin/*" {
+        respond "internal only\n"
+
+        // Deny wins over allow, and an allow list excludes everything it does
+        // not name.
+        ip-filter allow="10.0.0.0/8" deny="10.9.0.0/16"
+    }
+}

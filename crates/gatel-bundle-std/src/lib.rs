@@ -10,7 +10,10 @@
 
 pub mod access_log;
 pub mod headers;
+pub mod ip_filter;
+pub mod rate_limit;
 pub mod redirect;
+pub mod request_id;
 pub mod respond;
 
 use gatel_plan::Bundle;
@@ -22,6 +25,9 @@ pub fn bundle() -> Bundle {
         .with(redirect::Redirect)
         .with(headers::Headers)
         .with(access_log::AccessLog)
+        .with(request_id::RequestId)
+        .with(ip_filter::IpFilter)
+        .with(rate_limit::RateLimit)
 }
 
 #[cfg(test)]
@@ -34,7 +40,18 @@ mod tests {
     fn the_bundle_builds_and_claims_distinct_names() {
         let registry = Registry::builder().bundle(bundle()).build().unwrap();
         let names: Vec<&str> = registry.names().collect();
-        assert_eq!(names, ["access-log", "headers", "redirect", "respond"]);
+        assert_eq!(
+            names,
+            [
+                "access-log",
+                "headers",
+                "ip-filter",
+                "rate-limit",
+                "redirect",
+                "request-id",
+                "respond"
+            ]
+        );
     }
 
     #[test]

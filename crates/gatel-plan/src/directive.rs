@@ -11,8 +11,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use gatel_model::{Code, Diagnostic, Diagnostics, Hasher, Node, did_you_mean};
+use gatel_model::{Code, Diagnostic, Diagnostics, Fingerprint, Hasher, Node, ResourceId, did_you_mean};
 use salvo_core::Handler;
+
+use crate::plan::StateKind;
 
 /// Where a middleware sits in the request chain.
 ///
@@ -115,6 +117,13 @@ pub enum Scope {
     Route,
 }
 
+const fn scope_name(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Site => "site",
+        Scope::Route => "route",
+    }
+}
+
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -200,6 +209,29 @@ impl DirectiveMeta {
     }
 }
 
+/// State a directive keeps between requests.
+///
+/// A directive that needs one declares it here rather than reaching for a
+/// global: a rate limiter's buckets must survive a reload that did not change
+/// the limit, and must *not* survive one that did.
+pub struct DirectiveState {
+    pub kind: StateKind,
+    /// Changes exactly when the existing buckets or counters stop meaning what
+    /// they meant. Raising a window does; renaming an unrelated route does not.
+    pub compatibility: Fingerprint,
+    /// Builds a fresh instance when the existing one cannot be reused.
+    pub create: Box<dyn Fn() -> Arc<dyn Any + Send + Sync> + Send + Sync>,
+}
+
+impl std::fmt::Debug for DirectiveState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectiveState")
+            .field("kind", &self.kind)
+            .field("compatibility", &self.compatibility.short())
+            .finish()
+    }
+}
+
 /// A decoded directive configuration.
 ///
 /// `hash_into` must cover everything that changes behaviour and nothing that
@@ -210,7 +242,15 @@ pub trait DirectiveConfig: Any + Send + Sync + 'static {
     /// Build the handler for one generation. Called during `prepare`, so a
     /// failure here rejects the candidate and leaves the running configuration
     /// untouched.
-    fn build(&self) -> Result<Arc<dyn Handler>, String>;
+    ///
+    /// `state` is whatever [`DirectiveConfig::state`] asked for, resolved
+    /// against what is already running. A stateless directive ignores it.
+    fn build(&self, state: Option<Arc<dyn Any + Send + Sync>>) -> Result<Arc<dyn Handler>, String>;
+
+    /// What this directive needs to keep between requests, if anything.
+    fn state(&self) -> Option<DirectiveState> {
+        None
+    }
 
     /// One line for `gatel explain`.
     fn describe(&self) -> String;
@@ -231,10 +271,32 @@ pub struct DirectiveInstance {
     pub scope: Scope,
     /// Explicit `order=` if written, otherwise the directive's default.
     pub order: i32,
+    /// Who owns this instance's state. Derived from where it sits, so moving a
+    /// directive to another route gives it different state, and editing an
+    /// unrelated part of the file does not.
+    pub owner: ResourceId,
     pub origin: gatel_model::Origin,
 }
 
 impl DirectiveInstance {
+    /// Give this instance an owner derived from the resource it sits on.
+    pub fn own(&mut self, resource: &ResourceId) {
+        self.owner = ResourceId::derived(
+            gatel_model::ResourceKind::Directive,
+            &[resource.name(), self.meta.name, scope_name(self.scope)],
+        );
+    }
+
+    /// The state binding this instance needs, if any.
+    pub fn state_binding(&self) -> Option<crate::plan::StateBinding> {
+        self.config.state().map(|state| crate::plan::StateBinding {
+            owner: self.owner.clone(),
+            kind: state.kind,
+            compatibility: state.compatibility,
+            policy: crate::plan::ResetPolicy::Preserve,
+        })
+    }
+
     /// The stable sort key: outer scope first, then phase, then order, then
     /// name. Declaration position never appears.
     pub fn sort_key(&self) -> (u8, u8, i32, &'static str) {
@@ -408,11 +470,18 @@ impl Registry {
         stripped.props.retain(|property| property.name != "order");
 
         let config = directive.decode(&stripped, diagnostics)?;
+        // A placeholder until the enclosing resource is known; `normalize`
+        // calls `own` once the site or route it belongs to has an identity.
+        let owner = ResourceId::derived(
+            gatel_model::ResourceKind::Directive,
+            &[meta.name, scope_name(scope)],
+        );
         Some(DirectiveInstance {
             meta,
             config,
             scope,
             order,
+            owner,
             origin: node.origin.clone(),
         })
     }
@@ -475,7 +544,10 @@ mod tests {
             hasher.update_str(&self.label);
         }
 
-        fn build(&self) -> Result<Arc<dyn Handler>, String> {
+        fn build(
+            &self,
+            _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        ) -> Result<Arc<dyn Handler>, String> {
             Err("not built in tests".to_string())
         }
 

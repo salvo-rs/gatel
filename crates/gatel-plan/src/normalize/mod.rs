@@ -250,6 +250,11 @@ impl Context<'_> {
 
         reject_duplicate_directives(&directives, self.diagnostics);
         directives.sort_by_key(crate::directive::DirectiveInstance::sort_key);
+        // Now that the site has an identity, its directives can own state under
+        // it: state follows the resource it was written on.
+        for directive in &mut directives {
+            directive.own(&id);
+        }
 
         if self.diagnostics.error_count() > errors_before {
             return None;
@@ -497,6 +502,9 @@ impl Context<'_> {
 
         reject_duplicate_directives(&directives, self.diagnostics);
         directives.sort_by_key(crate::directive::DirectiveInstance::sort_key);
+        for directive in &mut directives {
+            directive.own(&id);
+        }
 
         if self.diagnostics.error_count() > errors_before {
             return None;

@@ -125,7 +125,8 @@ pub fn prepare(
             for route in &site.routes {
                 let mut chain = Vec::with_capacity(route.chain.len() + 1);
                 for directive in &route.chain {
-                    chain.push(directive.config.build().map_err(|error| {
+                    let state = resolve_state(directive, resources.state);
+                    chain.push(directive.config.build(state).map_err(|error| {
                         format!(
                             "`{}` in route `{}`: {error}",
                             directive.meta.name,
@@ -133,7 +134,12 @@ pub fn prepare(
                         )
                     })?);
                 }
-                chain.push(build_terminal(&route.terminal, &upstreams, route.id.name())?);
+                chain.push(build_terminal(
+                    &route.terminal,
+                    &upstreams,
+                    resources.state,
+                    route.id.name(),
+                )?);
                 routes.push(PreparedRoute {
                     id: route.id.clone(),
                     path: route.path.clone(),
@@ -194,9 +200,24 @@ fn terminal_name(terminal: &Terminal) -> &'static str {
     }
 }
 
+/// Resolve whatever a directive said it needs to keep between requests.
+///
+/// Reusing is the normal case: a reload that did not change a rate limit must
+/// not hand every client a fresh bucket.
+fn resolve_state(
+    directive: &gatel_plan::DirectiveInstance,
+    state: &StateRegistry,
+) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    let binding = directive.state_binding()?;
+    let declared = directive.config.state()?;
+    let (value, _) = state.bind_any(&binding, &declared.create);
+    Some(value)
+}
+
 fn build_terminal(
     terminal: &Terminal,
     upstreams: &UpstreamRuntimes,
+    state: &StateRegistry,
     route: &str,
 ) -> Result<Arc<dyn salvo_core::Handler>, String> {
     match terminal {
@@ -206,9 +227,12 @@ fn build_terminal(
             })?;
             Ok(Arc::new(crate::proxy::ProxyTerminal::new(Arc::clone(runtime))))
         }
-        Terminal::Directive(instance) => instance
-            .config
-            .build()
-            .map_err(|error| format!("`{}` in route `{route}`: {error}", instance.meta.name)),
+        Terminal::Directive(instance) => {
+            let resolved = resolve_state(instance, state);
+            instance
+                .config
+                .build(resolved)
+                .map_err(|error| format!("`{}` in route `{route}`: {error}", instance.meta.name))
+        }
     }
 }

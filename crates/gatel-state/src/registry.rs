@@ -103,6 +103,49 @@ impl StateRegistry {
         )
     }
 
+    /// Resolve a binding whose type is only known to the directive that
+    /// declared it.
+    ///
+    /// The same reuse rule as [`StateRegistry::bind`], for callers that hold an
+    /// already-erased value: a directive builds its own state, so the registry
+    /// never needs to know what is inside.
+    pub fn bind_any(
+        &self,
+        binding: &StateBinding,
+        create: &dyn Fn() -> Arc<dyn Any + Send + Sync>,
+    ) -> (Arc<dyn Any + Send + Sync>, Resolution) {
+        let key = StateKey {
+            owner: binding.owner.clone(),
+            kind: binding.kind,
+        };
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+
+        if binding.policy == ResetPolicy::Preserve
+            && let Some(slot) = slots.get(&key)
+            && slot.compatibility == binding.compatibility
+        {
+            return (Arc::clone(&slot.value), Resolution::Reused);
+        }
+
+        let replaced = slots.contains_key(&key);
+        let value = create();
+        slots.insert(
+            key,
+            Slot {
+                compatibility: binding.compatibility,
+                value: Arc::clone(&value),
+            },
+        );
+        (
+            value,
+            if replaced {
+                Resolution::Replaced
+            } else {
+                Resolution::Created
+            },
+        )
+    }
+
     /// Look up running state without creating it.
     pub fn get<T: Send + Sync + 'static>(&self, owner: &ResourceId, kind: StateKind) -> Option<Arc<T>> {
         let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());

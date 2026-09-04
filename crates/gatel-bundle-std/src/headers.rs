@@ -78,7 +78,10 @@ impl DirectiveConfig for Config {
         hasher.update_ordered(&self.response, |operation, hasher| operation.hash_into(hasher));
     }
 
-    fn build(&self) -> Result<Arc<dyn Handler>, String> {
+    fn build(
+        &self,
+        _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Arc<dyn Handler>, String> {
         Ok(Arc::new(HeadersHandler {
             request: compile(&self.request)?,
             response: compile(&self.response)?,

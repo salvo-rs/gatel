@@ -313,6 +313,28 @@ fn collect_bindings(spec: &Spec, upstreams: &[Arc<Upstream>]) -> Vec<StateBindin
         }
     }
 
+    // A directive that keeps something between requests declares it, and it
+    // lands in the same table the pool and the balancer use.
+    for site in &spec.sites {
+        for directive in &site.directives {
+            if let Some(binding) = directive.state_binding() {
+                bindings.push(binding);
+            }
+        }
+        for route in &site.routes {
+            for directive in &route.directives {
+                if let Some(binding) = directive.state_binding() {
+                    bindings.push(binding);
+                }
+            }
+            if let Terminal::Directive(instance) = &route.terminal
+                && let Some(binding) = instance.state_binding()
+            {
+                bindings.push(binding);
+            }
+        }
+    }
+
     for site in &spec.sites {
         if let Some(tls) = &site.tls {
             let mut certificate = Hasher::new();
@@ -400,7 +422,10 @@ mod tests {
             hasher.update_str(&self.0);
         }
 
-        fn build(&self) -> Result<Arc<dyn Handler>, String> {
+        fn build(
+            &self,
+            _state: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        ) -> Result<Arc<dyn Handler>, String> {
             Err("test".into())
         }
 
