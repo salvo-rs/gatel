@@ -220,6 +220,29 @@ rotation. Liveness answers yes as long as it can answer at all — a liveness
 probe that fails on a downstream condition restarts a process that was working,
 usually across every replica at once.
 
+## The one thing that is filled in
+
+Nothing else in this design guesses, so the exception is worth stating exactly.
+A site with no `tls` gets a development certificate when **both** of these hold:
+
+- every listener it could use terminates TLS, so without one it would be served
+  nowhere at all, and
+- its host can only ever be local — `localhost`, `*.localhost`, or a name under
+  `.test`, `.local`, `.internal` or `.home.arpa`, or a loopback, private or
+  link-local address.
+
+Both halves matter. The first means this only ever turns an error into the one
+outcome that could have been meant; it never moves a site that was already
+working. The second means it is not a guess: no public authority will issue for
+those names, so a certificate from the built-in authority is the only one that
+could exist. A public name in the same position is refused at compile time and
+told which of the three ways to get a certificate is missing, because nothing
+this process could sign would be accepted for it.
+
+`gatel explain` says so on the site line, and `gatel trust` is still a separate
+command: a certificate appearing without being asked for is a convenience, and
+changing what every program on the machine trusts is not.
+
 ## Whose error is it
 
 `error-pages` replaces the body of an error the gateway produced, and leaves

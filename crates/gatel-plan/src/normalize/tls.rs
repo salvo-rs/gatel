@@ -93,6 +93,10 @@ impl Context<'_> {
                 );
             }
         }
-        Some(SiteTls { source, client_auth })
+        Some(SiteTls {
+            source,
+            client_auth,
+            automatic: false,
+        })
     }
 }

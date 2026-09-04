@@ -743,3 +743,137 @@ fn a_test_certificate_authority_can_be_named() {
     assert_eq!(acme.directory, "https://127.0.0.1:14000/dir");
     assert_eq!(acme.renew_before, std::time::Duration::from_secs(3600));
 }
+
+// ---------------------------------------------------------------------------
+// Development certificates, without being asked
+// ---------------------------------------------------------------------------
+
+const LOCAL: &str = r#"
+global { https ":8443" }
+site "localhost" {
+    route "/" { respond "hi" }
+}
+"#;
+
+#[test]
+fn a_local_name_that_could_only_be_served_over_tls_gets_a_development_certificate() {
+    // The whole point is what a test environment feels like: an https listener
+    // and a site, with no line about certificates to distract from what is
+    // actually being tested.
+    let spec = spec(LOCAL);
+    let tls = spec.sites[0].tls.as_ref().expect("a certificate was arranged");
+    assert_eq!(tls.source, gatel_plan::CertificateSource::Internal);
+    assert!(tls.automatic, "and nothing in the file asked for it");
+}
+
+#[test]
+fn every_name_that_can_only_be_local_is_covered() {
+    for host in [
+        "localhost",
+        "api.localhost",
+        "gateway.test",
+        "printer.local",
+        "db.internal",
+        "127.0.0.1",
+        "10.1.2.3",
+        "192.168.0.9",
+        // An IPv6 literal cannot be written as a site host yet — `HostMatch`
+        // refuses anything with a colon — so the classifier is covered by a
+        // unit test in `matcher.rs` instead.
+    ] {
+        let spec = spec(&LOCAL.replace("localhost", host));
+        assert!(
+            spec.sites[0].tls.as_ref().is_some_and(|tls| tls.automatic),
+            "`{host}` should have been recognised as local"
+        );
+    }
+}
+
+#[test]
+fn a_wildcard_local_name_gets_one_too() {
+    let spec = spec(&LOCAL.replace(r#"site "localhost""#, r#"site "*.localhost""#));
+    assert!(spec.sites[0].tls.as_ref().is_some_and(|tls| tls.automatic));
+}
+
+#[test]
+fn a_public_name_is_told_what_is_missing_rather_than_given_a_certificate() {
+    // Nothing this process could sign would be accepted for `example.com`, so
+    // inventing one would only move the failure to the first handshake.
+    let diagnostics = errors(&LOCAL.replace("localhost", "example.com"));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("has no certificate"))
+    );
+    let help = diagnostics.iter().next().unwrap().help.clone().unwrap();
+    assert!(
+        help.contains("tls acme") && help.contains("tls internal"),
+        "{help}"
+    );
+}
+
+#[test]
+fn a_catch_all_site_is_not_a_name_and_gets_nothing() {
+    let diagnostics = errors(&LOCAL.replace(r#"site "localhost""#, r#"site "*""#));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("has no certificate"))
+    );
+}
+
+#[test]
+fn a_site_that_can_be_served_in_plaintext_is_left_alone() {
+    // This only ever turns an error into the one outcome that could have been
+    // meant. A site that already had somewhere to go keeps going there.
+    let spec = spec(
+        r#"
+global {
+    http ":8080"
+    https ":8443"
+}
+site "localhost" {
+    route "/" { respond "hi" }
+}
+"#,
+    );
+    assert!(
+        spec.sites[0].tls.is_none(),
+        "the plaintext listener was already serving it"
+    );
+}
+
+#[test]
+fn nothing_is_inferred_when_no_listener_terminates_tls() {
+    let spec = spec(
+        r#"
+global { http ":8080" }
+site "localhost" { route "/" { respond "hi" } }
+"#,
+    );
+    assert!(spec.sites[0].tls.is_none());
+}
+
+#[test]
+fn an_explicit_certificate_is_never_replaced() {
+    let spec = spec(
+        r#"
+global { https ":8443" }
+site "localhost" {
+    tls internal
+    route "/" { respond "hi" }
+}
+"#,
+    );
+    let tls = spec.sites[0].tls.as_ref().unwrap();
+    assert!(!tls.automatic, "written down, not inferred");
+}
+
+#[test]
+fn writing_it_out_and_having_it_inferred_are_the_same_request() {
+    // `spec_hash` answers "did the operator ask for something different?", and
+    // these two did not.
+    let inferred = spec(LOCAL);
+    let written = spec(&LOCAL.replace("site \"localhost\" {", "site \"localhost\" {\n    tls internal"));
+    assert_eq!(inferred.fingerprint(), written.fingerprint());
+}

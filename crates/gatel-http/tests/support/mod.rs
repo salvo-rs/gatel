@@ -242,12 +242,33 @@ impl Drop for Gateway {
     }
 }
 
+/// A port nothing is using, and that this process has not already claimed.
+///
+/// Binding and releasing is the only way to ask the operating system for one,
+/// and it will hand the same one out again a moment later — so tests running in
+/// parallel would collide. Remembering what was given out removes that, which
+/// is the collision that actually happens.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static CLAIMED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let claimed = CLAIMED.get_or_init(|| Mutex::new(HashSet::new()));
+    for _ in 0..64 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if claimed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(port)
+        {
+            return port;
+        }
+    }
+    panic!("no free port after 64 attempts");
 }
 
 /// A minimal HTTP/1.1 client: raw enough that the test depends on the wire,

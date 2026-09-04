@@ -175,3 +175,97 @@ site "*" {{
         "only the https listener terminates TLS"
     );
 }
+
+#[tokio::test]
+async fn a_local_name_is_served_over_tls_without_being_asked() {
+    // What a test environment should feel like: an https listener, a site, and
+    // nothing about certificates.
+    let gateway = Gateway::new("tls-automatic");
+    let port = free_port();
+    let outcome = gateway
+        .apply(&format!(
+            r#"
+global {{ https "127.0.0.1:{port}" }}
+site "localhost" id="local" {{
+    route "/*" id="root" {{ respond "over tls\n" }}
+}}
+"#
+        ))
+        .await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::Started { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        gateway.certificates.len(),
+        1,
+        "the development authority issued one during prepare"
+    );
+}
+
+#[tokio::test]
+async fn a_development_certificate_is_issued_once_and_then_kept() {
+    let gateway = Gateway::new("tls-automatic-reload");
+    let port = free_port();
+    let config = |body: &str| {
+        format!(
+            r#"
+global {{ https "127.0.0.1:{port}" }}
+site "localhost" id="local" {{
+    route "/*" id="root" {{ respond "{body}" }}
+}}
+"#
+        )
+    };
+    gateway.apply(&config("first")).await;
+    let first = gateway
+        .certificates
+        .get(&gatel_model::ResourceId::new(
+            gatel_model::ResourceKind::Site,
+            "local",
+        ))
+        .expect("a certificate");
+
+    gateway.apply(&config("second")).await;
+    let second = gateway
+        .certificates
+        .get(&gatel_model::ResourceId::new(
+            gatel_model::ResourceKind::Site,
+            "local",
+        ))
+        .expect("still a certificate");
+
+    // A new certificate on every reload would make browsers re-prompt and
+    // would defeat session resumption.
+    assert!(
+        std::sync::Arc::ptr_eq(&first.certified, &second.certified),
+        "the same certificate survived the reload"
+    );
+}
+
+#[tokio::test]
+async fn a_public_name_with_no_certificate_is_refused_at_compile_time() {
+    let gateway = Gateway::new("tls-public");
+    let port = free_port();
+    let outcome = gateway
+        .apply(&format!(
+            r#"
+global {{ https "127.0.0.1:{port}" }}
+site "example.com" id="public" {{
+    route "/*" id="root" {{ respond "hi\n" }}
+}}
+"#
+        ))
+        .await;
+    // Not a prepare failure and not a bad handshake later: nothing this
+    // process could sign would be accepted for that name.
+    let gatel_plan::Outcome::Rejected(diagnostics) = outcome else {
+        panic!("expected the configuration to be refused: {outcome:?}");
+    };
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("has no certificate")),
+        "{diagnostics}"
+    );
+}

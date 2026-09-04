@@ -132,14 +132,18 @@ fn load_certificate(
             }
         }
         CertificateSource::Internal => {
-            // A wildcard or catch-all site has no single name to certify, so
-            // the operator has to say what to issue for.
-            let HostMatch::Exact(name) = host else {
-                return Err(format!(
-                    "site `{}` cannot use `tls internal`: there is no single host to issue for",
-                    host.describe()
-                ));
+            // `*` has no name at all; `*.localhost` does, and our own authority
+            // can issue a wildcard for it.
+            let name = match host {
+                HostMatch::Exact(name) => name.clone(),
+                HostMatch::Suffix(suffix) => format!("*{suffix}"),
+                HostMatch::Any => {
+                    return Err(
+                        "site `*` cannot use `tls internal`: there is no host to issue for".to_string(),
+                    );
+                }
             };
+            let name = &name;
             // Only issue once per process: a new certificate on every reload
             // would make browsers re-prompt and would defeat session resumption.
             if preparation.store.get(&site).is_none() {
@@ -319,6 +323,7 @@ mod tests {
                     key: SecretRef::parse("key.pem").unwrap(),
                 },
                 client_auth: None,
+                automatic: false,
             }
         }
     }
@@ -357,6 +362,7 @@ mod tests {
                 key: SecretRef::parse("absent-key.pem").unwrap(),
             },
             client_auth: None,
+            automatic: false,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("api.example.com", Some(tls))]);
         let error = fixture.prepare(&listener).unwrap_err();
@@ -377,6 +383,7 @@ mod tests {
         let tls = SiteTls {
             source: CertificateSource::Internal,
             client_auth: None,
+            automatic: false,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("app.localhost", Some(tls))]);
 
@@ -395,6 +402,7 @@ mod tests {
         let tls = SiteTls {
             source: CertificateSource::Internal,
             client_auth: None,
+            automatic: false,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("app.localhost", Some(tls))]);
 
@@ -415,15 +423,32 @@ mod tests {
     }
 
     #[test]
-    fn a_wildcard_site_cannot_use_the_internal_authority() {
+    fn a_catch_all_site_cannot_use_the_internal_authority() {
+        // `*` is not a name, so there is nothing to put in a certificate.
         let fixture = Fixture::new("wildcard");
         let tls = SiteTls {
             source: CertificateSource::Internal,
             client_auth: None,
+            automatic: false,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("*", Some(tls))]);
         let error = fixture.prepare(&listener).unwrap_err();
-        assert!(error.contains("no single host"), "{error}");
+        assert!(error.contains("no host to issue for"), "{error}");
+    }
+
+    #[test]
+    fn a_wildcard_name_gets_a_wildcard_certificate() {
+        // `*.localhost` is a name, and our own authority can certify it — which
+        // a public one never would.
+        let fixture = Fixture::new("wildcard-name");
+        let tls = SiteTls {
+            source: CertificateSource::Internal,
+            client_auth: None,
+            automatic: true,
+        };
+        let listener = listener(ListenerProtocol::Https, vec![site("*.localhost", Some(tls))]);
+        assert!(fixture.prepare(&listener).unwrap().is_some());
+        assert_eq!(fixture.store.len(), 1);
     }
 
     #[test]
@@ -435,6 +460,7 @@ mod tests {
         let tls = SiteTls {
             source: CertificateSource::Acme,
             client_auth: None,
+            automatic: false,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("api.example.com", Some(tls))]);
         let config = acme_config();
@@ -454,6 +480,7 @@ mod tests {
         let tls = SiteTls {
             source: CertificateSource::Acme,
             client_auth: None,
+            automatic: false,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("api.example.com", Some(tls))]);
         let error = fixture.prepare_with(&listener, None).unwrap_err();
@@ -478,6 +505,7 @@ mod tests {
         let tls = SiteTls {
             source: CertificateSource::Acme,
             client_auth: None,
+            automatic: false,
         };
         let listener = listener(ListenerProtocol::Https, vec![site("api.example.com", Some(tls))]);
         fixture.prepare_with(&listener, Some(&config)).unwrap();

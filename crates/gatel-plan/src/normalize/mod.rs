@@ -19,7 +19,9 @@ mod global;
 mod tls;
 mod validate;
 
-use validate::{check_references, check_uniqueness, reject_duplicate_directives, sort_routes};
+use validate::{
+    apply_automatic_tls, check_references, check_uniqueness, reject_duplicate_directives, sort_routes,
+};
 
 const TOP_LEVEL: [&str; 3] = ["global", "site", "upstream"];
 
@@ -102,6 +104,9 @@ pub fn normalize(snapshot: &Snapshot, registry: &Registry) -> Result<Spec, Diagn
         sites,
         upstreams,
     };
+    // Before every check that reads `tls`, because what it fills in is part of
+    // what the rest of them are checking.
+    apply_automatic_tls(&mut spec, &mut diagnostics);
     check_uniqueness(&spec, &mut diagnostics);
     check_references(&spec, &mut diagnostics);
     sort_routes(&mut spec);

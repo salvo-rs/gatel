@@ -1,0 +1,33 @@
+// HTTPS in a test environment, with nothing about certificates in it.
+//
+// `localhost`, `*.localhost`, and anything under `.test`, `.local`, `.internal`
+// or `.home.arpa` can only ever mean something on this machine or this network.
+// No public authority will issue for them, so a development certificate is not
+// a guess about what was meant — it is the only certificate that could exist.
+//
+// Gatel issues one from an authority it generates on first use. Run
+// `gatel trust` once to make this machine accept it; that is its own command
+// because adding a trust anchor changes what every program here believes.
+//
+// This only ever happens when the site would otherwise be served nowhere at
+// all. A site that a plaintext listener could serve is left exactly as it was.
+global {
+    https ":8443"
+}
+
+site "localhost" {
+    route "/api/*" {
+        proxy "127.0.0.1:9000"
+    }
+    route "/*" {
+        respond "served over TLS, and the file says nothing about it\n"
+    }
+}
+
+// A wildcard works too: our own authority can issue `*.localhost`, which a
+// public one never would.
+site "*.localhost" {
+    route "/*" {
+        respond "any name under localhost\n"
+    }
+}

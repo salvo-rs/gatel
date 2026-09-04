@@ -91,6 +91,25 @@ impl HostMatch {
         }
     }
 
+    /// The name to certify if this host is one that can only ever be local.
+    ///
+    /// A public certificate authority will not issue for any of these, and
+    /// nothing outside the machine or the network can resolve them — so a
+    /// development certificate is not a guess about what was meant, it is the
+    /// only certificate that could exist.
+    pub fn local_name(&self) -> Option<String> {
+        match self {
+            // Nothing to certify: `*` is not a name.
+            HostMatch::Any => None,
+            HostMatch::Exact(name) => is_local(name).then(|| name.clone()),
+            HostMatch::Suffix(suffix) => {
+                // `*.localhost` matches `a.localhost`, so the certificate has
+                // to be a wildcard one. Our own authority can issue that.
+                is_local(suffix.trim_start_matches('.')).then(|| format!("*{suffix}"))
+            }
+        }
+    }
+
     pub fn hash_into(&self, hasher: &mut Hasher) {
         hasher.update_str(&self.describe());
     }
@@ -442,6 +461,35 @@ pub fn parse_match_node(node: &Node, diagnostics: &mut Diagnostics) -> Vec<Match
 
 /// Route selection order: more specific first. Ties are impossible because
 /// duplicate matchers are rejected at compile time.
+/// Names reserved for local use, which no public authority will certify.
+///
+/// `.localhost` and `.test` are RFC 6761; `.local` is mDNS; `.internal` was
+/// set aside for private networks. A name under any of them cannot resolve
+/// outside the machine or the network it is on.
+const LOCAL_SUFFIXES: [&str; 5] = [".localhost", ".test", ".local", ".internal", ".home.arpa"];
+
+/// Whether a name or address can only ever mean something local.
+fn is_local(name: &str) -> bool {
+    if name == "localhost" {
+        return true;
+    }
+    if let Ok(address) = name.parse::<IpAddr>() {
+        return match address {
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            // `fc00::/7` is the unique-local range; there is no std method for
+            // it that is stable, so it is written out.
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    LOCAL_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix) && name.len() > suffix.len())
+}
+
 pub fn compare_specificity(
     a: (&HostMatch, &PathMatch, &MethodMatch, usize),
     b: (&HostMatch, &PathMatch, &MethodMatch, usize),
@@ -455,6 +503,37 @@ pub fn compare_specificity(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_name_that_can_only_be_local_is_recognised() {
+        let exact = |name: &str| super::HostMatch::Exact(name.to_string()).local_name();
+        assert_eq!(exact("localhost"), Some("localhost".to_string()));
+        assert_eq!(exact("api.test"), Some("api.test".to_string()));
+        assert_eq!(exact("printer.local"), Some("printer.local".to_string()));
+        assert_eq!(exact("db.internal"), Some("db.internal".to_string()));
+        assert_eq!(exact("gw.home.arpa"), Some("gw.home.arpa".to_string()));
+        assert_eq!(exact("127.0.0.1"), Some("127.0.0.1".to_string()));
+        assert_eq!(exact("10.1.2.3"), Some("10.1.2.3".to_string()));
+        // Written directly, because a site host with a colon cannot be parsed.
+        assert_eq!(exact("::1"), Some("::1".to_string()));
+        assert_eq!(exact("fd00::1"), Some("fd00::1".to_string()));
+        assert_eq!(exact("fe80::1"), Some("fe80::1".to_string()));
+
+        assert_eq!(exact("example.com"), None);
+        assert_eq!(exact("localhost.example.com"), None);
+        assert_eq!(exact("8.8.8.8"), None);
+        // `.local` has to have something in front of it.
+        assert_eq!(exact("local"), None);
+        assert_eq!(super::HostMatch::Any.local_name(), None);
+        assert_eq!(
+            super::HostMatch::Suffix(".localhost".to_string()).local_name(),
+            Some("*.localhost".to_string())
+        );
+        assert_eq!(
+            super::HostMatch::Suffix(".example.com".to_string()).local_name(),
+            None
+        );
+    }
+
     use std::collections::HashMap;
 
     use super::*;

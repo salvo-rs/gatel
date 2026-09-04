@@ -69,6 +69,14 @@ pub enum CertificateSource {
 pub struct SiteTls {
     pub source: CertificateSource,
     pub client_auth: Option<ClientAuth>,
+    /// True when nothing in the configuration said `tls`, and a name that can
+    /// only ever be local was given a development certificate so it could be
+    /// served at all.
+    ///
+    /// Deliberately not hashed: writing `tls internal` and having it inferred
+    /// are the same request, and `spec_hash` answers "did the operator ask for
+    /// something different?".
+    pub automatic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +478,7 @@ mod tests {
             host: HostMatch::parse(host).unwrap(),
             listeners,
             tls: tls.then_some(SiteTls {
+                automatic: false,
                 source: CertificateSource::Internal,
                 client_auth: None,
             }),

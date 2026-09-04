@@ -73,6 +73,8 @@ carries; it is the same list, generated rather than written down.
 | Mutual TLS | yes | done | `gatel-tls/src/server.rs` |
 | Certificates outlive generations; a renewal produces none | yes | done | `gatel-tls/src/store.rs` |
 | A development authority, and `gatel trust` as its own command | yes | done | `gatel-tls/src/internal.rs`, `gatel-http/tests/tls.rs` |
+| A local name served over TLS with nothing said about certificates | yes | done | `gatel-plan/tests/normalize.rs`, `gatel-http/tests/tls.rs` |
+| A public name in the same position refused at compile time | yes | done | `gatel-http/tests/tls.rs` |
 | No `tls-skip-verify`, anywhere | yes | done | the option does not exist |
 | ACME with HTTP-01 | yes | done | `gatel-http/tests/acme.rs` drives a whole order — the real client, a test authority that actually fetches the challenge from the gateway |
 | ACME with TLS-ALPN-01 or DNS-01 | no (2.1) | not started | `certon` implements both; neither is wired to a listener yet |

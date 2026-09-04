@@ -26,7 +26,7 @@ pub fn explain(plan: &Plan) -> String {
             out.push_str("  (no sites)\n");
         }
         for site in &listener.sites {
-            out.push_str(&format!("  site {}\n", site.host.describe()));
+            out.push_str(&format!("  site {}{}\n", site.host.describe(), tls_note(site)));
             for route in &site.routes {
                 out.push_str(&format!(
                     "    route {} {} [{}]\n",
@@ -173,5 +173,27 @@ fn diff_lines(out: &mut String, label: &str, before: &[String], after: &[String]
     }
     for line in added {
         out.push_str(&format!("  + {line}\n"));
+    }
+}
+
+/// Where a site's certificate comes from, when that is worth saying.
+///
+/// The automatic case earns a note because nothing in the file mentions it: a
+/// name that can only ever be local was given a development certificate so it
+/// could be served at all, and the reader should not have to work that out.
+fn tls_note(site: &gatel_plan::SitePlan) -> String {
+    match &site.tls {
+        None => String::new(),
+        Some(tls) => {
+            let source = match &tls.source {
+                gatel_plan::CertificateSource::Manual { .. } => "tls from files",
+                gatel_plan::CertificateSource::Internal if tls.automatic => {
+                    return "  (tls internal, automatic — run `gatel trust`)".to_string();
+                }
+                gatel_plan::CertificateSource::Internal => "tls internal",
+                gatel_plan::CertificateSource::Acme => "tls acme",
+            };
+            format!("  ({source})")
+        }
     }
 }

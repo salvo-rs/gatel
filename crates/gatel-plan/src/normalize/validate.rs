@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use gatel_model::{Code, Diagnostic, Diagnostics, Origin, did_you_mean};
 
 use crate::matcher::{HostMatch, compare_specificity};
-use crate::spec::{CertificateSource, Spec, Terminal};
+use crate::spec::{CertificateSource, SiteTls, Spec, Terminal};
 
 pub(super) fn reject_duplicate_directives(
     directives: &[crate::directive::DirectiveInstance],
@@ -255,6 +255,89 @@ fn check_acme(spec: &Spec, diagnostics: &mut Diagnostics) {
                 )
                 .with_help("name the site, or use `tls cert=.. key=..` for a certificate you already have"),
             );
+        }
+    }
+}
+
+/// Give a local name a development certificate when it would otherwise have
+/// nowhere to be served.
+///
+/// This is the one place the compiler fills something in that the operator did
+/// not write, and it is narrow on purpose. It applies only when every listener
+/// the site could use terminates TLS — so without a certificate the site would
+/// be served nowhere at all — and only to a name no public authority would ever
+/// issue for. It turns an error into the only outcome that could have been
+/// meant; it never moves a site that was already working.
+///
+/// The point is what a test environment feels like. `https ":8443"` and
+/// `site "localhost"` should serve, once `gatel trust` has been run, without a
+/// line about certificates that has nothing to do with what is being tested.
+pub(super) fn apply_automatic_tls(spec: &mut Spec, diagnostics: &mut Diagnostics) {
+    let tls_listeners: Vec<String> = spec
+        .listeners
+        .iter()
+        .filter(|listener| listener.protocol.is_tls())
+        .map(|listener| listener.name.clone())
+        .collect();
+    let plaintext_listeners: Vec<String> = spec
+        .listeners
+        .iter()
+        .filter(|listener| !listener.protocol.is_tls())
+        .map(|listener| listener.name.clone())
+        .collect();
+    if tls_listeners.is_empty() {
+        return;
+    }
+
+    for site in &mut spec.sites {
+        if site.tls.is_some() {
+            continue;
+        }
+        // Could this site be served in plaintext? If so it already has
+        // somewhere to go, and nothing is inferred.
+        let has_plaintext = if site.listeners.is_empty() {
+            !plaintext_listeners.is_empty()
+        } else {
+            site.listeners
+                .iter()
+                .any(|name| plaintext_listeners.contains(name))
+        };
+        if has_plaintext {
+            continue;
+        }
+        let on_tls = if site.listeners.is_empty() {
+            true
+        } else {
+            site.listeners.iter().any(|name| tls_listeners.contains(name))
+        };
+        if !on_tls {
+            continue;
+        }
+
+        match site.host.local_name() {
+            Some(_) => {
+                site.tls = Some(SiteTls {
+                    source: CertificateSource::Internal,
+                    client_auth: None,
+                    automatic: true,
+                });
+            }
+            // A name somebody else has to vouch for. Saying which of the three
+            // ways to get one is missing beats inventing a certificate that no
+            // client would accept.
+            None => diagnostics.push(
+                Diagnostic::error(
+                    Code::MissingField,
+                    site.origin.clone(),
+                    format!(
+                        "site `{}` can only be served over TLS, and has no certificate",
+                        site.host.describe()
+                    ),
+                )
+                .with_help(
+                    "add `tls cert=.. key=..` for one you have, `tls acme` to have one issued,                      or `tls internal` for a development certificate",
+                ),
+            ),
         }
     }
 }
