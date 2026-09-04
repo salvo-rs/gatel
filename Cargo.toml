@@ -8,10 +8,7 @@ members = [
     "crates/gatel-plan",
     "crates/gatel-state",
     "crates/gatel-http",
-    "crates/gatel-tls",
     "crates/gatel-bundle-std",
-    "crates/gatel-observe",
-    "crates/gatel-testkit",
     "xtask",
 ]
 
@@ -31,10 +28,7 @@ gatel-kdl = { version = "2.0.0-alpha.1", path = "crates/gatel-kdl" }
 gatel-plan = { version = "2.0.0-alpha.1", path = "crates/gatel-plan" }
 gatel-state = { version = "2.0.0-alpha.1", path = "crates/gatel-state" }
 gatel-http = { version = "2.0.0-alpha.1", path = "crates/gatel-http" }
-gatel-tls = { version = "2.0.0-alpha.1", path = "crates/gatel-tls" }
 gatel-bundle-std = { version = "2.0.0-alpha.1", path = "crates/gatel-bundle-std" }
-gatel-observe = { version = "2.0.0-alpha.1", path = "crates/gatel-observe" }
-gatel-testkit = { version = "2.0.0-alpha.1", path = "crates/gatel-testkit" }
 
 blake3 = "1.8"
 bytes = "1"

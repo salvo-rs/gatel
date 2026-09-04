@@ -494,10 +494,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gatel-observe"
-version = "2.0.0-alpha.1"
-
-[[package]]
 name = "gatel-plan"
 version = "2.0.0-alpha.1"
 dependencies = [
@@ -523,14 +519,6 @@ dependencies = [
  "tokio",
  "tracing",
 ]
-
-[[package]]
-name = "gatel-testkit"
-version = "2.0.0-alpha.1"
-
-[[package]]
-name = "gatel-tls"
-version = "2.0.0-alpha.1"
 
 [[package]]
 name = "generic-array"
