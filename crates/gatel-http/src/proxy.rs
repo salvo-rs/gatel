@@ -219,7 +219,7 @@ impl ProxyTerminal {
                 return Err(last.unwrap_or(ProxyError::NoEndpoint));
             };
             let endpoint = Arc::clone(&selection.endpoint);
-            // Held until the response body finishes, so `least_conn` counts
+            // Held until the response body finishes, so `least-conn` counts
             // work rather than sockets.
             let in_flight = self.upstream.endpoints.claim(&endpoint);
 

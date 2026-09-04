@@ -34,7 +34,7 @@ carries; it is the same list, generated rather than written down.
 | A connection keeps the generation it was accepted under | yes | done | `gatel-http/src/serve.rs`, `tests/reload.rs` |
 | State survives a compatible reload (endpoints, pools, selectors, rate limits, certificates, metrics) | yes | done | `gatel-state/src/registry.rs`, `tests/observe.rs`, `tests/directives.rs` |
 | File watching with a polling fallback, and signals | yes | done | `crates/gatel/src/watch.rs` |
-| Reload stability matrix across every state kind | yes | partial | the individual cases are covered; there is no single matrix test |
+| Reload stability matrix across every state kind | yes | done | `gatel-http/tests/stability.rs`, one row per cell of the table in `ARCHITECTURE.md` |
 
 ## Serving
 
@@ -136,8 +136,7 @@ In order of what a deployment would miss first:
 1. **ACME.** The single largest gap. Everything else about TLS is in place; a
    certificate still has to be put there by hand.
 2. **Release engineering** — the matrix, signed artefacts, a soak test, fuzzing.
-3. **The reload stability matrix** as one test rather than several.
-4. **An events snapshot test**, so a field name cannot change without somebody
+3. **An events snapshot test**, so a field name cannot change without somebody
    deciding to change it.
 
 Everything marked 2.1 is deliberate: `cache`, `forward-auth`, `circuit-breaker`

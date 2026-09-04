@@ -121,22 +121,22 @@ pub fn select(
 fn fallback(eligible: &[Arc<Endpoint>], state: &SelectorState) -> Option<Selection> {
     Some(Selection {
         endpoint: round_robin(eligible, state),
-        effective: "round_robin",
+        effective: "round-robin",
         fell_back: true,
     })
 }
 
 fn name(balance: &Balance) -> &'static str {
     match balance {
-        Balance::RoundRobin => "round_robin",
-        Balance::WeightedRoundRobin => "weighted_round_robin",
+        Balance::RoundRobin => "round-robin",
+        Balance::WeightedRoundRobin => "weighted-round-robin",
         Balance::Random => "random",
-        Balance::TwoRandomChoices => "two_random_choices",
-        Balance::LeastConn => "least_conn",
-        Balance::IpHash => "ip_hash",
-        Balance::UriHash => "uri_hash",
-        Balance::HeaderHash { .. } => "header_hash",
-        Balance::CookieHash { .. } => "cookie_hash",
+        Balance::TwoRandomChoices => "two-random-choices",
+        Balance::LeastConn => "least-conn",
+        Balance::IpHash => "ip-hash",
+        Balance::UriHash => "uri-hash",
+        Balance::HeaderHash { .. } => "header-hash",
+        Balance::CookieHash { .. } => "cookie-hash",
         Balance::First => "first",
     }
 }
@@ -413,7 +413,7 @@ mod tests {
         )
         .unwrap();
         assert!(selection.fell_back);
-        assert_eq!(selection.effective, "round_robin");
+        assert_eq!(selection.effective, "round-robin");
     }
 
     #[test]

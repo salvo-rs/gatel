@@ -16,7 +16,7 @@ upstream "api" {
     endpoint "10.0.1.1:8080" id="a" weight=3
     endpoint "10.0.1.2:8080" id="b"
 
-    balance "weighted_round_robin"
+    balance "weighted-round-robin"
 
     // Take a backend out after repeated failures, and let it back in later.
     passive-health max-fails=5 window="30s" cooldown="60s"

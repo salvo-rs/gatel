@@ -210,7 +210,7 @@ site "*" { route "/" { proxy upstream="api" } }
         let (before, _) = UpstreamRuntimes::resolve(&plan(BASE), &state);
         let rebalanced = BASE.replace(
             "pool max-per-endpoint=8",
-            "balance \"least_conn\"\n    pool max-per-endpoint=8",
+            "balance \"least-conn\"\n    pool max-per-endpoint=8",
         );
         let (after, resolutions) = UpstreamRuntimes::resolve(&plan(&rebalanced), &state);
 

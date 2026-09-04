@@ -64,7 +64,7 @@ impl Ended {
 /// Copy bytes between a client and a backend until one of them stops.
 ///
 /// The in-flight guard is held for the whole tunnel, so a long-lived WebSocket
-/// counts as work for `least_conn` rather than disappearing the moment the
+/// counts as work for `least-conn` rather than disappearing the moment the
 /// response head was written.
 pub async fn tunnel(
     client: Upgraded,

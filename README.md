@@ -27,7 +27,7 @@ site "*" {
 upstream "api" {
     endpoint "10.0.1.1:8080" weight=3
     endpoint "10.0.1.2:8080"
-    balance "weighted_round_robin"
+    balance "weighted-round-robin"
     passive-health max-fails=5 window="30s" cooldown="60s"
 }
 ```
@@ -70,7 +70,7 @@ misspelled strategy, a reference that does not resolve: each is an error with a
 stable code, a file position and, where possible, a suggestion.
 
 ```
-error[unknown-property]: `balance "round_robin"` has no property `header`
+error[unknown-property]: `balance "round-robin"` has no property `header`
   --> gatel.kdl:14:19
 ```
 

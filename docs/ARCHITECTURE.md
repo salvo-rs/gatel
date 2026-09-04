@@ -111,7 +111,9 @@ answer.
 Raising a pool limit must not drop live connections; changing the balancing
 strategy must not pretend the old cursor still means anything; raising a rate
 limit must not hand every client a fresh allowance. `gatel diff` prints this
-table for two real configurations before either is applied.
+table for two real configurations before either is applied, and
+`gatel-http/tests/stability.rs` fails if any cell of it stops being true — the
+table is a test, not a description.
 
 Directives take part in the same table. A directive declares what it needs to
 keep between requests, and its state is owned by the site or route it was

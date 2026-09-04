@@ -66,31 +66,31 @@ fn balance_key(node: &Node, strategy: &str, property: &str, diagnostics: &mut Di
 impl Balance {
     pub fn parse(name: &str, node: &Node, diagnostics: &mut Diagnostics) -> Option<Self> {
         let strategy = match name {
-            "round_robin" => Balance::RoundRobin,
-            "weighted_round_robin" => Balance::WeightedRoundRobin,
+            "round-robin" => Balance::RoundRobin,
+            "weighted-round-robin" => Balance::WeightedRoundRobin,
             "random" => Balance::Random,
-            "two_random_choices" => Balance::TwoRandomChoices,
-            "least_conn" => Balance::LeastConn,
-            "ip_hash" => Balance::IpHash,
-            "uri_hash" => Balance::UriHash,
-            "header_hash" => Balance::HeaderHash {
+            "two-random-choices" => Balance::TwoRandomChoices,
+            "least-conn" => Balance::LeastConn,
+            "ip-hash" => Balance::IpHash,
+            "uri-hash" => Balance::UriHash,
+            "header-hash" => Balance::HeaderHash {
                 header: balance_key(node, name, "header", diagnostics)?.to_ascii_lowercase(),
             },
-            "cookie_hash" => Balance::CookieHash {
+            "cookie-hash" => Balance::CookieHash {
                 cookie: balance_key(node, name, "cookie", diagnostics)?,
             },
             "first" => Balance::First,
             other => {
                 let known = [
-                    "round_robin",
-                    "weighted_round_robin",
+                    "round-robin",
+                    "weighted-round-robin",
                     "random",
-                    "two_random_choices",
-                    "least_conn",
-                    "ip_hash",
-                    "uri_hash",
-                    "header_hash",
-                    "cookie_hash",
+                    "two-random-choices",
+                    "least-conn",
+                    "ip-hash",
+                    "uri-hash",
+                    "header-hash",
+                    "cookie-hash",
                     "first",
                 ];
                 let mut diagnostic = gatel_model::Diagnostic::error(
@@ -127,15 +127,15 @@ impl Balance {
 
     pub fn describe(&self) -> String {
         match self {
-            Balance::RoundRobin => "round_robin".into(),
-            Balance::WeightedRoundRobin => "weighted_round_robin".into(),
+            Balance::RoundRobin => "round-robin".into(),
+            Balance::WeightedRoundRobin => "weighted-round-robin".into(),
             Balance::Random => "random".into(),
-            Balance::TwoRandomChoices => "two_random_choices".into(),
-            Balance::LeastConn => "least_conn".into(),
-            Balance::IpHash => "ip_hash".into(),
-            Balance::UriHash => "uri_hash".into(),
-            Balance::HeaderHash { header } => format!("header_hash({header})"),
-            Balance::CookieHash { cookie } => format!("cookie_hash({cookie})"),
+            Balance::TwoRandomChoices => "two-random-choices".into(),
+            Balance::LeastConn => "least-conn".into(),
+            Balance::IpHash => "ip-hash".into(),
+            Balance::UriHash => "uri-hash".into(),
+            Balance::HeaderHash { header } => format!("header-hash({header})"),
+            Balance::CookieHash { cookie } => format!("cookie-hash({cookie})"),
             Balance::First => "first".into(),
         }
     }
@@ -627,7 +627,7 @@ mod tests {
     fn hash_strategies_require_their_key() {
         let node = upstream_node(vec![
             endpoint("127.0.0.1:1"),
-            Node::new("balance", origin()).with_arg(Value::string("header_hash", origin())),
+            Node::new("balance", origin()).with_arg(Value::string("header-hash", origin())),
         ]);
         let (_, diagnostics) = decode(&node);
         assert!(
@@ -639,7 +639,7 @@ mod tests {
         let node = upstream_node(vec![
             endpoint("127.0.0.1:1"),
             Node::new("balance", origin())
-                .with_arg(Value::string("header_hash", origin()))
+                .with_arg(Value::string("header-hash", origin()))
                 .with_prop("header", Value::string("X-Tenant", origin())),
         ]);
         let (upstream, diagnostics) = decode(&node);
@@ -657,7 +657,7 @@ mod tests {
         let node = upstream_node(vec![
             endpoint("127.0.0.1:1"),
             Node::new("balance", origin())
-                .with_arg(Value::string("round_robin", origin()))
+                .with_arg(Value::string("round-robin", origin()))
                 .with_prop("header", Value::string("x", origin())),
         ]);
         let (_, diagnostics) = decode(&node);

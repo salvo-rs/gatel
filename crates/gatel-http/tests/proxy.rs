@@ -23,7 +23,7 @@ global {{
 upstream "api" {{
     endpoint "{a}" id="a"
     endpoint "{b}" id="b"
-    balance "round_robin"
+    balance "round-robin"
 }}
 site "*" {{
     route "/api/*" {{ proxy upstream="api" }}

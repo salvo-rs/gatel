@@ -350,7 +350,7 @@ site "*" {
         proxy {
             endpoint "127.0.0.1:9002"
             endpoint "127.0.0.1:9003"
-            balance "least_conn"
+            balance "least-conn"
         }
     }
 }
