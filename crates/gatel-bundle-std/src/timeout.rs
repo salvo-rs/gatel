@@ -109,6 +109,7 @@ impl Handler for TimeoutHandler {
         // Whatever the rest of the chain had started to write is discarded:
         // nothing has been sent, because a response only leaves once the chain
         // has returned, and a half-built one would be worse than none.
+        crate::generated(depot);
         response.status_code(self.status);
         *response.body_mut() = salvo_core::http::ResBody::None;
         let _ = response.write_body(format!(

@@ -213,6 +213,7 @@ mod tests {
 
     fn site(host: &str, tls: Option<SiteTls>) -> SitePlan {
         SitePlan {
+            fallback: Vec::new(),
             id: ResourceId::new(ResourceKind::Site, host),
             host: HostMatch::parse(host).unwrap(),
             tls,

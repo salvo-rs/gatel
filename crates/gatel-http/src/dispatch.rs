@@ -49,11 +49,28 @@ impl PreparedRoute {
     }
 }
 
-#[derive(Debug)]
 pub struct PreparedSite {
     pub id: ResourceId,
     pub host: HostMatch,
     pub routes: Vec<PreparedRoute>,
+    /// The site's own directives, plus a terminal that writes the 404, for a
+    /// request that reached this site and matched none of its routes.
+    ///
+    /// A site-wide `access-log` should see a request to an unknown path — those
+    /// are the ones worth seeing — and a site-wide `error-pages` should be able
+    /// to cover its own not-found.
+    pub fallback: Vec<Arc<dyn Handler>>,
+}
+
+impl std::fmt::Debug for PreparedSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedSite")
+            .field("id", &self.id.name())
+            .field("host", &self.host.describe())
+            .field("routes", &self.routes)
+            .field("fallback", &self.fallback.len())
+            .finish()
+    }
 }
 
 /// The route table for one listener, most specific first.
@@ -79,6 +96,19 @@ pub enum NoRoute {
     NoMatch,
 }
 
+/// What routing found when it did not find a route.
+///
+/// The site is carried out, because a request that reached a site is still that
+/// site's: its directives should see it even though none of its routes claimed
+/// it.
+#[derive(Debug)]
+pub enum NoMatch<'a> {
+    /// No site claims this host, so no site's directives apply.
+    Host,
+    /// This site claims the host, but none of its routes matched.
+    Site(&'a PreparedSite),
+}
+
 struct SalvoHeaders<'a>(&'a Request);
 
 impl HeaderLookup for SalvoHeaders<'_> {
@@ -100,7 +130,7 @@ impl Dispatcher {
     pub fn resolve<'a>(
         &'a self,
         request: &Request,
-    ) -> Result<(&'a PreparedSite, &'a PreparedRoute), NoRoute> {
+    ) -> Result<(&'a PreparedSite, &'a PreparedRoute), NoMatch<'a>> {
         let host = request_host(request);
         let method = request.method().as_str().to_string();
         let uri = request.uri();
@@ -123,12 +153,12 @@ impl Dispatcher {
             .sites
             .iter()
             .find(|site| site.host.matches(&host))
-            .ok_or(NoRoute::UnknownHost)?;
+            .ok_or(NoMatch::Host)?;
         let route = site
             .routes
             .iter()
             .find(|route| route.accepts(&context))
-            .ok_or(NoRoute::NoMatch)?;
+            .ok_or(NoMatch::Site(site))?;
         Ok((site, route))
     }
 
@@ -249,6 +279,7 @@ impl Handler for Dispatcher {
         if let crate::body::Declared::TooLarge(declared) = crate::body::limit(request, self.max_body) {
             self.metrics.unmatched_requests.increment();
             response.status_code(StatusCode::PAYLOAD_TOO_LARGE);
+            depot.insert("gatel.generated", true);
             let _ = response.write_body(format!(
                 "413 request body of {declared} bytes is larger than the {} byte limit
 ",
@@ -257,20 +288,28 @@ impl Handler for Dispatcher {
             return;
         }
 
+        // No route means no series to attribute a request to, and a path is
+        // not a label, so an unmatched request is counted on the listener.
         let (chain, measure) = match self.resolve(request) {
             Ok((site, route)) => {
                 depot.insert("gatel.site", site.id.name().to_string());
                 depot.insert("gatel.route", route.id.name().to_string());
                 (
                     route.chain.clone(),
-                    crate::measure::Measure::start(Arc::clone(&route.metrics)),
+                    Some(crate::measure::Measure::start(Arc::clone(&route.metrics))),
                 )
             }
-            Err(reason) => {
-                // No route means no series to attribute this to, and a path is
-                // not a label. It is counted on the listener instead.
+            Err(NoMatch::Site(site)) => {
                 self.metrics.unmatched_requests.increment();
-                write_not_found(response, reason);
+                depot.insert("gatel.site", site.id.name().to_string());
+                (site.fallback.clone(), None)
+            }
+            Err(NoMatch::Host) => {
+                // No site claimed the host, so no site's directives apply and
+                // there is nothing to run.
+                self.metrics.unmatched_requests.increment();
+                depot.insert("gatel.generated", true);
+                write_not_found(response, NoRoute::UnknownHost);
                 return;
             }
         };
@@ -279,7 +318,30 @@ impl Handler for Dispatcher {
         let mut flow = FlowCtrl::new(chain);
         flow.call_next(request, depot, response).await;
         // Outermost, so what is counted is the body that actually goes out.
-        crate::measure::observe(response, measure);
+        if let Some(measure) = measure {
+            crate::measure::observe(response, measure);
+        }
+    }
+}
+
+/// The terminal of a site's fallback chain.
+///
+/// A handler rather than a branch in the dispatcher, so the site's directives
+/// wrap it the way they wrap a real terminal — which is what makes a site-wide
+/// access log see the request and a site-wide error page cover the answer.
+pub struct NotFound;
+
+#[async_trait]
+impl Handler for NotFound {
+    async fn handle(
+        &self,
+        _request: &mut Request,
+        depot: &mut Depot,
+        response: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        depot.insert("gatel.generated", true);
+        write_not_found(response, NoRoute::NoMatch);
     }
 }
 
@@ -317,6 +379,7 @@ mod tests {
             id: ResourceId::new(ResourceKind::Site, host),
             host: HostMatch::parse(host).unwrap(),
             routes,
+            fallback: Vec::new(),
         }
     }
 
@@ -360,16 +423,15 @@ mod tests {
             "example.com",
             vec![route("only", "/", MethodMatch::Any, vec![])],
         )]);
-        assert_eq!(
-            dispatcher.resolve(&request("other.com", "GET", "/")).err(),
-            Some(NoRoute::UnknownHost)
-        );
-        assert_eq!(
-            dispatcher
-                .resolve(&request("example.com", "GET", "/missing"))
-                .err(),
-            Some(NoRoute::NoMatch)
-        );
+        assert!(matches!(
+            dispatcher.resolve(&request("other.com", "GET", "/")),
+            Err(NoMatch::Host)
+        ));
+        // The site still claimed the host, so its directives still apply.
+        assert!(matches!(
+            dispatcher.resolve(&request("example.com", "GET", "/missing")),
+            Err(NoMatch::Site(_))
+        ));
     }
 
     #[test]
@@ -422,10 +484,10 @@ mod tests {
                 .name(),
             "reads"
         );
-        assert_eq!(
-            dispatcher.resolve(&request("h", "DELETE", "/api/x")).err(),
-            Some(NoRoute::NoMatch)
-        );
+        assert!(matches!(
+            dispatcher.resolve(&request("h", "DELETE", "/api/x")),
+            Err(NoMatch::Site(_))
+        ));
     }
 
     #[test]

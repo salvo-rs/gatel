@@ -133,7 +133,7 @@ rather than something configuration chooses:
 | `observe` | outermost | `access-log` — may fail open |
 | `guard` | | authentication, filters, limits, CORS, timeouts — where a request is refused or answered instead of served |
 | `request` | | rewriting |
-| `response` | innermost | header and body transformation |
+| `response` | innermost | header and body transformation, error pages |
 
 Within a phase: scope depth (site before route), then `order`, then name.
 Declaration position appears nowhere. Writing `basic-auth` after `proxy` in the
@@ -145,6 +145,12 @@ sitting among them: "this route has thirty seconds" means the whole route,
 including a check that has to ask something else. Configuration can set `order`
 on any directive, which is the escape hatch for a case the defaults did not
 anticipate.
+
+A site's own directives also form a fallback chain, run when a request reached
+that site and none of its routes matched. Otherwise a site-wide access log would
+miss every request to an unknown path — the ones most worth seeing — and a
+site-wide error page could not cover its own 404. A request whose host no site
+claims runs nothing, because no site's directives apply to it.
 
 Routes are sorted by specificity at compile time — exact host over wildcard over
 catch-all, exact path over longest prefix — so the request path walks a fixed
@@ -196,6 +202,19 @@ Both kinds are named in the body; only the first takes the instance out of
 rotation. Liveness answers yes as long as it can answer at all — a liveness
 probe that fails on a downstream condition restarts a process that was working,
 usually across every replica at once.
+
+## Whose error is it
+
+`error-pages` replaces the body of an error the gateway produced, and leaves
+alone one a backend answered with. A 404 from a backend is very often a JSON
+document an application is waiting for, and replacing it with a page would break
+the client to make the browser look nicer.
+
+Telling them apart needs a fact only the gateway has, so every refusal it makes
+marks the response as its own: a route that matched nothing, a guard that said
+no, a backend that could not be reached, a body over the limit. A directive that
+forgets the mark costs a custom page, not correctness. `all=#true` covers
+everything for the cases where that is genuinely wanted.
 
 ## Limits that bite
 

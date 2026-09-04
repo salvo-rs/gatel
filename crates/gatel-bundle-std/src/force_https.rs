@@ -107,6 +107,7 @@ impl Handler for ForceHttpsHandler {
         let Some(location) = self.location(request) else {
             // No host, so nowhere to send them. Better a plain refusal than a
             // redirect to somewhere invented.
+            crate::generated(depot);
             response.status_code(StatusCode::BAD_REQUEST);
             let _ = response.write_body("400 no host to redirect to\n");
             ctrl.skip_rest();

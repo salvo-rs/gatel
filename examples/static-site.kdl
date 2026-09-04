@@ -8,6 +8,15 @@ site "*" {
     access-log
     request-id
 
+    // Covers the site's own answers — a path no route matched, a guard that
+    // said no, a backend that could not be reached — and leaves a backend's
+    // own error body alone, because for `/api/*` that body is the answer the
+    // application is waiting for.
+    error-pages {
+        page 404 file="/var/www/site/404.html"
+        page "5xx" file="/var/www/site/500.html"
+    }
+
     // More specific paths win regardless of the order they are written in, so
     // the catch-all below never shadows these.
     route "/api/*" {

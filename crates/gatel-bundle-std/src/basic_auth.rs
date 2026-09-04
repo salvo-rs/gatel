@@ -273,6 +273,7 @@ impl Handler for BasicAuthHandler {
             ctrl.call_next(request, depot, response).await;
             return;
         }
+        crate::generated(depot);
         response.status_code(StatusCode::UNAUTHORIZED);
         response
             .headers_mut()

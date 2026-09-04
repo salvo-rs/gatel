@@ -129,6 +129,10 @@ impl Handler for ProxyTerminal {
                     detail = error.detail(),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                 );
+                // The gateway could not reach the backend, so this answer is
+                // the gateway's own and an error page may replace it. A status
+                // the backend itself returned is not marked.
+                depot.insert("gatel.generated", true);
                 response.status_code(error.status());
                 let _ = response.write_body(error.public_message());
             }

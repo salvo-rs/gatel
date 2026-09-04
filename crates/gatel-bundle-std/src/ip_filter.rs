@@ -195,6 +195,7 @@ impl Handler for IpFilterHandler {
         }
         // 403 without saying which rule matched: the filter's shape is not the
         // client's business.
+        crate::generated(depot);
         response.status_code(StatusCode::FORBIDDEN);
         let _ = response.write_body("403 forbidden\n");
         ctrl.skip_rest();

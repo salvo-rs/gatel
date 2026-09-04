@@ -287,6 +287,7 @@ impl Handler for RateLimitHandler {
         let Some(key) = self.key.extract(request, client_ip) else {
             // Nothing to count against. Refusing is the only safe answer: the
             // alternative is an unlimited lane for anyone who omits the header.
+            crate::generated(depot);
             response.status_code(StatusCode::BAD_REQUEST);
             let _ = response.write_body("400 this route requires an identifying header\n");
             ctrl.skip_rest();
@@ -301,6 +302,7 @@ impl Handler for RateLimitHandler {
             }
             Err(wait) => {
                 let seconds = wait.as_secs().max(1);
+                crate::generated(depot);
                 response.status_code(StatusCode::TOO_MANY_REQUESTS);
                 add_header(response, "retry-after", &seconds.to_string());
                 add_header(response, "x-ratelimit-limit", &self.max.to_string());

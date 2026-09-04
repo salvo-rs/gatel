@@ -83,13 +83,13 @@ error[unknown-property]: `balance "round_robin"` has no property `header`
 | Reverse proxy | 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, active and passive health, safe retry |
 | TLS | manual PEM certificates, SNI, mutual TLS, and a built-in development authority with `gatel trust` |
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
-| Directives | `respond`, `redirect`, `file-server`, `rewrite`, `trailing-slash`, `force-https`, `headers`, `encode`, `cors`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `timeout`, `body-limit`, `metrics`, `health` |
+| Directives | `respond`, `redirect`, `file-server`, `rewrite`, `trailing-slash`, `force-https`, `headers`, `encode`, `cors`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `timeout`, `body-limit`, `error-pages`, `metrics`, `health` |
 | Observability | Prometheus metrics whose label set is the size of the configuration, an access log in text/JSON/CLF to stderr or a rolled file, and readiness that distinguishes what is wrong from what a restart would fix |
 | Limits | request head and body size, TLS handshake and idle-connection timeouts, and a process-wide connection cap — each applied, not just declared |
 | Tooling | `validate`, `explain`, `diff`, `capabilities`, `trust` |
 
-Not yet: ACME, caching, forward authentication, error pages, the admin API,
-tracing, HTTP/3, and the CGI family. The plan for those is in `docs/`.
+Not yet: ACME, caching, forward authentication, the admin API, tracing,
+HTTP/3, and the CGI family. The plan for those is in `docs/`.
 
 ## Building
 

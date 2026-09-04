@@ -238,3 +238,99 @@ site "*" id="all" {{
         "the path a guard sees is the one the client sent: {response}"
     );
 }
+
+#[tokio::test]
+async fn an_error_page_replaces_the_gateways_own_refusal() {
+    let gateway = Gateway::new("error-pages");
+    let port = free_port();
+    std::fs::write(gateway.directory.join("404.html"), "<h1>nothing here</h1>\n").unwrap();
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{
+    error-pages {{
+        page 404 file="404.html"
+        page "5xx" body="the gateway could not answer\n"
+    }}
+    route "/known" id="known" {{ respond "content" }}
+    route "/gone" id="gone" {{ proxy "127.0.0.1:1" }}
+}}
+"#
+        ))
+        .await;
+
+    let address = gateway.address();
+    let missing = get(address, "/absent").await;
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+    assert!(missing.contains("<h1>nothing here</h1>"), "{missing}");
+    assert!(
+        missing.contains("content-type: text/html"),
+        "the type follows the page: {missing}"
+    );
+
+    // A backend that cannot be reached is the gateway's own failure too.
+    let unreachable = get(address, "/gone").await;
+    assert!(unreachable.starts_with("HTTP/1.1 50"), "{unreachable}");
+    assert!(unreachable.contains("could not answer"), "{unreachable}");
+
+    // Everything else is untouched.
+    assert!(get(address, "/known").await.contains("content"));
+}
+
+#[tokio::test]
+async fn a_backend_error_body_is_not_replaced() {
+    let gateway = Gateway::new("error-pages-backend");
+    let port = free_port();
+    let backend = failing_backend().await;
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{
+    error-pages {{ page 404 body="a page\n" }}
+    route "/*" id="any" {{ proxy "{backend}" }}
+}}
+"#
+        ))
+        .await;
+
+    // The backend's 404 is very often the answer an application is waiting
+    // for, and replacing it would break the client to tidy the browser.
+    let response = get(gateway.address(), "/thing").await;
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    assert!(response.contains(r#"{"error":"no such thing"}"#), "{response}");
+    assert!(!response.contains("a page"), "{response}");
+}
+
+/// A backend that answers 404 with a document of its own.
+async fn failing_backend() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer).await {
+                    if read == 0 {
+                        return;
+                    }
+                    let body = r#"{"error":"no such thing"}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                }
+            });
+        }
+    });
+    address
+}

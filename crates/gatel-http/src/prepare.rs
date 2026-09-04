@@ -162,10 +162,27 @@ pub fn prepare(
                     metrics: resources.telemetry.metrics.route(site.id.name(), route.id.name()),
                 });
             }
+            // The site's own directives, plus the not-found terminal, for a
+            // request that reached this site and matched none of its routes.
+            let mut fallback = Vec::with_capacity(site.fallback.len() + 1);
+            for directive in &site.fallback {
+                let state = resolve_state(directive, resources.state);
+                let cx = gatel_plan::BuildContext {
+                    root: resources.root,
+                    state,
+                    telemetry: resources.telemetry,
+                };
+                fallback.push(directive.config.build(cx).map_err(|error| {
+                    format!("`{}` on site `{}`: {error}", directive.meta.name, site.id.name())
+                })?);
+            }
+            fallback.push(Arc::new(crate::dispatch::NotFound));
+
             sites.push(PreparedSite {
                 id: site.id.clone(),
                 host: site.host.clone(),
                 routes,
+                fallback,
             });
         }
 

@@ -211,7 +211,7 @@ impl Handler for FileServer {
     async fn handle(
         &self,
         request: &mut Request,
-        _depot: &mut Depot,
+        depot: &mut Depot,
         response: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
@@ -232,6 +232,7 @@ impl Handler for FileServer {
             // One answer for "no such file", "outside the root" and "not a
             // regular file": the difference is not the client's business.
             Target::NotFound => {
+                crate::generated(depot);
                 response.status_code(StatusCode::NOT_FOUND);
                 let _ = response.write_body("404 not found\n");
                 return;
@@ -292,6 +293,7 @@ impl Handler for FileServer {
                     file = %source.display(),
                     %error,
                 );
+                crate::generated(depot);
                 response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
                 let _ = response.write_body("500 could not read the file\n");
             }

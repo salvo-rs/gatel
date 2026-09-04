@@ -334,3 +334,27 @@ async fn read_eventually(path: &std::path::Path) -> String {
     }
     panic!("nothing was written to {}", path.display());
 }
+
+#[tokio::test]
+async fn a_request_to_an_unknown_path_still_gets_a_log_line() {
+    let gateway = Gateway::new("access-log-unmatched");
+    let port = free_port();
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" id="all" {{
+    access-log format="clf" output="file:access.log"
+    route "/known" id="known" {{ respond "hi\n" }}
+}}
+"#
+        ))
+        .await;
+
+    get(gateway.address(), "/nowhere").await;
+
+    // The requests worth seeing are exactly the ones that matched nothing, so
+    // a site's access log covers them even though no route claimed them.
+    let line = read_eventually(&gateway.directory.join("access.log")).await;
+    assert!(line.contains(r#""GET /nowhere HTTP/1.1" 404"#), "{line}");
+}

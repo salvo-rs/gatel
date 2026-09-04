@@ -13,6 +13,7 @@ pub mod basic_auth;
 pub mod body_limit;
 pub mod cors;
 pub mod encode;
+pub mod error_pages;
 pub mod file_server;
 pub mod force_https;
 pub mod headers;
@@ -30,6 +31,16 @@ pub mod trailing_slash;
 
 use gatel_plan::Bundle;
 
+/// Mark this response as one the gateway produced rather than one a backend
+/// answered with.
+///
+/// `error-pages` reads it, and so does anything else that has to tell "we
+/// refused this" from "the thing behind us said no". Every refusal in this
+/// crate sets it; forgetting to costs a custom error page, not correctness.
+pub fn generated(depot: &mut salvo_core::Depot) {
+    depot.insert("gatel.generated", true);
+}
+
 /// Every directive this crate provides.
 pub fn bundle() -> Bundle {
     Bundle::new("std", "1")
@@ -45,6 +56,7 @@ pub fn bundle() -> Bundle {
         .with(rewrite::Rewrite)
         .with(basic_auth::BasicAuth)
         .with(cors::Cors)
+        .with(error_pages::ErrorPages)
         .with(force_https::ForceHttps)
         .with(trailing_slash::TrailingSlash)
         .with(timeout::Timeout)
@@ -71,6 +83,7 @@ mod tests {
                 "body-limit",
                 "cors",
                 "encode",
+                "error-pages",
                 "file-server",
                 "force-https",
                 "headers",

@@ -92,6 +92,7 @@ impl Handler for BodyLimitHandler {
         if let Some(declared) = declared_length(request)
             && declared > self.max
         {
+            crate::generated(depot);
             response.status_code(StatusCode::PAYLOAD_TOO_LARGE);
             let _ = response.write_body(format!(
                 "413 request body of {declared} bytes is larger than the {} byte limit\n",

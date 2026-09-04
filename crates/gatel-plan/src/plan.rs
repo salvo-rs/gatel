@@ -108,6 +108,13 @@ pub struct SitePlan {
     pub host: HostMatch,
     pub tls: Option<SiteTls>,
     pub routes: Vec<RoutePlan>,
+    /// The site's own directives, ordered, for a request that reached this site
+    /// and matched none of its routes.
+    ///
+    /// Without this, a site-wide `access-log` would miss every request to an
+    /// unknown path — the ones most worth seeing — and a site-wide
+    /// `error-pages` could not cover its own 404.
+    pub fallback: Vec<DirectiveInstance>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,11 +242,14 @@ fn compile_site(site: &Site) -> SitePlan {
             }
         })
         .collect();
+    let mut fallback = site.directives.clone();
+    fallback.sort_by_key(DirectiveInstance::sort_key);
     SitePlan {
         id: site.id.clone(),
         host: site.host.clone(),
         tls: site.tls.clone(),
         routes,
+        fallback,
     }
 }
 
