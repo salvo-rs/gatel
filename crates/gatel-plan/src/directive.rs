@@ -191,6 +191,16 @@ impl DirectiveMeta {
         self
     }
 
+    /// Move this directive within its phase.
+    ///
+    /// Lower runs first. Needed only where alphabetical order would put a
+    /// directive in the wrong place — a timeout that has to wrap the other
+    /// guards rather than sit among them.
+    pub const fn with_order(mut self, order: i32) -> Self {
+        self.order = order;
+        self
+    }
+
     pub const fn fail_open(mut self) -> Self {
         self.failure_policy = FailurePolicy::Open;
         self

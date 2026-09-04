@@ -10,8 +10,11 @@
 
 pub mod access_log;
 pub mod basic_auth;
+pub mod body_limit;
+pub mod cors;
 pub mod encode;
 pub mod file_server;
+pub mod force_https;
 pub mod headers;
 pub mod ip_filter;
 pub mod observe;
@@ -22,6 +25,8 @@ pub mod respond;
 pub mod rewrite;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod timeout;
+pub mod trailing_slash;
 
 use gatel_plan::Bundle;
 
@@ -39,6 +44,11 @@ pub fn bundle() -> Bundle {
         .with(encode::Encode)
         .with(rewrite::Rewrite)
         .with(basic_auth::BasicAuth)
+        .with(cors::Cors)
+        .with(force_https::ForceHttps)
+        .with(trailing_slash::TrailingSlash)
+        .with(timeout::Timeout)
+        .with(body_limit::BodyLimit)
         .with(observe::Metrics)
         .with(observe::Health)
 }
@@ -58,8 +68,11 @@ mod tests {
             [
                 "access-log",
                 "basic-auth",
+                "body-limit",
+                "cors",
                 "encode",
                 "file-server",
+                "force-https",
                 "headers",
                 "health",
                 "ip-filter",
@@ -68,7 +81,9 @@ mod tests {
                 "redirect",
                 "request-id",
                 "respond",
-                "rewrite"
+                "rewrite",
+                "timeout",
+                "trailing-slash"
             ]
         );
     }

@@ -131,13 +131,20 @@ rather than something configuration chooses:
 | Phase | Position | Examples |
 |---|---|---|
 | `observe` | outermost | `access-log` — may fail open |
-| `guard` | | authentication, filters, limits — where rejections happen |
+| `guard` | | authentication, filters, limits, CORS, timeouts — where a request is refused or answered instead of served |
 | `request` | | rewriting |
 | `response` | innermost | header and body transformation |
 
-Within a phase: explicit `order`, then scope depth (site before route), then
-name. Declaration position appears nowhere. Writing `basic-auth` after `proxy`
-in the file cannot move authentication after the terminal.
+Within a phase: scope depth (site before route), then `order`, then name.
+Declaration position appears nowhere. Writing `basic-auth` after `proxy` in the
+file cannot move authentication after the terminal.
+
+`order` exists for the few places where alphabetical order would be wrong.
+`timeout` carries a negative one so it wraps the other guards rather than
+sitting among them: "this route has thirty seconds" means the whole route,
+including a check that has to ask something else. Configuration can set `order`
+on any directive, which is the escape hatch for a case the defaults did not
+anticipate.
 
 Routes are sorted by specificity at compile time — exact host over wildcard over
 catch-all, exact path over longest prefix — so the request path walks a fixed

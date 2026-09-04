@@ -1,6 +1,6 @@
 [package]
 name = "gatel-bundle-std"
-description = "Gatel's standard directives: respond, headers, redirect and access-log"
+description = "Gatel's standard directives: routing terminals, guards, and the observability endpoints"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,3 +26,7 @@ salvo_core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `start_paused` lets the timeout tests run in milliseconds rather than minutes.
+tokio = { workspace = true, features = ["test-util"] }

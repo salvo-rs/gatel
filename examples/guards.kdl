@@ -1,8 +1,8 @@
-// Guards: the directives that refuse a request.
+// Guards: the directives that refuse a request, or answer instead of it.
 //
-// All three are written after the terminal here, on purpose. Their phase puts
-// them ahead of it regardless — where a directive appears in the file cannot
-// move authentication or a rate limit after the thing they protect.
+// Most are written after the terminal here, on purpose. Their phase puts them
+// ahead of it regardless — where a directive appears in the file cannot move
+// authentication or a rate limit after the thing they protect.
 global {
     http ":8080"
     trusted-proxy "10.0.0.0/8"
@@ -13,6 +13,14 @@ site "*" {
     access-log format="json"
     request-id
 
+    // Every route under this site. A plaintext request is sent to the secure
+    // URL before anything reads a body or reaches a backend.
+    force-https
+
+    // One spelling per path, so a cache, a search engine and a set of
+    // relative links all agree. A path that names a file is left alone.
+    trailing-slash "remove"
+
     route "/public/*" {
         respond "anyone may read this\n"
     }
@@ -22,6 +30,22 @@ site "*" {
 
         // 100 requests per minute, counted per client address.
         rate-limit max=100 window="1m" key="ip"
+
+        // Bounds the time to a response head, not to the last byte of a body:
+        // a slow download is a different problem from a route that has hung.
+        timeout "30s"
+
+        // Narrower than the process-wide limit, because this route reads JSON
+        // rather than uploads.
+        body-limit "256KiB"
+
+        // A browser mechanism, not an access control. A request from an origin
+        // that is not listed is served exactly as it would have been; the
+        // browser is what refuses to hand the answer to the page.
+        cors credentials=#true methods="GET,POST,PATCH,DELETE" headers="content-type,authorization" {
+            origin "https://app.example.com"
+            origin "https://admin.example.com"
+        }
     }
 
     route "/tenant/*" {
