@@ -177,7 +177,7 @@ pub fn compile(spec: Arc<Spec>, registry: &Registry) -> Plan {
                     .iter()
                     .any(|candidate| candidate.name == listener.name)
             })
-            .map(|site| compile_site(site))
+            .map(compile_site)
             .collect();
         // Most specific host first, so the request path takes the first match.
         sites.sort_by(|a, b| {

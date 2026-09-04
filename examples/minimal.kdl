@@ -1,0 +1,22 @@
+// The smallest configuration that serves something.
+global {
+    http "127.0.0.1:18080"
+}
+
+site "*" {
+    access-log
+
+    route "/health" {
+        method "GET"
+        respond "ok\n"
+    }
+
+    route "/*" {
+        headers {
+            response {
+                set "x-served-by" "gatel"
+            }
+        }
+        respond "reloaded without dropping a connection\n"
+    }
+}

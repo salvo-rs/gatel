@@ -35,7 +35,7 @@ impl std::fmt::Display for ByteSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         const UNITS: [(u64, &str); 3] = [(1024 * 1024 * 1024, "GiB"), (1024 * 1024, "MiB"), (1024, "KiB")];
         for (factor, suffix) in UNITS {
-            if self.0 >= factor && self.0 % factor == 0 {
+            if self.0 >= factor && self.0.is_multiple_of(factor) {
                 return write!(f, "{}{suffix}", self.0 / factor);
             }
         }

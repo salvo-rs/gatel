@@ -1,0 +1,55 @@
+// Reverse proxy with two backends, health-based ejection and forwarding.
+global {
+    http ":8080"
+
+    // Only a peer inside these networks may tell us the client's address.
+    trusted-proxy "10.0.0.0/8"
+
+    limits header="16KiB" body="16MiB" header-timeout="10s" idle="60s" connections=10000
+}
+
+upstream "api" {
+    endpoint "10.0.1.1:8080" id="a" weight=3
+    endpoint "10.0.1.2:8080" id="b"
+
+    balance "weighted_round_robin"
+
+    // Take a backend out after repeated failures, and let it back in later.
+    passive-health max-fails=5 window="30s" cooldown="60s"
+
+    // Retry is off unless asked for; `safe` only retries failures that
+    // happened before any request byte was sent.
+    retry mode="safe" attempts=2
+
+    timeouts connect="5s" queue="2s" response-head="10s" body-idle="60s" overall="5m"
+    pool max-per-endpoint=32 max-idle-per-endpoint=8 idle-timeout="30s"
+}
+
+site "api.example.com" {
+    access-log format="json"
+
+    headers {
+        response {
+            set "strict-transport-security" "max-age=31536000"
+        }
+    }
+
+    // A canary: the extra condition makes this route more specific, so it is
+    // tried before the one below it regardless of declaration order.
+    route "/*" id="canary" {
+        match header="x-canary=1"
+        proxy {
+            endpoint "10.0.9.1:8080"
+        }
+    }
+
+    route "/*" id="stable" {
+        proxy upstream="api"
+    }
+}
+
+site "*" {
+    route "/*" {
+        redirect "https://api.example.com/" permanent=#true
+    }
+}

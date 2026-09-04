@@ -559,7 +559,7 @@ mod tests {
         let respond = registry
             .decode(&node("respond"), Scope::Route, &mut diagnostics)
             .unwrap();
-        let mut instances = vec![respond, headers, auth];
+        let mut instances = [respond, headers, auth];
         instances.sort_by_key(DirectiveInstance::sort_key);
         let order: Vec<&str> = instances.iter().map(|item| item.meta.name).collect();
         assert_eq!(order, ["basic-auth", "headers", "respond"]);

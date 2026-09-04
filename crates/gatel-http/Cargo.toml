@@ -1,6 +1,6 @@
 [package]
 name = "gatel-http"
-description = "Gatel component: gatel-http"
+description = "Gatel's HTTP data plane: listeners, routing, and the reverse proxy terminal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gatel-model.workspace = true
+gatel-plan.workspace = true
+gatel-state.workspace = true
+
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["server-graceful"] }
+pin-project-lite.workspace = true
+salvo_core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+gatel-bundle-std.workspace = true
+gatel-kdl.workspace = true

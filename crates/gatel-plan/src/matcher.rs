@@ -436,7 +436,7 @@ pub fn parse_match_node(node: &Node, diagnostics: &mut Diagnostics) -> Vec<Match
             "`match` takes conditions as properties, not positional arguments",
         );
     }
-    matchers.sort_by(|a, b| a.describe().cmp(&b.describe()));
+    matchers.sort_by_key(|a| a.describe());
     matchers
 }
 

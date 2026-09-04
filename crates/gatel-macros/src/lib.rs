@@ -247,7 +247,7 @@ fn kebab_case(name: &str) -> String {
     name.trim_start_matches("r#").replace('_', "-")
 }
 
-fn generic_inner<'a>(ty: &'a Type, wrapper: &str) -> Option<Type> {
+fn generic_inner(ty: &Type, wrapper: &str) -> Option<Type> {
     let Type::Path(path) = ty else { return None };
     let segment = path.path.segments.last()?;
     if segment.ident != wrapper {

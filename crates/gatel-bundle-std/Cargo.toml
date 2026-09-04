@@ -1,6 +1,6 @@
 [package]
 name = "gatel-bundle-std"
-description = "Gatel component: gatel-bundle-std"
+description = "Gatel's standard directives: respond, headers, redirect and access-log"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gatel-model.workspace = true
+gatel-macros.workspace = true
+gatel-plan.workspace = true
+
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+pin-project-lite.workspace = true
+salvo_core.workspace = true
+tokio.workspace = true
+tracing.workspace = true

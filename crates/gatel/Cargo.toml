@@ -1,10 +1,27 @@
 [package]
 name = "gatel"
-description = "Gatel component: gatel"
+description = "A programmable gateway with a readable configuration and transactional reloads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "gatel"
+path = "src/main.rs"
 
 [dependencies]
+gatel-bundle-std.workspace = true
+gatel-http.workspace = true
+gatel-kdl.workspace = true
+gatel-model.workspace = true
+gatel-plan.workspace = true
+gatel-state.workspace = true
+
+clap.workspace = true
+notify.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
