@@ -1,6 +1,6 @@
 [package]
 name = "gatel-plan"
-description = "Gatel component: gatel-plan"
+description = "Gatel's compiler and configuration transaction: snapshot to spec to plan to generation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gatel-model.workspace = true
+gatel-macros.workspace = true
+# salvo_core is the project's HTTP execution vocabulary, not transport. This
+# crate may name `Handler`; it may not depend on hyper, rustls or tokio::net.
+salvo_core.workspace = true
+
+[dev-dependencies]
+gatel-kdl.workspace = true

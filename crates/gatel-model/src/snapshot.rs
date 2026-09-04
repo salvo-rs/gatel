@@ -107,6 +107,19 @@ impl RevVector {
         self.0.iter().map(|(id, rev)| (id, *rev))
     }
 
+    /// Advance to the newer of two observations, per source.
+    ///
+    /// A revision only ever moves forward, so a late-arriving stale read
+    /// cannot make a candidate that was already overtaken look current again.
+    pub fn merge_max(&mut self, other: &RevVector) {
+        for (source, rev) in &other.0 {
+            let slot = self.0.entry(source.clone()).or_insert(*rev);
+            if *rev > *slot {
+                *slot = *rev;
+            }
+        }
+    }
+
     /// Describe the first difference, for the "candidate went stale" event.
     pub fn first_difference(&self, other: &RevVector) -> Option<String> {
         for (source, rev) in &self.0 {
