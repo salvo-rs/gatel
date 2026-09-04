@@ -98,16 +98,29 @@ State is keyed by `(owning resource, kind)` and carries a compatibility
 fingerprint. A reload asks "is what I need already running?" and gets a typed
 answer.
 
-| Change | Endpoints | Pool | Selector |
-|---|---|---|---|
-| Raise `max-per-endpoint` | reused | **reused** | reused |
-| Replace the backend list | replaced | replaced | replaced |
-| Change `balance` | reused | reused | **replaced** |
-| Edit an unrelated route | reused | reused | reused |
+| Change | Endpoints | Pool | Selector | Rate-limit buckets |
+|---|---|---|---|---|
+| Raise `max-per-endpoint` | reused | **reused** | reused | reused |
+| Replace the backend list | replaced | replaced | replaced | reused |
+| Change `balance` | reused | reused | **replaced** | reused |
+| Raise `rate-limit max` | reused | reused | reused | **reused** |
+| Change `rate-limit key` | reused | reused | reused | **replaced** |
+| Edit an unrelated route | reused | reused | reused | reused |
 
-Raising a pool limit must not drop live connections, and changing the balancing
-strategy must not pretend the old cursor still means anything. `gatel diff`
-prints this table for two real configurations before either is applied.
+Raising a pool limit must not drop live connections; changing the balancing
+strategy must not pretend the old cursor still means anything; raising a rate
+limit must not hand every client a fresh allowance. `gatel diff` prints this
+table for two real configurations before either is applied.
+
+Directives take part in the same table. A directive declares what it needs to
+keep between requests, and its state is owned by the site or route it was
+written on — so moving it gives it different state, and editing an unrelated
+part of the file does not. There is no path to a global singleton.
+
+Certificates are in the same table for the same reason, with one difference: a
+renewal is not a configuration change, so it never produces a generation. The
+resolver reads through the store on each handshake, which is what lets a
+certificate be replaced while established connections carry on.
 
 ## Ordering is decided once
 
@@ -141,7 +154,10 @@ directive.
 
 ## What is deliberately absent
 
-- **No `tls-skip-verify`.** Development uses the built-in CA instead.
+- **No `tls-skip-verify`.** Development uses the built-in CA instead:
+  `tls internal` issues short-lived certificates from an authority generated on
+  first use, and `gatel trust` installs its root — as its own command, because
+  adding a trust anchor changes what every program on the machine believes.
 - **No secret material in configuration.** `env:` and `file:` references only,
   and `SecretString` is redacted in every rendering path.
 - **No forwarding header believed by default.** `trusted-proxy` decides, and the
