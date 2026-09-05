@@ -123,7 +123,7 @@ fn raising_a_pool_limit_keeps_everything() {
             (StateKind::Endpoints, "reuse"),
             (StateKind::Pool, "reuse"),
             (StateKind::Selector, "reuse"),
-            (StateKind::RateLimit, "reuse"),
+            (StateKind::Directive("rate-limit"), "reuse"),
         ],
     );
 }
@@ -139,7 +139,7 @@ fn replacing_the_backends_replaces_what_points_at_them() {
             (StateKind::Endpoints, "replace"),
             (StateKind::Pool, "replace"),
             (StateKind::Selector, "replace"),
-            (StateKind::RateLimit, "reuse"),
+            (StateKind::Directive("rate-limit"), "reuse"),
         ],
     );
 }
@@ -155,7 +155,7 @@ fn changing_the_balance_replaces_only_the_selector() {
             (StateKind::Endpoints, "reuse"),
             (StateKind::Pool, "reuse"),
             (StateKind::Selector, "replace"),
-            (StateKind::RateLimit, "reuse"),
+            (StateKind::Directive("rate-limit"), "reuse"),
         ],
     );
 }
@@ -165,7 +165,10 @@ fn raising_a_rate_limit_does_not_hand_every_client_a_fresh_allowance() {
     assert_row(
         "raise the rate limit",
         config(TWO, "round-robin", 8, r#"max=1000 window="1m" key="ip""#),
-        &[(StateKind::RateLimit, "reuse"), (StateKind::Endpoints, "reuse")],
+        &[
+            (StateKind::Directive("rate-limit"), "reuse"),
+            (StateKind::Endpoints, "reuse"),
+        ],
     );
 }
 
@@ -181,7 +184,7 @@ fn changing_what_a_rate_limit_counts_replaces_its_buckets() {
             r#"max=100 window="1m" key="header:x-api-key""#,
         ),
         &[
-            (StateKind::RateLimit, "replace"),
+            (StateKind::Directive("rate-limit"), "replace"),
             (StateKind::Endpoints, "reuse"),
             (StateKind::Pool, "reuse"),
             (StateKind::Selector, "reuse"),
@@ -199,7 +202,7 @@ fn editing_an_unrelated_route_keeps_everything() {
             (StateKind::Endpoints, "reuse"),
             (StateKind::Pool, "reuse"),
             (StateKind::Selector, "reuse"),
-            (StateKind::RateLimit, "reuse"),
+            (StateKind::Directive("rate-limit"), "reuse"),
         ],
     );
 }
@@ -235,7 +238,7 @@ fn moving_a_directive_to_another_route_gives_it_different_state() {
         );
     let outcome = transition(&base(), &after);
     assert_eq!(
-        outcome.get(&StateKind::RateLimit).copied(),
+        outcome.get(&StateKind::Directive("rate-limit")).copied(),
         Some("retire"),
         "the buckets belonged to the route it left: {outcome:?}"
     );

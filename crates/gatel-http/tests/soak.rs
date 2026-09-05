@@ -109,7 +109,7 @@ fn caches(gateway: &Gateway) -> impl Iterator<Item = std::sync::Arc<gatel_bundle
         .state
         .keys()
         .into_iter()
-        .filter(|key| key.kind == gatel_plan::StateKind::Cache)
+        .filter(|key| key.kind == gatel_plan::StateKind::Directive("cache"))
         .filter_map(|key| gateway.state.get(&key.owner, key.kind))
 }
 

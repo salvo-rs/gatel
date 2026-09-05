@@ -19,6 +19,21 @@ use crate::spec::{Listener, Site, SiteTls, Spec, Terminal};
 use crate::upstream::Upstream;
 
 /// A kind of state that outlives the generation that created it.
+///
+/// The named variants belong to the kernel: the proxy owns its endpoints,
+/// pool, selector and health, and the TLS layer owns its certificates, because
+/// those four are one correctness chain rather than four independent things.
+///
+/// Everything else is [`Directive`](StateKind::Directive), named after the
+/// directive that asked for it. That is what keeps this enum from being a list
+/// somebody has to add to: a bundle outside this crate can declare state
+/// without editing the kernel, which it could not do while `rate-limit` and
+/// `cache` were spelled out here.
+///
+/// Collision is impossible rather than merely unlikely. A binding is keyed by
+/// `(owning resource, kind)`, the owner is the site or route the directive was
+/// written on, and one directive may appear at most once per scope — so the
+/// directive's own name is already unique wherever it is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StateKind {
     /// The set of backends and where they came from.
@@ -29,12 +44,8 @@ pub enum StateKind {
     Pool,
     /// A balancer's cursor or counters.
     Selector,
-    /// Token buckets.
-    RateLimit,
-    /// Stored responses.
-    Cache,
-    /// Breaker counters and trip state.
-    CircuitBreaker,
+    /// Whatever a directive keeps between requests, named after the directive.
+    Directive(&'static str),
     /// Loaded and issued certificates.
     Certificate,
 }
@@ -46,9 +57,7 @@ impl StateKind {
             StateKind::Health => "health",
             StateKind::Pool => "pool",
             StateKind::Selector => "selector",
-            StateKind::RateLimit => "rate-limit",
-            StateKind::Cache => "cache",
-            StateKind::CircuitBreaker => "circuit-breaker",
+            StateKind::Directive(name) => name,
             StateKind::Certificate => "certificate",
         }
     }

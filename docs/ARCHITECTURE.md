@@ -120,6 +120,14 @@ keep between requests, and its state is owned by the site or route it was
 written on — so moving it gives it different state, and editing an unrelated
 part of the file does not. There is no path to a global singleton.
 
+The kinds a directive can use are not a list in the kernel. Four of them belong
+to the proxy and one to TLS, because those are one correctness chain; every
+other kind is named after the directive that asked for it. A bundle from
+another crate declares state exactly as the standard one does, and the name
+cannot collide: a binding is keyed by owning resource and kind, the owner is
+the scope the directive was written on, and a directive may appear at most once
+per scope.
+
 Certificates are in the same table for the same reason, with one difference: a
 renewal is not a configuration change, so it never produces a generation. The
 resolver reads through the store on each handshake, which is what lets a

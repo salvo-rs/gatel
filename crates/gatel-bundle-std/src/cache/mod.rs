@@ -44,7 +44,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use gatel_macros::FromNode;
 use gatel_model::{ByteSize, Code, Diagnostic, Diagnostics, FromNode as _, Hasher, Node};
-use gatel_plan::{Directive, DirectiveConfig, DirectiveMeta, DirectiveState, Phase, Scopes, StateKind};
+use gatel_plan::{Directive, DirectiveConfig, DirectiveMeta, DirectiveState, Phase, Scopes};
 pub use policy::Refusal;
 use salvo_core::http::{Request, ResBody, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
@@ -97,7 +97,6 @@ impl DirectiveConfig for Config {
         // eviction on the next write.
         let max_size = self.max_size;
         Some(DirectiveState {
-            kind: StateKind::Cache,
             compatibility: Hasher::new().finish(),
             create: Box::new(move || Arc::new(Store::new(max_size)) as Arc<dyn Any + Send + Sync>),
         })

@@ -14,8 +14,6 @@ use std::sync::Arc;
 use gatel_model::{Code, Diagnostic, Diagnostics, Fingerprint, Hasher, Node, ResourceId, did_you_mean};
 use salvo_core::Handler;
 
-use crate::plan::StateKind;
-
 /// Where a middleware sits in the request chain.
 ///
 /// The order is fixed by the enum, not by where the operator wrote the node:
@@ -225,7 +223,6 @@ impl DirectiveMeta {
 /// global: a rate limiter's buckets must survive a reload that did not change
 /// the limit, and must *not* survive one that did.
 pub struct DirectiveState {
-    pub kind: StateKind,
     /// Changes exactly when the existing buckets or counters stop meaning what
     /// they meant. Raising a window does; renaming an unrelated route does not.
     pub compatibility: Fingerprint,
@@ -236,7 +233,6 @@ pub struct DirectiveState {
 impl std::fmt::Debug for DirectiveState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectiveState")
-            .field("kind", &self.kind)
             .field("compatibility", &self.compatibility.short())
             .finish()
     }
@@ -335,7 +331,10 @@ impl DirectiveInstance {
     pub fn state_binding(&self) -> Option<crate::plan::StateBinding> {
         self.config.state().map(|state| crate::plan::StateBinding {
             owner: self.owner.clone(),
-            kind: state.kind,
+            // Named after the directive rather than chosen by it. A directive
+            // that named its own kind could collide with another's, and there
+            // is nothing it could usefully say that its name does not.
+            kind: crate::plan::StateKind::Directive(self.meta.name),
             compatibility: state.compatibility,
             policy: crate::plan::ResetPolicy::Preserve,
         })

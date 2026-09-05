@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use gatel_macros::FromNode;
 use gatel_model::{Code, Diagnostics, FromNode as _, Hasher, Node};
-use gatel_plan::{Directive, DirectiveConfig, DirectiveMeta, DirectiveState, Phase, Scopes, StateKind};
+use gatel_plan::{Directive, DirectiveConfig, DirectiveMeta, DirectiveState, Phase, Scopes};
 use salvo_core::http::{Request, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 
@@ -113,7 +113,6 @@ impl DirectiveConfig for Config {
         compatibility.update_duration(self.window);
         let max_keys = self.max_keys as usize;
         Some(DirectiveState {
-            kind: StateKind::RateLimit,
             compatibility: compatibility.finish(),
             create: Box::new(move || Arc::new(Buckets::new(max_keys)) as Arc<dyn Any + Send + Sync>),
         })
