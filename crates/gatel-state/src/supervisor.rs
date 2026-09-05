@@ -249,9 +249,18 @@ async fn probe_loop(
         for endpoint in runtime.endpoints.all() {
             let kind = policy.kind.clone();
             let addresses = endpoint.addresses();
+            let unix = endpoint.target.unix_path().map(std::path::Path::to_path_buf);
             let id = endpoint.id.clone();
             let timeout = policy.timeout;
-            checks.push(async move { (id, probe_any(&addresses, &kind, protocol, timeout).await) });
+            checks.push(async move {
+                let result = match unix {
+                    // A socket path has no addresses, so the address loop would
+                    // have called it unhealthy for ever.
+                    Some(path) => crate::probe::probe_unix(&path, &kind, protocol, timeout).await,
+                    None => probe_any(&addresses, &kind, protocol, timeout).await,
+                };
+                (id, result)
+            });
         }
 
         let results = join_all(checks).await;

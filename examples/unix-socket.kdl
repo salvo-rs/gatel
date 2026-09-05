@@ -1,0 +1,50 @@
+// A gateway in front of applications that listen on a socket path.
+//
+// The shape a traditional deployment has had for twenty years: PHP-FPM,
+// gunicorn, uWSGI, Puma, and most sidecars. A socket has no port and no
+// address, and it is not reachable from another machine — the permission on
+// the file is the access control, which is why this is the usual arrangement
+// for anything that should only ever be reached through the gateway.
+global {
+    http ":8080"
+    limits body="32MiB"
+}
+
+site "*" {
+    access-log format="json"
+
+    // A Python application under gunicorn:
+    //   gunicorn --bind unix:/run/app/gunicorn.sock app:application
+    //
+    // Health checks work the same as over an address: the probe opens the
+    // socket instead of a connection, and asks the same question.
+    route "/api/*" {
+        proxy {
+            endpoint "unix:/run/app/gunicorn.sock"
+            health "http" path="/healthz" interval="5s"
+            timeouts connect="2s" response-head="30s"
+        }
+    }
+
+    route "/*" {
+        proxy upstream="workers"
+    }
+}
+
+// Two backends of one upstream, one on a socket and one on an address. Written
+// this way, a migration from one to the other is a change of endpoints rather
+// than a change of shape.
+upstream "workers" {
+    endpoint "unix:/run/app/worker-1.sock" id="local"
+    endpoint "10.0.1.4:8000" id="remote"
+    balance "least-conn"
+    passive-health max-fails=3 window="30s" cooldown="30s"
+}
+
+// A socket path that does not exist is a backend that is down, not a
+// configuration error: the application that owns the path may create it a
+// moment after the gateway starts, exactly as an address may start listening.
+//
+// On a platform with no Unix sockets, a configuration naming one is refused
+// when it is compiled, with a message that says the machine cannot do it
+// rather than that the file is wrong.

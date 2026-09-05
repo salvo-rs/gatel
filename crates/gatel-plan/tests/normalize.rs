@@ -894,7 +894,7 @@ site "*" { route "/" { proxy "api.example.com:8080" } }
     );
     let endpoint = &plan.upstreams[0].endpoints[0];
     assert_eq!(endpoint.target.host(), Some("api.example.com"));
-    assert_eq!(endpoint.target.port(), 8080);
+    assert_eq!(endpoint.target.port(), Some(8080));
     assert_eq!(endpoint.id, "api.example.com:8080");
 }
 
@@ -1124,4 +1124,43 @@ site "*" { route "/" { respond "hi" } }
             .any(|d| d.message.contains("has no property `nonsense`")),
         "{diagnostics}"
     );
+}
+
+#[test]
+fn a_backend_can_be_a_unix_socket_where_there_are_unix_sockets() {
+    // How PHP-FPM, gunicorn and uWSGI are reached. On a platform without them
+    // the same configuration is refused with a message that says it is the
+    // machine rather than the file that is wrong — so this test asserts the
+    // behaviour of whichever platform it is running on, and both are correct.
+    let text = r#"
+global { http ":8080" }
+site "*" { route "/" { proxy "unix:/run/app.sock" } }
+"#;
+    if cfg!(unix) {
+        let spec = spec(text);
+        let endpoint = &spec.upstreams[0].endpoints[0];
+        assert!(endpoint.target.is_unix());
+        assert_eq!(endpoint.target.describe(), "unix:/run/app.sock");
+        assert_eq!(endpoint.target.port(), None, "a socket has no port");
+    } else {
+        let diagnostics = errors(text);
+        let only = diagnostics.iter().next().unwrap();
+        assert!(
+            only.message.contains("Unix-like operating system"),
+            "it has to say the machine is wrong, not the file: {}",
+            only.message
+        );
+    }
+}
+
+#[test]
+fn a_unix_backend_needs_a_path() {
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+site "*" { route "/" { proxy "unix:" } }
+"#,
+    );
+    let only = diagnostics.iter().next().unwrap();
+    assert!(only.message.contains("needs a path"), "{}", only.message);
 }

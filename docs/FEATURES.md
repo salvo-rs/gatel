@@ -68,6 +68,7 @@ carries; it is the same list, generated rather than written down.
 | `X-Forwarded-For` from a canonical client address, decided once | yes | done | `gatel-http/tests/proxy.rs` |
 | TLS to a backend: SNI, a private authority, a client identity | yes | done | `gatel-tls/src/client.rs`, `gatel-http/tests/proxy.rs` |
 | No way to skip verifying a backend's certificate | yes | done | the option does not exist; `tests/proxy.rs` proves an untrusted backend is refused |
+| Backends over a Unix domain socket | yes | done | `unix:/run/app.sock`; dialled, pooled and health-checked like any other, and refused at compile time where the platform has none. `gatel-http/tests/unix_socket.rs`, `gatel-state/src/probe.rs` |
 | Backends named by host rather than address | yes | done | `gatel-plan/src/upstream/target.rs`, `gatel-state/src/resolve.rs`, `gatel-http/tests/resolve.rs` |
 | A name's addresses refreshed without a reload, and without resetting health or pools | yes | done | the name is the endpoint's identity; `gatel-state/src/resolve.rs`, `tests/stability.rs` |
 | Retry with a replayed body | no | not started | only `safe` is implemented, deliberately |
@@ -174,7 +175,7 @@ it:
 | | nginx | Caddy | here |
 |---|---|---|---|
 | `forward-auth` / `auth_request` | yes | yes | **no** — the SSO-gateway pattern (oauth2-proxy, Authelia) has no answer here |
-| Unix-socket listeners and backends | yes | yes | **no** — blocks the PHP-FPM and gunicorn shapes |
+| Unix-socket *listeners* | yes | yes | **no** — backends are done; listening on a path is not |
 | OCSP stapling | yes | yes | **no** |
 | HTTP/3 | yes | yes | no |
 | Layer-4 TCP/UDP proxying | yes (`stream`) | plugin | no |

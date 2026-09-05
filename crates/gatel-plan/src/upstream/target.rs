@@ -26,11 +26,32 @@ pub enum Target {
     /// search domains, `/etc/hosts` and `nsswitch` mean the same thing here as
     /// they do for every other process on the machine.
     Name { host: String, port: u16 },
+    /// A Unix domain socket, written `unix:/run/app.sock`.
+    ///
+    /// How PHP-FPM, gunicorn, uWSGI and a great many sidecars are reached. It
+    /// is not a network address: there is no port, no resolution, and the
+    /// permission on the socket file is the access control.
+    Unix(std::path::PathBuf),
 }
 
 impl Target {
     /// Parse `127.0.0.1:8080`, `[::1]:8080`, `:8080` or `api.internal:8080`.
     pub fn parse(text: &str) -> Result<Self, String> {
+        if let Some(path) = text.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err("`unix:` needs a path, as in `unix:/run/app.sock`".to_string());
+            }
+            // Refused here rather than at the first connection, and named as a
+            // platform limit rather than a mistake in the configuration: this
+            // file is right, and this machine cannot run it.
+            if !cfg!(unix) {
+                return Err(format!(
+                    "`{text}` is a Unix domain socket, which this build cannot open — \
+                     Unix sockets need a Unix-like operating system"
+                ));
+            }
+            return Ok(Target::Unix(std::path::PathBuf::from(path)));
+        }
         if let Ok(address) = gatel_model::parse_socket_addr(text) {
             return Ok(Target::Address(address));
         }
@@ -60,22 +81,37 @@ impl Target {
         match self {
             Target::Address(address) => address.to_string(),
             Target::Name { host, port } => format!("{host}:{port}"),
+            Target::Unix(path) => format!("unix:{}", path.display()),
         }
     }
 
-    pub fn port(&self) -> u16 {
+    /// The port, for the two kinds that have one.
+    pub fn port(&self) -> Option<u16> {
         match self {
-            Target::Address(address) => address.port(),
-            Target::Name { port, .. } => *port,
+            Target::Address(address) => Some(address.port()),
+            Target::Name { port, .. } => Some(*port),
+            Target::Unix(_) => None,
         }
+    }
+
+    /// The socket path, for a target that is one.
+    pub fn unix_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Target::Unix(path) => Some(path.as_path()),
+            _ => None,
+        }
+    }
+
+    pub fn is_unix(&self) -> bool {
+        matches!(self, Target::Unix(_))
     }
 
     /// The name, when there is one. This is also the name a certificate would
     /// have to carry, which is why `tls` can take it rather than repeat it.
     pub fn host(&self) -> Option<&str> {
         match self {
-            Target::Address(_) => None,
             Target::Name { host, .. } => Some(host),
+            _ => None,
         }
     }
 
@@ -87,7 +123,7 @@ impl Target {
     pub fn address(&self) -> Option<SocketAddr> {
         match self {
             Target::Address(address) => Some(*address),
-            Target::Name { .. } => None,
+            _ => None,
         }
     }
 
@@ -220,7 +256,7 @@ mod tests {
     #[test]
     fn an_ipv6_literal_stays_an_address() {
         let target = Target::parse("[::1]:8080").unwrap();
-        assert_eq!(target.port(), 8080);
+        assert_eq!(target.port(), Some(8080));
         assert!(!target.is_name());
     }
 
@@ -228,7 +264,7 @@ mod tests {
     fn a_name_is_kept_as_a_name() {
         let target = Target::parse("api.internal:8080").unwrap();
         assert_eq!(target.host(), Some("api.internal"));
-        assert_eq!(target.port(), 8080);
+        assert_eq!(target.port(), Some(8080));
         assert_eq!(target.describe(), "api.internal:8080");
     }
 

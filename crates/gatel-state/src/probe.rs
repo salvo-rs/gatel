@@ -38,19 +38,72 @@ pub async fn probe(
     }
 }
 
+/// Run one probe against a Unix domain socket.
+///
+/// The same check, over a different kind of socket. A backend behind a socket
+/// path is as capable of being unhealthy as one behind an address, and a
+/// gateway that could not check it would have to guess.
+#[cfg(unix)]
+pub async fn probe_unix(
+    path: &std::path::Path,
+    kind: &HealthKind,
+    protocol: UpstreamProtocol,
+    timeout: Duration,
+) -> Result<(), ProbeError> {
+    let run = async {
+        let stream = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|error| error.to_string())?;
+        check(stream, kind, protocol, &path.display().to_string()).await
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("no answer within {timeout:?}")),
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn probe_unix(
+    path: &std::path::Path,
+    _kind: &HealthKind,
+    _protocol: UpstreamProtocol,
+    _timeout: Duration,
+) -> Result<(), ProbeError> {
+    Err(format!(
+        "{}: Unix sockets need a Unix-like operating system",
+        path.display()
+    ))
+}
+
 async fn run(address: SocketAddr, kind: &HealthKind, protocol: UpstreamProtocol) -> Result<(), ProbeError> {
     let stream = TcpStream::connect(address)
         .await
         .map_err(|error| error.to_string())?;
     let _ = stream.set_nodelay(true);
+    check(stream, kind, protocol, &address.to_string()).await
+}
 
+/// The check itself, over whatever kind of socket got here.
+///
+/// `authority` is what goes in the `Host` header when the configuration did
+/// not say — for an address that is the address, and for a socket path it is
+/// the path, which is at least true rather than invented.
+async fn check<IO>(
+    stream: IO,
+    kind: &HealthKind,
+    protocol: UpstreamProtocol,
+    authority: &str,
+) -> Result<(), ProbeError>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let HealthKind::Http { path, status, host } = kind else {
         // A TCP probe has already learned what it can: the backend accepted a
         // connection. Closing it immediately is the whole check.
         return Ok(());
     };
 
-    let authority = host.clone().unwrap_or_else(|| address.to_string());
+    let authority = host.clone().unwrap_or_else(|| authority.to_string());
     let request = http::Request::builder()
         .method(http::Method::GET)
         .uri(path.as_str())
@@ -152,6 +205,11 @@ mod tests {
         listener.local_addr().unwrap()
     }
 
+    /// Long enough that a working backend answers, short enough that a broken
+    /// one does not hold the suite up.
+    #[cfg(unix)]
+    const SOON: Duration = Duration::from_secs(2);
+
     fn http(path: &str, status: u16) -> HealthKind {
         HealthKind::Http {
             path: path.to_string(),
@@ -245,5 +303,89 @@ mod tests {
         .await
         .unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    // -- Unix domain sockets -------------------------------------------------
+    //
+    // The same checks, over a socket path. A backend behind one is as capable
+    // of being unhealthy as one behind an address, and probing only addresses
+    // would have marked every socket endpoint permanently unhealthy.
+
+    #[cfg(unix)]
+    mod unix {
+        use tokio::net::UnixListener;
+
+        use super::*;
+
+        fn socket(tag: &str) -> std::path::PathBuf {
+            let path = std::env::temp_dir().join(format!("gatel-probe-{tag}-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            path
+        }
+
+        async fn backend(path: std::path::PathBuf, status: u16) {
+            let listener = UnixListener::bind(&path).unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 4096];
+                        while let Ok(read) = stream.read(&mut buffer).await {
+                            if read == 0 {
+                                return;
+                            }
+                            let answer = format!(
+                                "HTTP/1.1 {status} X
+Content-Length: 0
+
+"
+                            );
+                            if stream.write_all(answer.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        #[tokio::test]
+        async fn a_tcp_style_probe_over_a_socket_is_just_connecting() {
+            let path = socket("connect");
+            backend(path.clone(), 200).await;
+            assert!(
+                probe_unix(&path, &HealthKind::TcpConnect, UpstreamProtocol::Http1, SOON)
+                    .await
+                    .is_ok()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_http_probe_over_a_socket_checks_the_status() {
+            let path = socket("http");
+            backend(path.clone(), 200).await;
+            assert!(
+                probe_unix(&path, &http("/healthz", 200), UpstreamProtocol::Http1, SOON)
+                    .await
+                    .is_ok()
+            );
+
+            let wrong = probe_unix(&path, &http("/healthz", 204), UpstreamProtocol::Http1, SOON)
+                .await
+                .unwrap_err();
+            assert!(wrong.contains("expected 204, got 200"), "{wrong}");
+        }
+
+        #[tokio::test]
+        async fn a_socket_that_is_not_there_fails_rather_than_hangs() {
+            let path = socket("absent");
+            assert!(
+                probe_unix(&path, &HealthKind::TcpConnect, UpstreamProtocol::Http1, SOON)
+                    .await
+                    .is_err()
+            );
+        }
     }
 }

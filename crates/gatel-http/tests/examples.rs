@@ -37,6 +37,12 @@ fn every_example_compiles() {
 
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
+        // An example of something the running platform cannot do is still a
+        // correct example. Checking it here would assert that Windows has Unix
+        // sockets; CI runs Linux, where it is checked like every other.
+        if name.starts_with("unix-") && !cfg!(unix) {
+            continue;
+        }
         let source = gatel_kdl::snapshot(&path, SourceId::file("main"), None)
             .unwrap_or_else(|diagnostics| panic!("{name} does not load:\n{diagnostics}"));
         let snapshot = Snapshot::new().with(source);

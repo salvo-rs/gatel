@@ -86,10 +86,14 @@ enum Sender {
 
 struct Idle {
     sender: Sender,
-    /// Which address this connection actually reached. Kept so that when a
-    /// name stops resolving to an address, the sockets to it can be dropped
-    /// and the ones to addresses it still has can be left alone.
-    address: SocketAddr,
+    /// Which address this connection actually reached, for a target that has
+    /// one. Kept so that when a name stops resolving to an address, the
+    /// sockets to it can be dropped and the ones to addresses it still has can
+    /// be left alone.
+    ///
+    /// `None` for a Unix socket, which has no address and cannot go stale that
+    /// way: the path either opens or it does not.
+    address: Option<SocketAddr>,
     opened: Instant,
     returned: Instant,
 }
@@ -327,7 +331,14 @@ impl ConnectionPool {
         &self,
         endpoint: &Endpoint,
         timeouts: &Timeouts,
-    ) -> Result<(Sender, SocketAddr), CheckoutError> {
+    ) -> Result<(Sender, Option<SocketAddr>), CheckoutError> {
+        // A Unix socket is not reached by address: there is nothing to
+        // resolve, nothing to rotate, and nothing that can go stale.
+        if let Some(path) = endpoint.target.unix_path() {
+            let sender = self.dial_unix(path, timeouts.connect).await?;
+            return Ok((sender, None));
+        }
+
         let deadline = Instant::now() + timeouts.connect;
         let addresses = self.addresses_for(endpoint, deadline).await?;
 
@@ -337,7 +348,7 @@ impl ConnectionPool {
                 break;
             };
             match self.dial_one(address, budget).await {
-                Ok(sender) => return Ok((sender, address)),
+                Ok(sender) => return Ok((sender, Some(address))),
                 Err(error) => last = Some(error),
             }
         }
@@ -376,6 +387,32 @@ impl ConnectionPool {
         }
     }
 
+    /// Reach a backend over a Unix domain socket.
+    ///
+    /// Not behind a `cfg` at the call site: the configuration that names one
+    /// is refused at compile time on a platform that has none, so this is the
+    /// only place that has to know.
+    #[cfg(unix)]
+    async fn dial_unix(&self, path: &std::path::Path, budget: Duration) -> Result<Sender, CheckoutError> {
+        let stream = match tokio::time::timeout(budget, tokio::net::UnixStream::connect(path)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                return Err(CheckoutError::Connect(format!("{}: {error}", path.display())));
+            }
+            Err(_) => return Err(CheckoutError::ConnectTimeout(budget)),
+        };
+        // No `set_nodelay`: Nagle is a TCP thing, and a Unix socket has none.
+        self.secure_and_handshake(stream, budget).await
+    }
+
+    #[cfg(not(unix))]
+    async fn dial_unix(&self, path: &std::path::Path, _budget: Duration) -> Result<Sender, CheckoutError> {
+        Err(CheckoutError::Connect(format!(
+            "{}: Unix sockets need a Unix-like operating system",
+            path.display()
+        )))
+    }
+
     async fn dial_one(&self, address: SocketAddr, budget: Duration) -> Result<Sender, CheckoutError> {
         let stream = match tokio::time::timeout(budget, TcpStream::connect(address)).await {
             Ok(Ok(stream)) => stream,
@@ -384,10 +421,19 @@ impl ConnectionPool {
         };
         // Interactive traffic; batching small writes only adds latency.
         let _ = stream.set_nodelay(true);
+        self.secure_and_handshake(stream, budget).await
+    }
 
-        // The handshake is bounded by the same deadline as the connection it
-        // is part of. A backend that accepts and then says nothing must not
-        // hold a slot for longer than dialling one would have.
+    /// Wrap a connected socket in TLS when the configuration asked for it, and
+    /// speak HTTP over whatever came out.
+    ///
+    /// The handshake is bounded by the same deadline as the connection it is
+    /// part of. A backend that accepts and then says nothing must not hold a
+    /// slot for longer than dialling one would have.
+    async fn secure_and_handshake<IO>(&self, stream: IO, budget: Duration) -> Result<Sender, CheckoutError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+    {
         match &self.tls {
             None => self.handshake(TokioIo::new(stream)).await,
             Some(tls) => {
@@ -469,7 +515,9 @@ impl ConnectionPool {
         *slot.live.lock().unwrap_or_else(|p| p.into_inner()) = keep.to_vec();
         let mut idle = slot.idle.lock().unwrap_or_else(|p| p.into_inner());
         let before = idle.len();
-        idle.retain(|entry| keep.contains(&entry.address));
+        // A connection with no address is a Unix socket, which no change of
+        // addresses can make stale.
+        idle.retain(|entry| entry.address.is_none_or(|address| keep.contains(&address)));
         let dropped = before - idle.len();
         slot.counters
             .discarded
@@ -502,7 +550,7 @@ impl Drop for WaitingGuard {
 /// unusable.
 pub struct Lease {
     sender: Option<Sender>,
-    address: SocketAddr,
+    address: Option<SocketAddr>,
     opened: Instant,
     slot: Arc<EndpointPool>,
     permit: OwnedSemaphorePermit,
@@ -569,9 +617,9 @@ impl Drop for Lease {
         // A connection to an address the name has since stopped resolving to
         // reached a container that is being replaced. Parking it would hand the
         // next request a socket to something on its way out.
-        {
+        if let Some(address) = self.address {
             let live = self.slot.live.lock().unwrap_or_else(|p| p.into_inner());
-            if !live.is_empty() && !live.contains(&self.address) {
+            if !live.is_empty() && !live.contains(&address) {
                 return;
             }
         }
