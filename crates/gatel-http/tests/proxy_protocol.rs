@@ -184,3 +184,47 @@ site "*" {{ route "/*" {{ respond "plain" }} }}
 
     assert!(get(gateway.address(), "/").await.contains("plain"));
 }
+
+#[tokio::test]
+async fn the_header_is_read_before_tls_rather_than_after() {
+    // The commonest real deployment: a network load balancer forwards TCP and
+    // the gateway terminates TLS. The header arrives ahead of the ClientHello,
+    // so reading it after the handshake would read it out of the encrypted
+    // stream — or, more likely, fail the handshake on twelve bytes of noise.
+    //
+    // The two failure modes tell the ordering apart without needing a TLS
+    // client: with a header, the bytes after it reach rustls, which answers a
+    // plaintext request with a fatal alert. Without one, the connection is
+    // closed before rustls ever sees anything.
+    let gateway = Gateway::new("proxy-protocol-tls");
+    let port = free_port();
+    let tls = manual_certificate(&gateway, "secure.example.com");
+    gateway
+        .apply(&format!(
+            r#"
+global {{
+    https "127.0.0.1:{port}" proxy-protocol=#true
+    trusted-proxy "127.0.0.0/8"
+}}
+site "secure.example.com" {{
+    {tls}
+    route "/" {{ respond "over tls" }}
+}}
+"#
+        ))
+        .await;
+
+    let address = gateway.address();
+
+    let after_header = with_header(address, b"PROXY TCP4 203.0.113.7 10.0.0.1 45678 443\r\n", "/").await;
+    assert!(
+        !after_header.is_empty() && after_header.as_bytes()[0] == 0x15,
+        "the header must be consumed and TLS begin, so plaintext draws an alert: {after_header:?}"
+    );
+
+    let without_header = with_header(address, b"", "/").await;
+    assert!(
+        without_header.is_empty(),
+        "with no header the connection is closed before TLS: {without_header:?}"
+    );
+}
