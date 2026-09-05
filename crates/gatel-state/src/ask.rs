@@ -121,8 +121,12 @@ pub async fn ask_upstream(runtime: &Arc<UpstreamRuntime>, ask: Ask) -> Result<An
 
         let (head, body) = response.into_parts();
         // A refusal is an answer, so the connection is worth keeping — but only
-        // if what is left on it is read off first.
-        let read = read_bounded(body).await;
+        // if what is left on it is read off first. Under the overall deadline
+        // like everything else: a backend that sends a head and then stalls
+        // must not hold a request open on the strength of having answered.
+        let read = tokio::time::timeout_at(deadline, read_bounded(body))
+            .await
+            .unwrap_or(None);
         if read.is_none() {
             lease.poison();
         }

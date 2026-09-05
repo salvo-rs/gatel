@@ -4,8 +4,10 @@
 //! hop-by-hop header cannot survive by being spelled unusually, and neither
 //! direction trusts anything the previous hop wrote about who the client is.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use gatel_state::{Body, BoxError, InFlight};
@@ -126,8 +128,11 @@ impl ProxyTerminal {
         }
         // The guard rides along with the body so the in-flight count falls when
         // the response finishes or is dropped, not when this function returns.
+        let gap = self.upstream.spec.timeouts.body_idle;
         let guarded = GuardedBody {
             inner: body,
+            idle: tokio::time::sleep(gap),
+            gap,
             _guard: in_flight,
         };
         response.replace_body(salvo_core::http::ResBody::Boxed(Box::pin(guarded)));
@@ -177,10 +182,22 @@ pub(super) fn declared_length(request: &Request) -> Option<u64> {
 }
 
 pin_project_lite::pin_project! {
-    /// A response body that keeps an in-flight guard alive.
+    /// A response body that keeps an in-flight guard alive, and gives up on a
+    /// backend that stops sending it.
+    ///
+    /// `response-head` says how long the answer may take to start. Nothing said
+    /// how long it may take to continue, so a backend that sent a header and
+    /// then stalled held a connection, a pool slot and an in-flight count for
+    /// as long as it liked — bounded only by `overall`, which is measured in
+    /// minutes because it has to cover a legitimately long download.
     struct GuardedBody {
         #[pin]
         inner: hyper::body::Incoming,
+        #[pin]
+        idle: tokio::time::Sleep,
+        // Reset after every frame, so the bound is on the gap between chunks
+        // rather than on the length of the body.
+        gap: Duration,
         _guard: InFlight,
     }
 }
@@ -193,10 +210,27 @@ impl http_body::Body for GuardedBody {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        self.project()
-            .inner
-            .poll_frame(context)
-            .map(|frame| frame.map(|result| result.map_err(|error| Box::new(error) as BoxError)))
+        let mut this = self.project();
+        match this.inner.poll_frame(context) {
+            Poll::Ready(frame) => {
+                if frame.is_some() {
+                    let gap = *this.gap;
+                    this.idle.as_mut().reset(tokio::time::Instant::now() + gap);
+                }
+                Poll::Ready(frame.map(|result| result.map_err(|error| Box::new(error) as BoxError)))
+            }
+            // Nothing arrived. The response head is already on its way to the
+            // client, so there is no status left to change: the only thing this
+            // can do is stop, which truncates the body and frees everything the
+            // stalled backend was holding.
+            Poll::Pending => match this.idle.poll(context) {
+                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("the backend stopped sending the response body for {:?}", this.gap),
+                )) as BoxError))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
     }
 
     fn is_end_stream(&self) -> bool {

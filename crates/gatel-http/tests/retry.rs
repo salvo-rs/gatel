@@ -302,6 +302,77 @@ async fn a_budget_of_nothing_means_no_retries_at_all() {
 }
 
 #[tokio::test]
+async fn a_backend_that_stops_mid_body_does_not_hold_the_request_open() {
+    // `response-head` bounds how long an answer may take to start. `body-idle`
+    // bounds how long it may take to continue, and until it was applied a
+    // backend could send one byte and then hold a connection, a pool slot and
+    // an in-flight count until `overall` — which is minutes, because it has to
+    // cover a download that is legitimately long.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalls = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 8192];
+            let _ = stream.read(&mut buffer).await;
+            // A complete head promising ten bytes, then one of them, then
+            // nothing at all.
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nX")
+                .await;
+            held.push(stream);
+        }
+    });
+
+    let gateway = Gateway::new("body-idle");
+    let port = free_port();
+    let outcome = gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+upstream "api" {{
+    endpoint "{stalls}"
+    timeouts connect="1s" response-head="5s" body-idle="500ms" overall="60s"
+}}
+site "*" {{ route "/*" {{ proxy upstream="api" }} }}
+"#
+        ))
+        .await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::Started { .. }),
+        "{outcome:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let response = support::get(gateway.address(), "/slow").await;
+    let elapsed = started.elapsed();
+
+    // The head was already sent, so there is no status left to change: the
+    // body is simply cut short.
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response
+        .split_once(
+            "
+
+",
+        )
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    assert!(
+        body.len() < 10,
+        "the body should have been cut short, not completed: {body:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the body-idle gap was not applied: {elapsed:?}"
+    );
+    gateway.stop().await;
+}
+
+#[tokio::test]
 async fn without_a_retry_block_nothing_is_tried_twice() {
     // The default has to stay the conservative one: a gateway that retried
     // without being asked would duplicate requests for every operator who never

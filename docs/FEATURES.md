@@ -60,7 +60,7 @@ carries; it is the same list, generated rather than written down.
 |---|---|---|---|
 | Ten balancing strategies | yes | done | `gatel-state/src/selector.rs` |
 | Bounded connection pool with reuse, and pre-send checkout failures | yes | done | `gatel-state/src/pool.rs` |
-| Per-stage timeouts | yes | done | `gatel-state/src/pool.rs`, `gatel-http/src/proxy.rs` |
+| Per-stage timeouts: queue, connect, response head, body gap, overall | yes | done | every one of them applied, including `body-idle`, which bounds the gap between response chunks so a backend that answers and then stalls is cut off rather than held until `overall`. `gatel-state/src/pool/`, `gatel-http/src/proxy/`, `gatel-http/tests/retry.rs` |
 | Active health checks, TCP and HTTP | yes | done | `gatel-state/src/supervisor.rs`, `probe.rs` |
 | Passive health with ejection | yes | done | `gatel-state/src/endpoint.rs`, `gatel-http/tests/proxy.rs` |
 | Safe retry: any failure before a byte was sent, whatever the method | yes | done | `gatel-http/src/proxy/mod.rs`, `gatel-http/tests/retry.rs` |

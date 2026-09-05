@@ -153,9 +153,6 @@ pub struct DirectiveMeta {
     /// Bumped when the compiled behaviour changes, so a plan built by an older
     /// binary is never mistaken for an equivalent one.
     pub version: &'static str,
-    /// The capability this directive provides, used by `gatel capabilities`
-    /// and by the missing-capability diagnostic.
-    pub capability: &'static str,
     pub failure_policy: FailurePolicy,
 }
 
@@ -167,7 +164,6 @@ impl DirectiveMeta {
             role: Role::Middleware(phase),
             order: 0,
             version: "1",
-            capability: name,
             failure_policy: FailurePolicy::Closed,
         }
     }
@@ -179,7 +175,6 @@ impl DirectiveMeta {
             role: Role::Terminal,
             order: 0,
             version: "1",
-            capability: name,
             failure_policy: FailurePolicy::Closed,
         }
     }
@@ -207,7 +202,6 @@ impl DirectiveMeta {
     pub fn hash_into(&self, hasher: &mut Hasher) {
         hasher.update_str(self.name);
         hasher.update_str(self.version);
-        hasher.update_str(self.capability);
         hasher.update_u64(match self.role {
             Role::Middleware(phase) => phase as u64,
             Role::Terminal => 100,
