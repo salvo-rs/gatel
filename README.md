@@ -78,18 +78,18 @@ error[unknown-property]: `balance "round-robin"` has no property `header`
 
 | | |
 |---|---|
-| Serving | HTTP/1.1 and HTTP/2, keep-alive, graceful drain, WebSocket and other upgrades |
+| Serving | HTTP/1.1 and HTTP/2, keep-alive, graceful drain, WebSocket and other upgrades, PROXY protocol v1/v2 for the client address behind a layer-4 balancer |
 | Routing | host (exact, wildcard, catch-all), path (exact, prefix), method, header/query/cookie/client-ip matchers |
 | Reverse proxy | backends by name or by address — a name is the endpoint's identity, and what it resolves to changes under it without resetting health or pools — TLS to backends with a private authority and client identity, 10 balancing strategies, bounded connection pool with reuse, per-stage timeouts, active and passive health, safe retry |
 | TLS | manual PEM certificates, SNI, mutual TLS, automatic certificates over ACME (HTTP-01), and a development authority that issues for local names without being asked — `gatel trust` once, then `https://localhost` works |
 | Reload | file watching with a polling fallback, transactional commit, last-known-good, no-op detection, listener add/remove without restart |
-| Directives | `respond`, `redirect`, `file-server` (ranges, streamed), `rewrite`, `trailing-slash`, `force-https`, `headers`, `encode`, `cors`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `timeout`, `body-limit`, `error-pages`, `metrics`, `health` |
+| Directives | `respond`, `redirect`, `file-server` (ranges, streamed, single-page-app fallback), `cache`, `rewrite`, `trailing-slash`, `force-https`, `headers`, `encode`, `cors`, `access-log`, `request-id`, `basic-auth`, `ip-filter`, `rate-limit`, `timeout`, `body-limit`, `error-pages`, `metrics`, `health` |
 | Observability | Prometheus metrics whose label set is the size of the configuration, an access log in text/JSON/CLF to stderr or a rolled file, and readiness that distinguishes what is wrong from what a restart would fix |
 | Limits | request head and body size, TLS handshake and idle-connection timeouts, and a process-wide connection cap — each applied, not just declared |
 | Tooling | `validate`, `explain`, `diff`, `capabilities`, `trust` |
 
-Not yet: caching, forward authentication, the admin API, tracing, HTTP/3, and
-the CGI family. What is done, what is missing and what proves each is in
+Not yet: forward authentication, the admin API, tracing, HTTP/3, Unix-socket
+listeners and backends, and the CGI family. What is done, what is missing and what proves each is in
 [docs/FEATURES.md](docs/FEATURES.md), and every event it emits is in
 [docs/EVENTS.md](docs/EVENTS.md). Where the code came from and what may be
 taken from elsewhere is [docs/design/provenance.md](docs/design/provenance.md);

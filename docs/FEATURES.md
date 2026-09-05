@@ -166,9 +166,38 @@ In order of what a deployment would miss first:
    every push except the two that need a tag — pushing artefacts and signing
    them — so the first tag is a smaller risk than it was, but it is not zero.
 
-Everything marked 2.1 is deliberate: `cache`, `forward-auth`, `circuit-breaker`,
-the other ACME challenge types and the Admin API are each large enough to want
-their own release, and none of them is needed to put this in front of a service.
+## Measured against nginx and Caddy
+
+What both of them have and this does not, in the order a deployment would miss
+it:
+
+| | nginx | Caddy | here |
+|---|---|---|---|
+| `forward-auth` / `auth_request` | yes | yes | **no** — the SSO-gateway pattern (oauth2-proxy, Authelia) has no answer here |
+| Unix-socket listeners and backends | yes | yes | **no** — blocks the PHP-FPM and gunicorn shapes |
+| OCSP stapling | yes | yes | **no** |
+| HTTP/3 | yes | yes | no |
+| Layer-4 TCP/UDP proxying | yes (`stream`) | plugin | no |
+| Response body rewriting (`sub_filter`) | yes | plugin | no |
+| Variables and `map` | yes | yes | no, deliberately — see `ARCHITECTURE.md` |
+| Admin API over HTTP | no | yes | no (2.1) |
+
+And what is here that neither has out of the box, so the comparison runs both
+ways: active health checks (nginx Plus only), a reload that is transactional
+rather than best-effort, ten balancing strategies, and a compile step that
+refuses an ambiguous route instead of letting file order decide it.
+
+`forward-auth` is the largest of the gaps and is not simply unwritten. A
+directive lives in `gatel-bundle-std`, which may not depend on `gatel-state`,
+so it cannot reach the connection pool. Giving it its own HTTP client would
+mean a second dialling path with its own timeouts, no pooling and no health —
+which is the thing the proxy exists to avoid. It needs a capability passed
+through `BuildContext`, which is an architectural change rather than a
+directive, and is worth doing on purpose rather than in passing.
+
+Everything else marked 2.1 is deliberate: `circuit-breaker`, the other ACME
+challenge types and the Admin API are each large enough to want their own
+release, and none of them is needed to put this in front of a service.
 
 ## Where the ACME protocol comes from
 
