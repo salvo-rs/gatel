@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,10 @@ struct Counters {
 
 struct EndpointPool {
     permits: Arc<Semaphore>,
+    /// How many permits the semaphore has been given. The semaphore itself
+    /// only reports what is *available*, which is not the same number while
+    /// requests are in flight, so the total has to be remembered to resize it.
+    granted: AtomicU32,
     idle: Mutex<VecDeque<Idle>>,
     waiting: AtomicU64,
     counters: Counters,
@@ -129,11 +133,13 @@ struct EndpointPool {
 
 /// Live connections to one upstream's backends.
 pub struct ConnectionPool {
-    config: gatel_plan::Pool,
+    /// Behind a lock because a pool outlives the generation that created it.
+    /// Sizing is deliberately not part of what makes a pool reusable — raising
+    /// a limit must not tear down live connections — which means the pool that
+    /// a reload keeps is holding the *previous* generation's numbers until it
+    /// is told the new ones.
+    policy: Mutex<Policy>,
     protocol: UpstreamProtocol,
-    /// Only used on the on-demand path, when a request arrives before the
-    /// resolver task has answered for the first time.
-    resolve: gatel_plan::Resolve,
     /// Present exactly when the configuration said the backend speaks TLS.
     /// Built during prepare, so a certificate authority that will not load
     /// stops a reload rather than turning into a connection error under
@@ -146,9 +152,40 @@ impl std::fmt::Debug for ConnectionPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionPool")
             .field("protocol", &self.protocol)
-            .field("max_per_endpoint", &self.config.max_per_endpoint)
+            .field("max_per_endpoint", &self.policy().config.max_per_endpoint)
             .field("tls", &self.tls.as_ref().map(|tls| tls.server_name()))
             .finish()
+    }
+}
+
+/// Everything about a pool that a reload may change while keeping the pool.
+#[derive(Debug, Clone, Copy)]
+struct Policy {
+    config: gatel_plan::Pool,
+    /// Only used on the on-demand path, when a request arrives before the
+    /// resolver task has answered for the first time.
+    resolve: gatel_plan::Resolve,
+}
+
+/// Grow or shrink one endpoint's concurrency bound in place.
+///
+/// Growing is immediate. Shrinking can only give back permits nobody is
+/// holding, so a limit lowered while requests are in flight lands as far as it
+/// can now and the rest at the next commit — which is better than the
+/// alternatives: cancelling a request that is already talking to a backend, or
+/// waiting on a lock in the middle of a reload.
+fn resize(slot: &EndpointPool, wanted: u32) {
+    let granted = slot.granted.load(Ordering::Acquire);
+    match wanted.cmp(&granted) {
+        std::cmp::Ordering::Equal => {}
+        std::cmp::Ordering::Greater => {
+            slot.permits.add_permits((wanted - granted) as usize);
+            slot.granted.store(wanted, Ordering::Release);
+        }
+        std::cmp::Ordering::Less => {
+            let forgotten = slot.permits.forget_permits((granted - wanted) as usize);
+            slot.granted.fetch_sub(forgotten as u32, Ordering::AcqRel);
+        }
     }
 }
 
@@ -172,19 +209,39 @@ impl ConnectionPool {
         tls: Option<Arc<gatel_tls::ClientTls>>,
     ) -> Self {
         Self {
-            config,
+            policy: Mutex::new(Policy { config, resolve }),
             protocol,
-            resolve,
             tls,
             endpoints: Mutex::new(HashMap::new()),
         }
     }
 
-    fn slot(&self, endpoint: &Endpoint) -> Arc<EndpointPool> {
+    fn policy(&self) -> Policy {
+        *self.policy.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Take on a reload's numbers without touching its connections.
+    ///
+    /// Called on every commit, including one that created this pool, so there
+    /// is one path rather than two. Without it, everything a reload can change
+    /// about a pool that it also keeps — every limit, every lifetime, how often
+    /// a name is looked up — would be read once at creation and then silently
+    /// ignored for as long as the process ran.
+    pub fn adopt(&self, config: gatel_plan::Pool, resolve: gatel_plan::Resolve) {
+        *self.policy.lock().unwrap_or_else(|p| p.into_inner()) = Policy { config, resolve };
+
+        let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
+        for slot in endpoints.values() {
+            resize(slot, config.max_per_endpoint);
+        }
+    }
+
+    fn slot(&self, endpoint: &Endpoint, config: &gatel_plan::Pool) -> Arc<EndpointPool> {
         let mut endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
         Arc::clone(endpoints.entry(endpoint.id.clone()).or_insert_with(|| {
             Arc::new(EndpointPool {
-                permits: Arc::new(Semaphore::new(self.config.max_per_endpoint as usize)),
+                permits: Arc::new(Semaphore::new(config.max_per_endpoint as usize)),
+                granted: AtomicU32::new(config.max_per_endpoint),
                 idle: Mutex::new(VecDeque::new()),
                 waiting: AtomicU64::new(0),
                 counters: Counters::default(),
@@ -199,16 +256,17 @@ impl ConnectionPool {
         endpoint: &Arc<Endpoint>,
         timeouts: &Timeouts,
     ) -> Result<Lease, CheckoutError> {
-        let slot = self.slot(endpoint);
+        let Policy { config, .. } = self.policy();
+        let slot = self.slot(endpoint, &config);
 
         let waiting = slot.waiting.fetch_add(1, Ordering::Relaxed) + 1;
         let _waiting_guard = WaitingGuard {
             slot: Arc::clone(&slot),
         };
-        if waiting > self.config.max_waiters as u64 {
+        if waiting > config.max_waiters as u64 {
             return Err(CheckoutError::QueueFull {
                 waiting: waiting as u32,
-                limit: self.config.max_waiters,
+                limit: config.max_waiters,
             });
         }
 
@@ -228,7 +286,7 @@ impl ConnectionPool {
                 idle.pop_front()
             };
             match candidate {
-                Some(entry) if entry.is_usable(&self.config, now) => {
+                Some(entry) if entry.is_usable(&config, now) => {
                     slot.counters.reused.fetch_add(1, Ordering::Relaxed);
                     return Ok(Lease {
                         sender: Some(entry.sender),
@@ -236,7 +294,7 @@ impl ConnectionPool {
                         opened: entry.opened,
                         slot,
                         permit,
-                        config: self.config,
+                        config,
                         reusable: true,
                     });
                 }
@@ -255,7 +313,7 @@ impl ConnectionPool {
             opened: Instant::now(),
             slot,
             permit,
-            config: self.config,
+            config,
             reusable: true,
         })
     }
@@ -304,9 +362,10 @@ impl ConnectionPool {
         let budget = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| CheckoutError::Resolve("no time left to look the name up".to_string()))?;
+        let resolve = self.policy().resolve;
         let policy = gatel_plan::Resolve {
-            timeout: budget.min(self.resolve.timeout),
-            ..self.resolve
+            timeout: budget.min(resolve.timeout),
+            ..resolve
         };
         match crate::resolve::lookup(&endpoint.target, policy).await {
             Ok(addresses) => {
@@ -376,13 +435,14 @@ impl ConnectionPool {
     }
 
     pub fn stats(&self) -> Vec<PoolStats> {
+        let granted = self.policy().config.max_per_endpoint;
         let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
         let mut stats: Vec<PoolStats> = endpoints
             .iter()
             .map(|(id, slot)| PoolStats {
                 endpoint: id.clone(),
                 idle: slot.idle.lock().unwrap_or_else(|p| p.into_inner()).len(),
-                in_use: self.config.max_per_endpoint - slot.permits.available_permits() as u32,
+                in_use: granted.saturating_sub(slot.permits.available_permits() as u32),
                 waiting: slot.waiting.load(Ordering::Relaxed),
                 opened: slot.counters.opened.load(Ordering::Relaxed),
                 reused: slot.counters.reused.load(Ordering::Relaxed),
@@ -763,5 +823,115 @@ mod tests {
             pool.checkout(&endpoint, &timeouts).await,
             Err(CheckoutError::Draining)
         ));
+    }
+
+    #[tokio::test]
+    async fn raising_a_limit_takes_effect_on_a_pool_the_reload_kept() {
+        // Sizing is not part of what makes a pool reusable, so a raised limit
+        // reaches a pool that already exists. Before `adopt` it reached
+        // nothing: the numbers were read once, at creation, and a reload that
+        // kept the pool kept the old ones for as long as the process ran.
+        let address = backend().await;
+        let (set, pool) = set(
+            address,
+            gatel_plan::Pool {
+                max_per_endpoint: 1,
+                ..gatel_plan::Pool::default()
+            },
+        );
+        let endpoint = Arc::clone(&set.all()[0]);
+        let timeouts = Timeouts {
+            queue: Duration::from_millis(100),
+            ..Timeouts::default()
+        };
+
+        let held = pool.checkout(&endpoint, &timeouts).await.unwrap();
+        assert!(
+            matches!(
+                pool.checkout(&endpoint, &timeouts).await,
+                Err(CheckoutError::QueueTimeout(_))
+            ),
+            "one permit means one connection"
+        );
+
+        pool.adopt(
+            gatel_plan::Pool {
+                max_per_endpoint: 2,
+                ..gatel_plan::Pool::default()
+            },
+            gatel_plan::Resolve::default(),
+        );
+
+        let second = pool.checkout(&endpoint, &timeouts).await;
+        assert!(second.is_ok(), "{second:?}");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn lowering_a_limit_gives_back_what_nobody_is_holding() {
+        let address = backend().await;
+        let (set, pool) = set(
+            address,
+            gatel_plan::Pool {
+                max_per_endpoint: 4,
+                ..gatel_plan::Pool::default()
+            },
+        );
+        let endpoint = Arc::clone(&set.all()[0]);
+        let timeouts = Timeouts {
+            queue: Duration::from_millis(100),
+            ..Timeouts::default()
+        };
+
+        let held = pool.checkout(&endpoint, &timeouts).await.unwrap();
+        pool.adopt(
+            gatel_plan::Pool {
+                max_per_endpoint: 1,
+                ..gatel_plan::Pool::default()
+            },
+            gatel_plan::Resolve::default(),
+        );
+
+        // The one in flight is not taken away from the request holding it, but
+        // nothing new may start beside it.
+        assert!(
+            matches!(
+                pool.checkout(&endpoint, &timeouts).await,
+                Err(CheckoutError::QueueTimeout(_))
+            ),
+            "a lowered limit must bind immediately for anything new"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn what_a_pool_reports_in_use_follows_the_limit_it_now_has() {
+        let address = backend().await;
+        let (set, pool) = set(
+            address,
+            gatel_plan::Pool {
+                max_per_endpoint: 4,
+                ..gatel_plan::Pool::default()
+            },
+        );
+        let endpoint = Arc::clone(&set.all()[0]);
+        let timeouts = Timeouts::default();
+
+        let held = pool.checkout(&endpoint, &timeouts).await.unwrap();
+        assert_eq!(pool.stats()[0].in_use, 1);
+
+        pool.adopt(
+            gatel_plan::Pool {
+                max_per_endpoint: 8,
+                ..gatel_plan::Pool::default()
+            },
+            gatel_plan::Resolve::default(),
+        );
+        assert_eq!(
+            pool.stats()[0].in_use,
+            1,
+            "raising the ceiling does not change how many are in use"
+        );
+        drop(held);
     }
 }

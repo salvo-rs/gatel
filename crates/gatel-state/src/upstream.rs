@@ -88,6 +88,11 @@ impl UpstreamRuntimes {
             let (pool, pool_resolution) = state.bind(&binding(StateKind::Pool), || {
                 ConnectionPool::new(upstream.pool, upstream.protocol, upstream.resolve, tls)
             });
+            // Sizing and lookup timing are deliberately not part of what makes
+            // a pool reusable, so a kept pool is holding the previous
+            // generation's numbers until it is handed the new ones. Done for
+            // every pool, not only a reused one, so there is one path.
+            pool.adopt(upstream.pool, upstream.resolve);
 
             resolutions.push((
                 upstream.id.clone(),
