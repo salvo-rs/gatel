@@ -1,0 +1,55 @@
+# Its own workspace on purpose: the fuzz targets need nightly and a linker
+# flag, and neither should reach an ordinary `cargo build` of the gateway.
+[package]
+name = "gatel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+# Its own workspace, so `cargo build` at the top of the repository never tries
+# to build something that needs nightly.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gatel-kdl = { path = "../crates/gatel-kdl" }
+gatel-model = { path = "../crates/gatel-model" }
+gatel-plan = { path = "../crates/gatel-plan" }
+gatel-bundle-std = { path = "../crates/gatel-bundle-std" }
+salvo_core = { version = "0.96", default-features = false }
+http = "1"
+
+[[bin]]
+name = "kdl_frontend"
+path = "fuzz_targets/kdl_frontend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "configuration"
+path = "fuzz_targets/configuration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "range_header"
+path = "fuzz_targets/range_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "matchers"
+path = "fuzz_targets/matchers.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

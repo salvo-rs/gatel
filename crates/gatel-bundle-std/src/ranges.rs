@@ -45,8 +45,13 @@ pub fn wanted(request: &Request, size: u64, etag: &str) -> Wanted {
     // `If-Range` is what makes a resumed download safe: if the file changed
     // since the part the client already has, it gets the whole new one rather
     // than a second half that does not match its first.
-    if let Some(condition) = header_of(request, http::header::IF_RANGE)
-        && condition.trim() != etag
+    //
+    // A header that is present but unreadable counts as not matching. Treating
+    // it as absent would be reading "I only want a part if it is still the
+    // same file" as "give me a part", which is the one direction that
+    // corrupts a download.
+    if let Some(condition) = request.headers().get(http::header::IF_RANGE)
+        && condition.to_str().map(str::trim).ok() != Some(etag)
     {
         return Wanted::Whole;
     }
@@ -64,10 +69,14 @@ pub fn wanted(request: &Request, size: u64, etag: &str) -> Wanted {
     match (from.trim(), to.trim()) {
         // `bytes=-500`: the last 500 bytes.
         ("", last) => match last.parse::<u64>() {
+            // A suffix of an empty file is a request nothing can satisfy.
+            // Without this the arithmetic saturates to `0-0`, which is one
+            // byte of a file that has none.
+            Ok(_) if size == 0 => Wanted::Unsatisfiable,
             Ok(0) => Wanted::Unsatisfiable,
             Ok(last) => Wanted::Part {
                 start: size.saturating_sub(last),
-                end: size.saturating_sub(1),
+                end: size - 1,
             },
             Err(_) => Wanted::Whole,
         },
@@ -390,5 +399,34 @@ mod tests {
         let body = body_of(&mut response).await;
         assert_eq!(body.len(), 4096);
         assert_eq!(body[0], b'Z', "it started where it was asked to");
+    }
+
+    #[test]
+    fn a_suffix_of_an_empty_file_is_unsatisfiable() {
+        // The arithmetic saturates to `0-0` without a size check, which is one
+        // byte of a file that has none — and then a read past the end.
+        for spec in ["bytes=-1", "bytes=-500", "bytes=-18446744073709551615"] {
+            assert_eq!(
+                wanted(&request(&[("range", spec)]), 0, TAG),
+                Wanted::Unsatisfiable,
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_if_range_that_cannot_be_read_counts_as_not_matching() {
+        // Present but unreadable is not the same as absent. Reading it as
+        // absent turns "only if it is still the same file" into "give me a
+        // part", which is the one direction that corrupts a resumed download.
+        let mut request = Request::default();
+        request
+            .headers_mut()
+            .insert(http::header::RANGE, HeaderValue::from_static("bytes=0-9"));
+        request.headers_mut().insert(
+            http::header::IF_RANGE,
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(wanted(&request, 1000, TAG), Wanted::Whole);
     }
 }

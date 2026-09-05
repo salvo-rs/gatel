@@ -42,7 +42,11 @@ impl Default for Limits {
             max_bytes_per_file: 4 * 1024 * 1024,
             max_import_depth: 8,
             max_nodes: 100_000,
-            max_depth: 32,
+            // The same number the frontend refuses at, because two limits on
+            // one thing is a way for them to disagree. The frontend's is the
+            // one that protects the stack; this one covers the tree that
+            // `import` splices together, which no single file's braces bound.
+            max_depth: crate::lower::MAX_NESTING,
         }
     }
 }

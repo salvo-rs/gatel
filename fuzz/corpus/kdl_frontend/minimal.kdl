@@ -1,0 +1,2 @@
+global { http ":8080" }
+site "*" { route "/" { respond "hi" } }

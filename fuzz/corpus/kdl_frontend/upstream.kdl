@@ -1,0 +1,5 @@
+upstream "api" {
+    endpoint "api.internal:8080"
+    resolve interval="5s" family="ipv4"
+    tls
+}

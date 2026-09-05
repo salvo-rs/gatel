@@ -14,3 +14,5 @@ gatel_*_*/
 
 # Local scratch
 /scratch
+fuzz/target/
+fuzz/artifacts/

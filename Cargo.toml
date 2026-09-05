@@ -13,6 +13,8 @@ members = [
     "crates/gatel-bundle-std",
     "xtask",
 ]
+# Needs nightly and a linker that ordinary builds do not want.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "2.0.0-alpha.1"

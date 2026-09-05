@@ -55,6 +55,34 @@ jobs:
         with:
           command: check
 
+  # A few minutes each, on every push. That finds regressions rather than deep
+  # bugs; a long run against a growing corpus is what finds those, and there is
+  # no substitute for leaving one going. What this does guarantee is that the
+  # targets still build and still pass over the corpus, which is how a fuzzing
+  # setup usually dies: quietly, by rotting.
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [kdl_frontend, configuration, range_header, matchers]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=180
+        working-directory: fuzz
+
+      # An input that made it fall over is the whole point of running this.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: fuzz/artifacts/
+
   # A release workflow nobody runs until a tag is a release workflow that is
   # discovered broken at the worst moment. This runs everything the tag would,
   # short of publishing: the same build, the same packaging, the same smoke

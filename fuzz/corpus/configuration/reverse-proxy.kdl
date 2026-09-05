@@ -1,0 +1,72 @@
+// Reverse proxy with two backends, health-based ejection and forwarding.
+global {
+    http ":8080"
+
+    // Only a peer inside these networks may tell us the client's address.
+    trusted-proxy "10.0.0.0/8"
+
+    // Each of these is applied to a real connection, not just recorded.
+    // `idle` covers both a keep-alive connection waiting for its next request
+    // and a client dribbling a head out one byte at a time, because from the
+    // socket those are the same thing.
+    limits header="16KiB" body="16MiB" handshake-timeout="10s" idle="60s" connections=10000
+}
+
+upstream "api" {
+    endpoint "10.0.1.1:8080" id="a" weight=3
+    endpoint "10.0.1.2:8080" id="b"
+
+    balance "weighted-round-robin"
+
+    // Take a backend out after repeated failures, and let it back in later.
+    passive-health max-fails=5 window="30s" cooldown="60s"
+
+    // Retry is off unless asked for; `safe` only retries failures that
+    // happened before any request byte was sent.
+    retry mode="safe" attempts=2
+
+    timeouts connect="5s" queue="2s" response-head="10s" body-idle="60s" overall="5m"
+    pool max-per-endpoint=32 max-idle-per-endpoint=8 idle-timeout="30s"
+}
+
+site "api.example.com" {
+    access-log format="json"
+
+    headers {
+        response {
+            set "strict-transport-security" "max-age=31536000"
+        }
+    }
+
+    // A canary: the extra condition makes this route more specific, so it is
+    // tried before the one below it regardless of declaration order.
+    route "/*" id="canary" {
+        match header="x-canary=1"
+        proxy {
+            endpoint "10.0.9.1:8080"
+        }
+    }
+
+    route "/*" id="stable" {
+        proxy upstream="api"
+    }
+}
+
+site "*" {
+    route "/*" {
+        redirect "https://api.example.com/" permanent=#true
+    }
+}
+
+// A backend that speaks TLS. `server-name` is both the SNI value and the name
+// the certificate is checked against — written down rather than taken from the
+// address, because a backend is usually reached by an address that is not its
+// name.
+//
+// There is no way to turn verification off. That option exists in other
+// gateways because it makes a broken deployment work today, and it is how
+// deployments stay broken for years. A private authority is named instead.
+upstream "partner" {
+    endpoint "10.0.9.1:443"
+    tls server-name="partner.internal" ca="file:partner-ca.pem"
+}
