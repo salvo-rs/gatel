@@ -249,7 +249,16 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("token"), "s3cret\n").unwrap();
+        let token = directory.join("token");
+        std::fs::write(&token, "s3cret\n").unwrap();
+        // Readable by nobody else, because that is what resolving requires —
+        // and a test that wrote it any other way would only pass on a platform
+        // where the requirement does nothing.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let resolved = resolve_secret(&SecretRef::parse("token").unwrap(), &directory).unwrap();
         assert_eq!(resolved.expose(), "s3cret");

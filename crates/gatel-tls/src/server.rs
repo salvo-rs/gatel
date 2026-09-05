@@ -307,11 +307,10 @@ mod tests {
         fn write_pair(&self, name: &str) -> SiteTls {
             let generated = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
             std::fs::write(self.directory.join("cert.pem"), generated.cert.pem()).unwrap();
-            std::fs::write(
-                self.directory.join("key.pem"),
-                generated.signing_key.serialize_pem(),
-            )
-            .unwrap();
+            crate::certificate::write_key(
+                &self.directory.join("key.pem"),
+                &generated.signing_key.serialize_pem(),
+            );
             SiteTls {
                 source: CertificateSource::Manual {
                     cert: SecretRef::parse("cert.pem").unwrap(),
@@ -491,11 +490,10 @@ mod tests {
         let state = fixture.directory.join("acme");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("api.example.com.crt"), generated.cert.pem()).unwrap();
-        std::fs::write(
-            state.join("api.example.com.key"),
-            generated.signing_key.serialize_pem(),
-        )
-        .unwrap();
+        crate::certificate::write_key(
+            &state.join("api.example.com.key"),
+            &generated.signing_key.serialize_pem(),
+        );
 
         let tls = SiteTls {
             source: CertificateSource::Acme,

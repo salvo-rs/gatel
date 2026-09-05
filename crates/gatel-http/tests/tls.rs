@@ -82,11 +82,10 @@ async fn a_certificate_that_will_not_load_stops_the_reload() {
 
     // Replace the key with one from a different certificate.
     let other = rcgen::generate_simple_self_signed(vec!["other.example.com".to_string()]).unwrap();
-    std::fs::write(
-        gateway.directory.join("key.pem"),
-        other.signing_key.serialize_pem(),
-    )
-    .unwrap();
+    write_key(
+        &gateway.directory.join("key.pem"),
+        &other.signing_key.serialize_pem(),
+    );
 
     let outcome = gateway
         .apply(&format!(

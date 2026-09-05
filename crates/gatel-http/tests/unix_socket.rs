@@ -86,19 +86,23 @@ async fn connections_to_a_socket_are_pooled_like_any_other() {
     let socket = socket_path(&gateway, "pool.sock");
     let _backend = unix_backend(socket.clone(), "pooled").await;
 
-    gateway
+    let outcome = gateway
         .apply(&format!(
             r#"
 global {{ http "127.0.0.1:{port}" }}
 upstream "app" {{
     endpoint "unix:{}"
-    pool max-per-endpoint=4
+    pool max-per-endpoint=8
 }}
 site "*" {{ route "/*" {{ proxy upstream="app" }} }}
 "#,
             socket.display()
         ))
         .await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::Started { .. }),
+        "it has to commit: {outcome:?}"
+    );
 
     let address = gateway.address();
     for _ in 0..5 {

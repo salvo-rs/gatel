@@ -219,7 +219,10 @@ mod tests {
         let root = directory("identity");
         let generated = rcgen::generate_simple_self_signed(vec!["gateway".to_string()]).unwrap();
         std::fs::write(root.join("client.pem"), generated.cert.pem()).unwrap();
-        std::fs::write(root.join("client-key.pem"), generated.signing_key.serialize_pem()).unwrap();
+        crate::certificate::write_key(
+            &root.join("client-key.pem"),
+            &generated.signing_key.serialize_pem(),
+        );
 
         let mut spec = spec("api.internal");
         spec.client_cert = Some(SecretRef::parse("client.pem").unwrap());
@@ -233,7 +236,7 @@ mod tests {
         let certificate = rcgen::generate_simple_self_signed(vec!["gateway".to_string()]).unwrap();
         let other = rcgen::generate_simple_self_signed(vec!["gateway".to_string()]).unwrap();
         std::fs::write(root.join("client.pem"), certificate.cert.pem()).unwrap();
-        std::fs::write(root.join("client-key.pem"), other.signing_key.serialize_pem()).unwrap();
+        crate::certificate::write_key(&root.join("client-key.pem"), &other.signing_key.serialize_pem());
 
         let mut spec = spec("api.internal");
         spec.client_cert = Some(SecretRef::parse("client.pem").unwrap());

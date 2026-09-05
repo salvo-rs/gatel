@@ -45,8 +45,10 @@ impl Certificate {
     /// The chain order matters and is preserved: the leaf first, then any
     /// intermediates. rustls sends them in the order given.
     pub fn from_pem_files(chain: &Path, key: &Path) -> Result<Self, String> {
-        let chain_bytes = read_bounded(chain)?;
-        let key_bytes = read_bounded(key)?;
+        // The chain is public — it is sent to every client that connects — so
+        // it is read without a permission check. The key is not, and is.
+        let chain_bytes = read_bounded(chain, Secrecy::Public)?;
+        let key_bytes = read_bounded(key, Secrecy::Private)?;
         Self::from_pem(&chain_bytes, &key_bytes, &describe(chain))
     }
 
@@ -75,11 +77,38 @@ impl Certificate {
     }
 }
 
+#[cfg(test)]
+/// Write a private key the way anything that writes one should: readable by
+/// nobody else.
+///
+/// Not a test convenience. Loading refuses a key that is readable by group or
+/// others, so a helper that wrote one at the default mode would only ever have
+/// worked on a platform where that check does nothing — which is exactly how
+/// this went unnoticed.
+pub fn write_key(path: &std::path::Path, pem: &str) {
+    std::fs::write(path, pem).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 /// Certificates are small. A file far larger than one is a mistake, or an
 /// attempt to make the gateway read something it should not.
 const MAX_PEM_BYTES: u64 = 256 * 1024;
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
+/// Whether a file is something only this process should be able to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Secrecy {
+    /// A certificate chain. Sent to every client that connects, so who else
+    /// can read it on this machine is not a finding.
+    Public,
+    /// A private key.
+    Private,
+}
+
+fn read_bounded(path: &Path, secrecy: Secrecy) -> Result<Vec<u8>, String> {
     let metadata =
         std::fs::metadata(path).map_err(|error| format!("cannot read `{}`: {error}", describe(path)))?;
     if !metadata.is_file() {
@@ -91,7 +120,9 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
             describe(path)
         ));
     }
-    check_permissions(path, &metadata)?;
+    if secrecy == Secrecy::Private {
+        check_permissions(path, &metadata)?;
+    }
     std::fs::read(path).map_err(|error| format!("cannot read `{}`: {error}", describe(path)))
 }
 
@@ -184,5 +215,65 @@ mod tests {
             !error.contains("/nowhere/"),
             "a diagnostic should not leak the layout: {error}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn write(directory: &Path, name: &str, contents: &str, mode: u32) -> std::path::PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn directory(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("gatel-cert-perm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_world_readable_certificate_is_fine_because_it_is_public() {
+        // It is sent to every client that connects. Refusing it for being
+        // readable made `tls cert=... key=...` — the most basic way to serve
+        // HTTPS — fail on every Unix machine, because nobody chmods a
+        // certificate to 0600 and there is no reason to.
+        let directory = directory("public-chain");
+        let certified = rcgen::generate_simple_self_signed(vec!["example.com".to_string()]).unwrap();
+        let chain = write(&directory, "cert.pem", &certified.cert.pem(), 0o644);
+        let key = write(
+            &directory,
+            "key.pem",
+            &certified.signing_key.serialize_pem(),
+            0o600,
+        );
+
+        Certificate::from_pem_files(&chain, &key).expect("a public certificate is not a finding");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_world_readable_key_is_still_refused() {
+        // The half that is worth refusing, and the reason the check exists.
+        let directory = directory("public-key");
+        let certified = rcgen::generate_simple_self_signed(vec!["example.com".to_string()]).unwrap();
+        let chain = write(&directory, "cert.pem", &certified.cert.pem(), 0o644);
+        let key = write(
+            &directory,
+            "key.pem",
+            &certified.signing_key.serialize_pem(),
+            0o644,
+        );
+
+        let error = Certificate::from_pem_files(&chain, &key).unwrap_err();
+        assert!(error.contains("readable by group or others"), "{error}");
+        assert!(error.contains("key.pem"), "and it names the key: {error}");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

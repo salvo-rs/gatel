@@ -365,14 +365,27 @@ pub async fn backend(name: &'static str) -> SocketAddr {
 
 /// Write a self-signed pair into the gateway's configuration directory and
 /// return the KDL that points at it.
+/// Write a private key the way anything that writes one should: readable by
+/// nobody else. Loading refuses a key that is not.
+pub fn write_key(path: &std::path::Path, pem: &str) {
+    std::fs::write(path, pem).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 pub fn manual_certificate(gateway: &Gateway, host: &str) -> String {
     let generated = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
     std::fs::write(gateway.directory.join("cert.pem"), generated.cert.pem()).unwrap();
-    std::fs::write(
-        gateway.directory.join("key.pem"),
-        generated.signing_key.serialize_pem(),
-    )
-    .unwrap();
+    // A key must be readable by nobody else, or loading it is refused — which
+    // is the point of the check, and is why the helper does it rather than
+    // every caller remembering to.
+    write_key(
+        &gateway.directory.join("key.pem"),
+        &generated.signing_key.serialize_pem(),
+    );
     "tls cert=\"cert.pem\" key=\"key.pem\"".to_string()
 }
 

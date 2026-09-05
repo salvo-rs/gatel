@@ -11,7 +11,9 @@ fn write_hash(gateway: &Gateway, name: &str, password: &str) -> String {
     // it is testing.
     let hash = bcrypt::hash(password, 4).unwrap();
     let path = gateway.directory.join(format!("{name}.hash"));
-    std::fs::write(&path, hash).unwrap();
+    // A file of password hashes is a secret, and loading refuses one that
+    // anybody on the machine can read.
+    write_key(&path, &hash);
     format!("{name}.hash")
 }
 
