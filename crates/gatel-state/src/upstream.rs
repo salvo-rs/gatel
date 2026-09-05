@@ -18,6 +18,12 @@ pub struct UpstreamRuntime {
     pub endpoints: Arc<EndpointSet>,
     pub selector: Arc<SelectorState>,
     pub pool: Arc<ConnectionPool>,
+    /// How much of this upstream's live traffic may currently be retries.
+    ///
+    /// Deliberately not bound state: it counts what is in flight at this
+    /// instant, and a number that stops being true within milliseconds has
+    /// nothing worth carrying across a reload.
+    pub retry_budget: Arc<crate::retry::RetryBudget>,
 }
 
 /// How each part of an upstream's state was resolved, for the reload event.
@@ -107,6 +113,7 @@ impl UpstreamRuntimes {
                 endpoints,
                 selector,
                 pool,
+                retry_budget: crate::retry::RetryBudget::new(),
             }));
         }
 

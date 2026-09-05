@@ -268,6 +268,15 @@ impl EndpointSet {
             .collect()
     }
 
+    /// Requests this upstream is handling right now, across every backend.
+    ///
+    /// The denominator of the retry budget. Counted from the endpoints rather
+    /// than kept separately, so it is the same number `least-conn` balances on
+    /// and cannot drift away from it.
+    pub fn in_flight(&self) -> u64 {
+        self.endpoints.iter().map(|endpoint| endpoint.in_flight()).sum()
+    }
+
     /// Claim an endpoint for a request. The returned guard must live until the
     /// response body is finished or dropped.
     pub fn claim(&self, endpoint: &Arc<Endpoint>) -> InFlight {

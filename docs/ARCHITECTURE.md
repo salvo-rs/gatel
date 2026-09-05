@@ -290,6 +290,27 @@ Lowering the cap never closes anything that is already open — it takes effect 
 connections end, because dropping a live request to satisfy a number somebody
 just typed is a worse surprise than being briefly over it.
 
+## What may be tried again
+
+Every retry is a guess that the backend did not act on the request. The
+configuration therefore describes *when the failure happened*, not what it was,
+because that is the only thing that makes the guess safe:
+
+| | Retried | Why |
+|---|---|---|
+| Nothing eligible, no connection, queue full or timed out | any method, any body | the request never left, so the backend cannot have seen it — this is `mode="safe"` |
+| The send failed, or no response head arrived | only under `mode="replay"`, and only when the body was buffered or absent | the backend may have acted on it, so this can duplicate a request; the configuration refuses to enable it without a `buffer` size, so the cost is stated |
+| An upgrade | never | the client committed to one connection the moment it asked |
+
+Two bounds sit on top. `per-try` gives each attempt a slice of the overall
+budget, so one endpoint that accepts and then goes quiet cannot consume the
+time the next attempt would have used. `budget-percent` caps retries as a
+share of the upstream's live traffic, because the moment a backend starts
+failing every request in flight fails at once — and a gateway that retried all
+of them would answer a partial outage by doubling the load on what is left.
+A budget of zero turns retries off rather than rounding up to the small floor
+that keeps a quiet gateway able to retry at all.
+
 ## Why `proxy` is in the kernel
 
 Endpoint selection, health, connection reuse and retry are one correctness

@@ -66,6 +66,7 @@ attempt.
 | `upstream_failed` | A proxied request got no usable answer. Carries the status the client was given. |
 | `checkout_failed` | A connection to a backend could not be obtained. Nothing had been sent, so another endpoint may be tried. |
 | `endpoint_ejected` | Passive health took an endpoint out of rotation. |
+| `retry_budget_exhausted` | A request would have been retried, and was not: too much of this upstream's live traffic is already retries. The client gets whatever the last attempt failed with. |
 | `upstream_upgrade_unavailable` | The backend answered 101 without giving a connection to take over. |
 
 ## `gatel::runtime`

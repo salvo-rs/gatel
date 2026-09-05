@@ -21,9 +21,22 @@ upstream "api" {
     // Take a backend out after repeated failures, and let it back in later.
     passive-health max-fails=5 window="30s" cooldown="60s"
 
-    // Retry is off unless asked for; `safe` only retries failures that
-    // happened before any request byte was sent.
-    retry mode="safe" attempts=2
+    // Retry is off unless asked for. `safe` retries only failures that
+    // happened before any request byte was sent — nothing to connect to, no
+    // pool slot, a queue that timed out — which is safe for every method,
+    // because the backend has not seen the request.
+    //
+    // `per-try` bounds one attempt, so a backend that accepts and then goes
+    // quiet cannot spend the budget the second attempt would have used.
+    // `budget-percent` caps retries as a share of this upstream's live
+    // traffic: when a backend starts failing everything, the gateway must not
+    // answer by doubling the load on whatever is left.
+    //
+    // `mode="replay"` is the other setting. It also retries failures that
+    // happened after the request was sent, which means the request can be
+    // duplicated — so it has to buffer the body, and the configuration refuses
+    // it without an explicit `buffer` saying how much memory that may cost.
+    retry mode="safe" attempts=2 per-try="3s" budget-percent=20
 
     timeouts connect="5s" queue="2s" response-head="10s" body-idle="60s" overall="5m"
     pool max-per-endpoint=32 max-idle-per-endpoint=8 idle-timeout="30s"

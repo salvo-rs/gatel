@@ -63,7 +63,7 @@ carries; it is the same list, generated rather than written down.
 | Per-stage timeouts | yes | done | `gatel-state/src/pool.rs`, `gatel-http/src/proxy.rs` |
 | Active health checks, TCP and HTTP | yes | done | `gatel-state/src/supervisor.rs`, `probe.rs` |
 | Passive health with ejection | yes | done | `gatel-state/src/endpoint.rs`, `gatel-http/tests/proxy.rs` |
-| Safe retry: only a request with no body, only before anything was sent | yes | done | `gatel-http/src/proxy.rs` |
+| Safe retry: any failure before a byte was sent, whatever the method | yes | done | `gatel-http/src/proxy/mod.rs`, `gatel-http/tests/retry.rs` |
 | Hop-by-hop headers stripped by rebuilding the request | yes | done | `gatel-http/src/proxy.rs` |
 | `X-Forwarded-For` from a canonical client address, decided once | yes | done | `gatel-http/tests/proxy.rs` |
 | TLS to a backend: SNI, a private authority, a client identity | yes | done | `gatel-tls/src/client.rs`, `gatel-http/tests/proxy.rs` |
@@ -71,7 +71,9 @@ carries; it is the same list, generated rather than written down.
 | Backends over a Unix domain socket | yes | done | `unix:/run/app.sock`; dialled, pooled and health-checked like any other, and refused at compile time where the platform has none. `gatel-http/tests/unix_socket.rs`, `gatel-state/src/probe.rs` |
 | Backends named by host rather than address | yes | done | `gatel-plan/src/upstream/target.rs`, `gatel-state/src/resolve.rs`, `gatel-http/tests/resolve.rs` |
 | A name's addresses refreshed without a reload, and without resetting health or pools | yes | done | the name is the endpoint's identity; `gatel-state/src/resolve.rs`, `tests/stability.rs` |
-| Retry with a replayed body | no | not started | only `safe` is implemented, deliberately |
+| Retry with a replayed body | yes | done | `retry mode="replay"` buffers a body up to the size the operator named and sends it again after a post-send failure; a body larger than that, or one with no declared length, is streamed and not replayed. `gatel-http/tests/retry.rs` |
+| A per-attempt deadline, so one slow endpoint cannot spend the whole budget | yes | done | `per-try`; `gatel-http/tests/retry.rs` |
+| A retry budget, so a failing backend is not given twice the load | yes | done | capped as a share of the upstream's live traffic. `gatel-state/src/retry.rs`, `gatel-http/tests/retry.rs` |
 | Circuit breaker as a directive | no (2.1) | not started | passive ejection covers the common case |
 | Forward proxying | no | not started | — |
 
