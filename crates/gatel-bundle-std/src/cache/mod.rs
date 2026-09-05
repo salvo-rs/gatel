@@ -168,12 +168,7 @@ struct CacheHandler {
 impl CacheHandler {
     /// What this request would be stored under, before `Vary`.
     fn key(&self, request: &Request) -> store::Key {
-        let host = request
-            .headers()
-            .get(http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .or_else(|| request.uri().host())
-            .unwrap_or("");
+        let host = crate::authority(request).unwrap_or("");
         let target = request
             .uri()
             .path_and_query()

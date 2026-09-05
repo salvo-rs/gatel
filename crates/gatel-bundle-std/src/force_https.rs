@@ -121,8 +121,8 @@ impl Handler for ForceHttpsHandler {
 
 impl ForceHttpsHandler {
     fn location(&self, request: &Request) -> Option<HeaderValue> {
-        let authority = authority(request)?;
-        let host = authority.split(':').next().unwrap_or(&authority);
+        let authority = crate::authority(request)?;
+        let host = authority.split(':').next().unwrap_or(authority);
         let target = request
             .uri()
             .path_and_query()
@@ -134,19 +134,6 @@ impl ForceHttpsHandler {
         };
         HeaderValue::from_str(&url).ok()
     }
-}
-
-/// The host the client asked for, from wherever this version of HTTP puts it.
-fn authority(request: &Request) -> Option<String> {
-    if let Some(authority) = request.uri().authority() {
-        return Some(authority.as_str().to_string());
-    }
-    request
-        .headers()
-        .get(http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.trim().to_string())
 }
 
 #[cfg(test)]

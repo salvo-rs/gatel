@@ -205,11 +205,11 @@ impl ForwardAuthHandler {
                 "http"
             },
         );
-        if let Some(host) = authority(request) {
-            set(&mut headers, "x-forwarded-host", &host);
+        if let Some(host) = crate::authority(request) {
+            set(&mut headers, "x-forwarded-host", host);
             // The authoriser is asked about the site the client named, not
             // about whichever backend happens to answer.
-            set(&mut headers, "host", &host);
+            set(&mut headers, "host", host);
         }
         // Written from what the dispatcher decided, never copied from the
         // client's own header: an authoriser that allowlists addresses must not
@@ -298,20 +298,6 @@ impl Handler for ForwardAuthHandler {
         }
         ctrl.call_next(request, depot, response).await;
     }
-}
-
-/// The host the client asked for, from wherever this version of HTTP puts it.
-fn authority(request: &Request) -> Option<String> {
-    if let Some(authority) = request.uri().authority() {
-        return Some(authority.as_str().to_string());
-    }
-    request
-        .headers()
-        .get(salvo_core::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 #[cfg(test)]

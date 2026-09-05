@@ -275,6 +275,56 @@ async fn an_authoriser_that_cannot_be_reached_refuses_rather_than_letting_it_thr
 }
 
 #[tokio::test]
+async fn a_cors_preflight_is_answered_without_asking_the_authoriser() {
+    // A browser sends a preflight with no cookies, so asking about it would
+    // refuse it, and refusing a preflight breaks the request that follows.
+    // Nothing here special-cases that: `cors` is a guard at the default order
+    // and `forward-auth` sits after every other guard, so the preflight is
+    // already answered by the time the question would be asked. This test
+    // exists because that is a property of the ordering, and orderings move.
+    let ledger = Arc::new(Ledger::default());
+    let auth = authoriser(Arc::clone(&ledger)).await;
+    let app = echo_identity().await;
+    let port = free_port();
+    let gateway = Gateway::new("fa-preflight");
+    let outcome = gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+upstream "auth" {{ endpoint "{auth}" }}
+upstream "app" {{ endpoint "{app}" }}
+site "*" {{
+    route "/*" {{
+        proxy upstream="app"
+        cors {{ origin "https://app.example" }}
+        forward-auth upstream="auth" path="/verify"
+    }}
+}}
+"#
+        ))
+        .await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::Started { .. }),
+        "{outcome:?}"
+    );
+
+    let response = request(
+        gateway.address(),
+        "OPTIONS /orders HTTP/1.1\r\nHost: example.com\r\nOrigin: https://app.example\r\n\
+         Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+    assert_eq!(
+        ledger.asks.load(Ordering::Relaxed),
+        0,
+        "a preflight is a question about a request, not a request"
+    );
+    gateway.stop().await;
+}
+
+#[tokio::test]
 async fn an_upstream_that_does_not_exist_is_caught_while_compiling() {
     // Not at the first refusal, when the operator is reading the wrong logs.
     let gateway = Gateway::new("fa-unknown");

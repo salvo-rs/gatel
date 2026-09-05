@@ -44,6 +44,27 @@ pub fn generated(depot: &mut salvo_core::Depot) {
     depot.insert("gatel.generated", true);
 }
 
+/// The host the client asked for, port and all, or `None` if it did not say.
+///
+/// One function because there is one answer, and three directives were each
+/// reaching for it slightly differently — which is how a cache key and a
+/// redirect end up disagreeing about what site a request was for.
+///
+/// The URI comes first on purpose. HTTP/2 carries the authority there, and a
+/// client may send a `host` header as well; when both are present the standard
+/// says the authority is the one that counts.
+pub fn authority(request: &salvo_core::http::Request) -> Option<&str> {
+    if let Some(authority) = request.uri().authority() {
+        return Some(authority.as_str());
+    }
+    request
+        .headers()
+        .get(salvo_core::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 /// Every directive this crate provides.
 pub fn bundle() -> Bundle {
     Bundle::new("std", "1")
@@ -131,5 +152,38 @@ mod tests {
             })
             .collect();
         assert_eq!(open, ["access-log"]);
+    }
+
+    #[test]
+    fn the_authority_in_the_uri_wins_over_a_host_header() {
+        // HTTP/2 puts it in the URI and may carry a `host` header as well.
+        // Reading the header first would let the two disagree, and a cache key
+        // and a redirect would then be about different sites.
+        let mut request = salvo_core::http::Request::default();
+        *request.uri_mut() = "https://real.example/path".parse().unwrap();
+        request.headers_mut().insert(
+            salvo_core::http::header::HOST,
+            salvo_core::http::HeaderValue::from_static("other.example"),
+        );
+        assert_eq!(authority(&request), Some("real.example"));
+    }
+
+    #[test]
+    fn without_a_uri_authority_the_host_header_answers() {
+        let mut request = salvo_core::http::Request::default();
+        *request.uri_mut() = "/path".parse().unwrap();
+        request.headers_mut().insert(
+            salvo_core::http::header::HOST,
+            salvo_core::http::HeaderValue::from_static("  example.com:8443  "),
+        );
+        assert_eq!(authority(&request), Some("example.com:8443"));
+    }
+
+    #[test]
+    fn a_request_that_names_no_host_says_so() {
+        // Rather than answering with an empty string, which every caller would
+        // then have to recognise as "none" on its own.
+        let request = salvo_core::http::Request::default();
+        assert_eq!(authority(&request), None);
     }
 }
