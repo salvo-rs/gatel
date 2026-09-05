@@ -19,8 +19,20 @@
 //! again in full rather than with `If-None-Match` — which is what nginx does
 //! without `proxy_cache_revalidate`. It is worth adding and is not here.
 //!
+//! It does not coalesce. Ten simultaneous requests for one uncached page are
+//! ten requests to the origin — nginx has `proxy_cache_lock` for this, and a
+//! cache that stampedes on a cold start is worth knowing about before it
+//! happens rather than after.
+//!
+//! Expired entries are reclaimed when something reads them or when the budget
+//! forces an eviction, not by a sweeper. So a cache full of things nobody asks
+//! for again holds its bytes until eviction reaches them. That is bounded, and
+//! it is not prompt.
+//!
 //! It is per-process and in memory. Two gateways behind a balancer keep two
-//! caches, and a restart starts empty.
+//! caches, and a restart starts empty. Two routes that each write `cache` get
+//! a store each, so the memory a configuration can use is the sum of every
+//! `max-size` in it.
 
 mod policy;
 mod store;
@@ -175,9 +187,11 @@ impl CacheHandler {
     fn serve(&self, entry: &store::Entry, response: &mut Response) {
         response.status_code(StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK));
         *response.headers_mut() = entry.headers.clone();
-        // How long it has been sitting here, which is what lets anything
-        // downstream work out its remaining life.
-        let age = entry.age().as_secs();
+        // How long it has been sitting here, plus however long it had already
+        // been somewhere else. Age accumulates along a chain of caches; a
+        // gateway that reports only its own resident time tells a browser a
+        // response is fresher than it is, and the error grows with every hop.
+        let age = entry.age().as_secs() + entry.age_on_arrival;
         if let Ok(value) = http::HeaderValue::from_str(&age.to_string()) {
             response.headers_mut().insert(http::header::AGE, value);
         }
@@ -187,6 +201,20 @@ impl CacheHandler {
         );
         response.body(ResBody::Once(entry.body.clone()));
     }
+}
+
+/// How old the response already was when it got here.
+///
+/// A response from an origin that is itself behind a cache arrives with an
+/// `Age`, and RFC 9111 says age accumulates: what a client is told has to be
+/// this plus however long it then sat here.
+fn arrived_with_age(response: &Response) -> u64 {
+    response
+        .headers()
+        .get(http::header::AGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// RFC 9211 `Cache-Status`, so "why did this not cache" has an answer on the
@@ -273,6 +301,7 @@ impl Handler for CacheHandler {
                 body: collected.clone(),
                 stored: std::time::Instant::now(),
                 ttl,
+                age_on_arrival: arrived_with_age(response),
             },
         );
 

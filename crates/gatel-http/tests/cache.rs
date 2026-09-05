@@ -323,3 +323,38 @@ site "*" {{ route "/*" {{ cache
         "the reload must not have emptied the cache"
     );
 }
+
+#[tokio::test]
+async fn age_accumulates_rather_than_restarting_at_this_hop() {
+    // A response from an origin that is itself behind a cache arrives with an
+    // `Age`. Reporting only our own resident time tells a browser the response
+    // is fresher than it is, and the error grows with every hop.
+    let gateway = Gateway::new("cache-age");
+    let port = free_port();
+    let (backend, _) = counting_backend("cache-control: max-age=300\r\nage: 120\r\n").await;
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" {{ route "/*" {{ cache
+        proxy "{backend}" }} }}
+"#
+        ))
+        .await;
+
+    let address = gateway.address();
+    get(address, "/page").await;
+    let hit = get(address, "/page").await;
+
+    let age: u64 = hit
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("age:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("a hit must carry an age:\n{hit}"));
+    assert!(
+        age >= 120,
+        "it was already 120 seconds old when it arrived, so it cannot be {age}"
+    );
+}

@@ -43,6 +43,12 @@ struct Sample {
     idle: usize,
     /// Tasks the runtime believes are alive.
     tasks: usize,
+    /// Resources the cache remembers a `Vary` list for.
+    ///
+    /// Watched separately from the bytes it holds, because the byte budget
+    /// counts bodies and does not bound this. It is exactly the shape of leak
+    /// a soak test is for: bounded-looking, and not bounded.
+    cached_resources: usize,
 }
 
 impl Sample {
@@ -69,6 +75,7 @@ impl Sample {
             sinks: gateway.telemetry.sinks.snapshot().len(),
             idle,
             tasks: tokio::runtime::Handle::current().metrics().num_alive_tasks(),
+            cached_resources: caches(gateway).map(|store| store.remembered_resources()).sum(),
         }
     }
 
@@ -81,6 +88,11 @@ impl Sample {
             ("log sinks", self.sinks, earlier.sinks),
             ("idle connections", self.idle, earlier.idle),
             ("live tasks", self.tasks, earlier.tasks),
+            (
+                "remembered resources",
+                self.cached_resources,
+                earlier.cached_resources,
+            ),
         ];
         for (what, now, before) in checks {
             if now > before + slack {
@@ -89,6 +101,16 @@ impl Sample {
         }
         None
     }
+}
+
+/// Every cache store the committed generation is using.
+fn caches(gateway: &Gateway) -> impl Iterator<Item = std::sync::Arc<gatel_bundle_std::cache::Store>> {
+    gateway
+        .state
+        .keys()
+        .into_iter()
+        .filter(|key| key.kind == gatel_plan::StateKind::Cache)
+        .filter_map(|key| gateway.state.get(&key.owner, key.kind))
 }
 
 /// Resident memory, where the operating system will say. Reported rather than
@@ -136,7 +158,8 @@ upstream "api" {{
 }}
 site "*" {{
     access-log format="clf" output="file:access.log" rotate="1MiB" keep=2
-    route "/api/*" {{ proxy upstream="api" }}
+    route "/api/*" {{ cache default-ttl="2s" max-size="4KiB" max-entry="1KiB"
+        proxy upstream="api" }}
     route "/static/*" {{ file-server root="{root}" }}
     route "/metrics" {{ metrics }}
     route "/" {{ respond "ok" }}
@@ -153,7 +176,8 @@ upstream "api" {{
 }}
 site "*" {{
     access-log format="clf" output="file:access.log" rotate="1MiB" keep=2
-    route "/api/*" {{ proxy upstream="api" }}
+    route "/api/*" {{ cache default-ttl="2s" max-size="4KiB" max-entry="1KiB"
+        proxy upstream="api" }}
     route "/static/*" {{ file-server root="{root}" }}
     route "/metrics" {{ metrics }}
     route "/" {{ respond "ok" }}
@@ -169,7 +193,8 @@ upstream "api" {{
 }}
 site "*" {{
     access-log format="clf" output="file:access.log" rotate="1MiB" keep=2
-    route "/api/*" {{ proxy upstream="api" }}
+    route "/api/*" {{ cache default-ttl="2s" max-size="4KiB" max-entry="1KiB"
+        proxy upstream="api" }}
     route "/static/*" {{ file-server root="{root}" }}
     route "/metrics" {{ metrics }}
     route "/" {{ respond "ok" }}
@@ -181,17 +206,23 @@ site "*" {{
     gateway.apply(&configs[0]).await;
     let address = gateway.address();
 
-    // A few rounds before the first sample. A process that has just started
-    // has not yet opened every connection it will keep, so measuring at zero
-    // would call ordinary warm-up a leak.
-    const WARMUP: usize = 3;
+    // Rounds before the first sample. A process that has just started has not
+    // yet opened every connection it will keep, and — more slowly — a cache
+    // being fed a new path every round is still filling toward its budget.
+    // Measuring before it is full would call the filling a leak; measuring
+    // after is what makes the plateau the assertion.
+    const WARMUP: usize = 80;
     let deadline = Instant::now() + budget();
     let mut round = 0usize;
     let mut baseline: Option<Sample> = None;
     let started_resident = resident_kib();
 
     while Instant::now() < deadline {
-        for path in ["/", "/api/thing", "/static/index.html", "/metrics"] {
+        // A fresh path each round, so the cache is asked to remember
+        // something new every time — which is what makes a leak in what it
+        // remembers show up rather than staying at one entry.
+        let unique = format!("/api/thing-{round}");
+        for path in ["/", unique.as_str(), "/static/index.html", "/metrics"] {
             let answer = get(address, path).await;
             assert!(
                 answer.starts_with("HTTP/1.1 2"),

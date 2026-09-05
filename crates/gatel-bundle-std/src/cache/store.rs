@@ -44,6 +44,9 @@ pub struct Entry {
     pub body: Bytes,
     pub stored: Instant,
     pub ttl: Duration,
+    /// How old it already was when it arrived, from an `Age` the origin sent.
+    /// Age accumulates along a chain of caches.
+    pub age_on_arrival: u64,
 }
 
 impl Entry {
@@ -154,6 +157,11 @@ impl Store {
             });
         if copies.is_empty() {
             held.remove(key);
+            // And forget what it varied on. The byte budget counts bodies, so
+            // it does not bound this map: without the removal, a gateway
+            // serving pages that expire keeps one entry per URL it has ever
+            // seen, for as long as the process runs.
+            self.vary.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
         }
         drop(held);
 
@@ -250,6 +258,14 @@ impl Store {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// How many resources the store remembers a `Vary` list for.
+    ///
+    /// Exposed because it is the one thing here that the byte budget does not
+    /// bound, so it is the one thing that needs watching.
+    pub fn remembered_resources(&self) -> usize {
+        self.vary.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
 }
 
 /// The signature a request has for a given `Vary` list.
@@ -279,6 +295,7 @@ mod tests {
             body: Bytes::from(body.to_string()),
             stored: Instant::now(),
             ttl,
+            age_on_arrival: 0,
         }
     }
 
@@ -440,5 +457,48 @@ mod tests {
         let mut with = http::HeaderMap::new();
         with.insert("accept-encoding", http::HeaderValue::from_static("gzip"));
         assert_ne!(signature(&with, &vary), signature(&http::HeaderMap::new(), &vary));
+    }
+}
+
+#[cfg(test)]
+mod leak_tests {
+    use super::*;
+
+    fn entry(ttl: Duration) -> Entry {
+        Entry {
+            status: 200,
+            headers: http::HeaderMap::new(),
+            body: Bytes::from_static(b"x"),
+            stored: Instant::now(),
+            ttl,
+            age_on_arrival: 0,
+        }
+    }
+
+    #[test]
+    fn nothing_is_remembered_about_a_resource_that_is_gone() {
+        // The `Vary` map is keyed by resource and written on every store. If
+        // it is not cleared when the last copy goes, a gateway serving pages
+        // that expire accumulates one entry per URL it has ever seen, for as
+        // long as the process runs — a leak that no byte budget bounds,
+        // because the budget only counts bodies.
+        let store = Store::new(1024);
+        for index in 0..200 {
+            let key = Key::new(&http::Method::GET, "example.com", &format!("/{index}"));
+            store.put(
+                key.clone(),
+                String::new(),
+                vec!["accept-encoding".to_string()],
+                entry(Duration::ZERO),
+            );
+            // Reading it is what discovers it is stale and drops it.
+            assert!(store.get(&key, "").is_none());
+        }
+        assert!(store.is_empty(), "no bodies are held");
+        assert_eq!(
+            store.remembered_resources(),
+            0,
+            "and nothing is remembered about them either"
+        );
     }
 }
