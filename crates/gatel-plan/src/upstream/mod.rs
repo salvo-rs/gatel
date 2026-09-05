@@ -336,12 +336,18 @@ pub struct Retry {
     pub budget_percent: u32,
 }
 
-impl Retry {
-    pub fn hash_into(&self, hasher: &mut Hasher) {
-        hasher.update_str(match self.mode {
+impl RetryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
             RetryMode::Safe => "safe",
             RetryMode::Replay => "replay",
-        });
+        }
+    }
+}
+
+impl Retry {
+    pub fn hash_into(&self, hasher: &mut Hasher) {
+        hasher.update_str(self.mode.as_str());
         hasher.update_u64(self.attempts as u64);
         hasher.update_duration(self.per_try);
         hasher.update_u64(self.buffer.bytes());

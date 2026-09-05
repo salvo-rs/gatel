@@ -3,6 +3,13 @@
 //! A snapshot is the union of what every configuration source declared at one
 //! point in time. Sources are merged by union only: a name claimed by two
 //! sources is an error, never a silent overwrite.
+//!
+//! Today a running process has exactly one source — the configuration file,
+//! with any `import` already spliced into it — so the merge is exercised by
+//! this module's own tests rather than by the binary. It is kept because the
+//! second source is the reason the type exists: a control plane that could add
+//! sites at runtime has to arrive as another source with its own revision, not
+//! as a mutation of the file somebody else is editing.
 
 use std::collections::BTreeMap;
 

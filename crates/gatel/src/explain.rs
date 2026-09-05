@@ -85,6 +85,18 @@ pub fn explain(plan: &Plan) -> String {
                     upstream.resolve.family.as_str()
                 ));
             }
+            // Worth printing because the answer to "why did my backend see
+            // this twice" is here and nowhere else in the file.
+            match &upstream.retry {
+                Some(retry) => out.push_str(&format!(
+                    "    retry {} up to {} attempts, {:?} each, at most {}% of live traffic\n",
+                    retry.mode.as_str(),
+                    retry.attempts,
+                    retry.per_try,
+                    retry.budget_percent
+                )),
+                None => out.push_str("    no retry\n"),
+            }
         }
     }
 
