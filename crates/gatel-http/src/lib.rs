@@ -14,6 +14,7 @@ pub mod dispatch;
 pub mod measure;
 pub mod prepare;
 pub mod proxy;
+pub mod proxy_protocol;
 pub mod serve;
 pub mod upgrade;
 

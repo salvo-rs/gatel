@@ -1,0 +1,50 @@
+// Behind a layer-4 load balancer: an AWS Network Load Balancer, a HAProxy in
+// TCP mode, a GCP internal load balancer.
+//
+// None of those reads the request, so none of them can add a forwarding
+// header. The connection arrives with the balancer's address on it and the
+// client's address nowhere — unless the balancer sends it first, in a PROXY
+// header, before anything else on the socket.
+//
+// Without this the data is wrong in the three places where being wrong matters
+// most: `ip-filter` matches the balancer, a per-client `rate-limit` counts
+// every client as one client, and the access log names the wrong machine.
+global {
+    // Every connection on this port begins with a PROXY header. It is a
+    // property of the port rather than of a request, because the bytes arrive
+    // before anything that could be called a request — so this port is for the
+    // balancer and nothing else.
+    //
+    // Both versions are read: the text form that HAProxy and stunnel send, and
+    // the binary form an AWS NLB sends.
+    http ":8080" proxy-protocol=#true
+
+    // Required, and refused at compile time without it. Anyone who reaches the
+    // port can claim any address, so the header is read only from a peer named
+    // here; a connection from anywhere else is closed rather than served.
+    //
+    // This is the same rule that decides whether `X-Forwarded-For` is
+    // believed, which is the point: one policy, one place.
+    trusted-proxy "10.0.0.0/8"
+
+    limits connections=20000 idle="60s"
+}
+
+site "*" {
+    // The address in this log is the client's, not the balancer's.
+    access-log format="json"
+
+    route "/admin/*" {
+        // Which means an allow list is about people rather than about
+        // infrastructure.
+        ip-filter allow="203.0.113.0/24"
+        proxy "127.0.0.1:9000"
+    }
+
+    route "/*" {
+        // And a rate limit counts each client separately, rather than counting
+        // the whole internet as one.
+        rate-limit max=600 window="1m" key="ip"
+        proxy "127.0.0.1:9000"
+    }
+}

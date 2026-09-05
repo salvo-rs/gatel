@@ -113,6 +113,7 @@ pub(super) fn check_uniqueness(spec: &Spec, diagnostics: &mut Diagnostics) {
 
 pub(super) fn check_references(spec: &Spec, diagnostics: &mut Diagnostics) {
     check_acme(spec, diagnostics);
+    check_proxy_protocol(spec, diagnostics);
     let listener_names: Vec<&str> = spec
         .listeners
         .iter()
@@ -215,6 +216,32 @@ pub(super) fn sort_routes(spec: &mut Spec) {
     });
     spec.listeners.sort_by(|a, b| a.name.cmp(&b.name));
     spec.upstreams.sort_by(|a, b| a.id.name().cmp(b.id.name()));
+}
+
+/// A listener that reads PROXY headers has to know whose it will read.
+///
+/// The header lets whoever sends it name any client address. That is safe only
+/// when the port is reachable by a balancer and nobody else, which is a fact
+/// the configuration has to state — otherwise every ip-based decision in the
+/// gateway is handed to whoever connects. Found here rather than at the first
+/// connection, because the failure is silent: everything works, and the
+/// addresses are wrong.
+fn check_proxy_protocol(spec: &Spec, diagnostics: &mut Diagnostics) {
+    if spec.global.trusted_proxies.is_empty() {
+        for listener in spec.listeners.iter().filter(|l| l.proxy_protocol) {
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::MissingField,
+                    listener.origin.clone(),
+                    format!(
+                        "listener `{}` reads PROXY headers, but no `trusted-proxy` says whose",
+                        listener.name
+                    ),
+                )
+                .with_help("add `trusted-proxy \"10.0.0.0/8\"` to `global`, naming the balancer's network"),
+            );
+        }
+    }
 }
 
 /// A site that asks for an automatic certificate has to be able to get one.

@@ -46,6 +46,7 @@ attempt.
 |---|---|
 | `connection_closed` | A connection ended with an error worth seeing. |
 | `tls_handshake_failed` | A handshake did not complete. Ordinary on a public port. |
+| `proxy_header_refused` | A connection to a `proxy-protocol` listener was closed: the peer is not a trusted proxy, or its PROXY header could not be read. |
 | `tls_handshake_timeout` | A client opened a connection and never finished the handshake. |
 | `tunnel_closed` | An upgraded connection ended, with why: closed, idle, expired or error. |
 | `upgrade_failed` | An upgrade was agreed and then could not be established. |

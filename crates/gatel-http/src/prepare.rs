@@ -47,6 +47,9 @@ pub struct ListenerRuntime {
     /// Present exactly when this listener terminates TLS. Immutable for the
     /// life of the generation; the certificates it resolves are not.
     pub tls: Option<Arc<ServerConfig>>,
+    /// Every connection here begins with a PROXY header, and only a trusted
+    /// peer may open one.
+    pub proxy_protocol: bool,
     pub service: Arc<Service>,
     /// Transport counters. Shared with every generation that keeps this
     /// listener, so accepting a connection does not restart the count.
@@ -80,6 +83,9 @@ pub struct Runtime {
     pub acme: Option<AcmeIntent>,
     pub limits: Limits,
     pub grace_period: Duration,
+    /// Who may speak for somebody else. Read when a PROXY header arrives, by
+    /// the same rule that decides whether a forwarding header is believed.
+    pub trusted_proxies: Vec<(std::net::IpAddr, u8)>,
 }
 
 impl Runtime {
@@ -214,6 +220,7 @@ pub fn prepare(
                 name: listener_plan.listener.name.clone(),
                 bind: listener_plan.listener.bind,
                 tls,
+                proxy_protocol: listener_plan.listener.proxy_protocol,
                 service: Arc::new(Service::new(root_router(dispatcher))),
                 metrics: listener_metrics,
             }),
@@ -226,6 +233,7 @@ pub fn prepare(
         acme: acme_wanted(plan, resources)?,
         limits: plan.spec.global.limits.clone(),
         grace_period: plan.spec.global.grace_period,
+        trusted_proxies: plan.spec.global.trusted_proxies.clone(),
     }))
 }
 

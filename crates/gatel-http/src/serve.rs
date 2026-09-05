@@ -199,8 +199,8 @@ async fn accept_loop(
 }
 
 async fn serve_connection(
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
+    mut stream: tokio::net::TcpStream,
+    mut peer: SocketAddr,
     local: SocketAddr,
     runtime: Arc<crate::prepare::ListenerRuntime>,
     generation: Arc<Committed<Arc<Runtime>>>,
@@ -212,6 +212,40 @@ async fn serve_connection(
     let metrics = Arc::clone(&runtime.metrics);
     metrics.connections_total.increment();
     metrics.connections_active.increment();
+
+    // Before TLS and before HTTP, because that is where the bytes are.
+    //
+    // Only from a peer the configuration named, and a connection from anywhere
+    // else is closed rather than served: anybody who can reach the port can
+    // claim any address, so reading the header from a stranger would hand
+    // every ip-based decision to whoever asked. The same rule already decides
+    // whether a forwarding header is believed.
+    if runtime.proxy_protocol {
+        if !crate::dispatch::is_trusted(peer.ip(), &generation.runtime.trusted_proxies) {
+            tracing::warn!(
+                target: "gatel::connection",
+                event = "proxy_header_refused",
+                %peer,
+                reason = "the peer is not a trusted-proxy",
+            );
+            return;
+        }
+        match crate::proxy_protocol::read(&mut stream, limits.handshake_timeout).await {
+            Ok(crate::proxy_protocol::Claim::Client(client)) => peer = client,
+            // The balancer's own connection, such as a health check. Its
+            // address is the right one to attribute this to.
+            Ok(crate::proxy_protocol::Claim::Local) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "gatel::connection",
+                    event = "proxy_header_refused",
+                    %peer,
+                    reason = %error,
+                );
+                return;
+            }
+        }
+    }
     // A guard rather than a decrement at the end: this function returns from
     // four places, and one of them being forgotten would make the gauge climb
     // forever.

@@ -195,12 +195,23 @@ impl Context<'_> {
         owner: &SourceId,
         protocol: ListenerProtocol,
     ) -> Option<Listener> {
+        let mut proxy_protocol = false;
         for property in &node.props {
-            self.error(
-                Code::UnknownProperty,
-                &property.origin,
-                format!("`{}` has no property `{}`", node.name, property.name),
-            );
+            match property.name.as_str() {
+                "proxy-protocol" => match property.value.as_bool() {
+                    Some(enabled) => proxy_protocol = enabled,
+                    None => self.error(
+                        Code::InvalidValue,
+                        &property.origin,
+                        "`proxy-protocol` is `#true` or `#false`",
+                    ),
+                },
+                other => self.error(
+                    Code::UnknownProperty,
+                    &property.origin,
+                    format!("`{}` has no property `{other}`", node.name),
+                ),
+            }
         }
         let (name, address_value) = match node.args.len() {
             1 => (protocol.as_str().to_string(), &node.args[0]),
@@ -258,6 +269,7 @@ impl Context<'_> {
             name,
             bind,
             protocol,
+            proxy_protocol,
             origin: node.origin.clone(),
         })
     }

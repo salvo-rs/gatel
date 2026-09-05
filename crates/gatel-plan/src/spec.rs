@@ -42,6 +42,12 @@ pub struct Listener {
     pub name: String,
     pub bind: SocketAddr,
     pub protocol: ListenerProtocol,
+    /// Every connection on this address begins with a PROXY header.
+    ///
+    /// For a port that only a layer-4 balancer reaches. It is a property of
+    /// the port rather than of a request, because the bytes arrive before
+    /// anything that could be called a request.
+    pub proxy_protocol: bool,
     pub origin: Origin,
 }
 
@@ -51,6 +57,7 @@ impl Listener {
         hasher.update_str(&self.name);
         hasher.update_str(&self.bind.to_string());
         hasher.update_str(self.protocol.as_str());
+        hasher.update_bool(self.proxy_protocol);
     }
 }
 
@@ -467,6 +474,7 @@ mod tests {
             } else {
                 ListenerProtocol::Http
             },
+            proxy_protocol: false,
             origin: Origin::synthetic("test"),
         }
     }

@@ -50,6 +50,7 @@ carries; it is the same list, generated rather than written down.
 | Routes ordered by specificity; an ambiguous pair is a compile error | yes | done | `gatel-plan/tests/normalize.rs` |
 | A site's own directives cover requests that matched no route | yes | done | `gatel-http/tests/observe.rs` |
 | Request head, body, handshake, idle and connection limits, all applied | yes | done | `gatel-http/tests/limits.rs` |
+| PROXY protocol v1 and v2, so a layer-4 balancer can say who the client is | yes | done | `gatel-http/src/proxy_protocol.rs`, `tests/proxy_protocol.rs`; read only from a `trusted-proxy`, and refused at compile time without one |
 | HTTP/3 | no | not started | — |
 | Layer-4 TCP proxying | no | not started | — |
 

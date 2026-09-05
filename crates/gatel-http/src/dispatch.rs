@@ -172,11 +172,7 @@ impl Dispatcher {
     /// address and defeat every ip-based decision.
     pub fn client_ip(&self, request: &Request) -> Option<IpAddr> {
         let peer = peer_ip(request)?;
-        if !self
-            .trusted_proxies
-            .iter()
-            .any(|(network, prefix)| in_network(peer, *network, *prefix))
-        {
+        if !is_trusted(peer, &self.trusted_proxies) {
             return Some(peer);
         }
         request
@@ -187,6 +183,16 @@ impl Dispatcher {
             .and_then(|value| value.trim().parse::<IpAddr>().ok())
             .or(Some(peer))
     }
+}
+
+/// Whether an address is one the configuration lets speak for somebody else.
+///
+/// Shared with the accept loop, which asks the same question about a PROXY
+/// header before there is a request to ask it about.
+pub fn is_trusted(address: IpAddr, trusted: &[(IpAddr, u8)]) -> bool {
+    trusted
+        .iter()
+        .any(|(network, prefix)| in_network(address, *network, *prefix))
 }
 
 fn peer_ip(request: &Request) -> Option<IpAddr> {

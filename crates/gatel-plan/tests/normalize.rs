@@ -1055,3 +1055,73 @@ site "*" { }
     );
     assert!(diagnostics.iter().any(|d| d.message.contains("has no routes")));
 }
+
+#[test]
+fn reading_proxy_headers_requires_saying_whose() {
+    // The header lets whoever sends it name any client address, so a listener
+    // that reads one without a trusted-proxy hands every ip-based decision to
+    // whoever connects. The failure is silent otherwise: everything works, and
+    // the addresses are wrong.
+    let diagnostics = errors(
+        r#"
+global { http ":8080" proxy-protocol=#true }
+site "*" { route "/" { respond "hi" } }
+"#,
+    );
+    let only = diagnostics.iter().next().unwrap();
+    assert!(
+        only.message.contains("no `trusted-proxy` says whose"),
+        "{}",
+        only.message
+    );
+    assert!(
+        only.help
+            .as_deref()
+            .is_some_and(|help| help.contains("trusted-proxy")),
+        "{:?}",
+        only.help
+    );
+}
+
+#[test]
+fn a_listener_can_be_told_to_read_proxy_headers() {
+    let spec = spec(
+        r#"
+global {
+    http ":8080" proxy-protocol=#true
+    trusted-proxy "10.0.0.0/8"
+}
+site "*" { route "/" { respond "hi" } }
+"#,
+    );
+    assert!(spec.listeners[0].proxy_protocol);
+}
+
+#[test]
+fn proxy_protocol_is_off_unless_asked_for() {
+    let spec = spec(
+        r#"
+global { http ":8080" }
+site "*" { route "/" { respond "hi" } }
+"#,
+    );
+    assert!(!spec.listeners[0].proxy_protocol);
+}
+
+#[test]
+fn a_listener_property_that_is_not_a_property_is_still_refused() {
+    // Adding one property must not turn the listener into a node that accepts
+    // anything.
+    let diagnostics = errors(
+        r#"
+global { http ":8080" nonsense=#true }
+site "*" { route "/" { respond "hi" } }
+"#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("has no property `nonsense`")),
+        "{diagnostics}"
+    );
+}

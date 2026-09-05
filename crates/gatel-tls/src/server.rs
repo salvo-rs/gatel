@@ -236,6 +236,7 @@ mod tests {
                 name: "https".into(),
                 bind: "127.0.0.1:443".parse().unwrap(),
                 protocol,
+                proxy_protocol: false,
                 origin: Origin::synthetic("test"),
             },
             sites,

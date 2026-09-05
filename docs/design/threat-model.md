@@ -52,6 +52,7 @@ matters more often than the first two.
 | Connection exhaustion | `connections` is a permit taken before `accept`, so excess stays in the backlog | `gatel-http/tests/limits.rs` |
 | A forgotten WebSocket holding a slot for ever | Idle and total-lifetime watchdogs on every tunnel | `gatel-http/src/upgrade.rs` |
 | Spoofing a client address to defeat an IP rule | A forwarding header is believed only from a configured `trusted-proxy`; the canonical address is decided once, where that policy lives | `gatel-http/tests/proxy.rs` |
+| Spoofing a client address through a PROXY header | Read only on a listener told to expect one, only from a `trusted-proxy`, and a connection from anywhere else is closed. A listener with no `trusted-proxy` does not compile | `gatel-http/tests/proxy_protocol.rs`, `gatel-plan/tests/normalize.rs` |
 | Request smuggling via hop-by-hop headers | The outbound request is rebuilt rather than edited, so nothing survives that was not deliberately copied | `gatel-http/src/proxy.rs` |
 | A rewrite slipping past a guard | `rewrite` is in the request phase, after every guard, and position in the file cannot move it | `gatel-bundle-std/src/rewrite.rs` |
 | A metrics or health endpoint exposed by accident | They are ordinary routes on a listener the operator chose, subject to the guards written on them. There is no admin port | `gatel-http/tests/observe.rs` |
@@ -100,9 +101,7 @@ marketing.
   through rather than inspected — which also means a decompression bomb is the
   backend's problem rather than the gateway's. That is a deliberate position,
   but it is a position rather than a defence.
-- **PROXY protocol is not implemented**, so a deployment behind a load balancer
-  that speaks it cannot get the real client address that way, and would have to
-  use a forwarding header and `trusted-proxy`.
+
 
 ## Failure injection worth having
 
