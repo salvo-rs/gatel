@@ -1,0 +1,62 @@
+// A gateway that keeps what the origin said it may keep.
+//
+// The rule this configuration is built around: a cache is only ever as safe as
+// the responses it is given. Everything below is about making sure the origin
+// says what it means, and that anything it did not say for is not kept.
+global {
+    http ":8080"
+}
+
+site "*" {
+    access-log format="json"
+
+    // Anything logged in is per-person, so it is never cached. The route is
+    // more specific than the catch-all below and therefore wins wherever it
+    // is written.
+    //
+    // The cache would refuse most of this on its own — a `Set-Cookie`, a
+    // `private`, or an `Authorization` with no `public` are each enough — but
+    // relying on the origin to get every header right on every endpoint is a
+    // bet, and not making the bet costs one route.
+    route "/account/*" {
+        proxy "127.0.0.1:9000"
+    }
+
+    // The API is cached only where it says so. `cache` with no `default-ttl`
+    // stores nothing that did not state a lifetime, which is what nginx does
+    // without `proxy_cache_valid`: inventing one for a response that declined
+    // to state it is how a cache serves stale pages nobody asked it to.
+    //
+    // So an endpoint opts in by answering with, say,
+    //   Cache-Control: public, s-maxage=60
+    // and `s-maxage` is the one to use, because it says something to a shared
+    // cache without saying it to every browser.
+    route "/api/*" {
+        cache max-size="256MiB" max-entry="4MiB"
+        proxy "127.0.0.1:9000"
+    }
+
+    // Rendered pages, where the application does not set cache headers and is
+    // not going to be changed. `default-ttl` is the deliberate decision to
+    // keep them anyway, for a short enough time that a stale page is a
+    // nuisance rather than a bug.
+    //
+    // `encode` is a response-phase directive, so it runs *inside* the cache:
+    // what is stored is the compressed bytes, and `Vary: accept-encoding`
+    // keeps a compressed copy from reaching a client that cannot read one.
+    route "/*" {
+        cache max-size="512MiB" default-ttl="30s"
+        encode
+        proxy "127.0.0.1:9000"
+    }
+}
+
+// Every response says why it was or was not cached, in the RFC 9211 header:
+//
+//   Cache-Status: gatel; hit; ttl=42
+//   Cache-Status: gatel; fwd=miss; stored
+//   Cache-Status: gatel; fwd=miss; detail=set-cookie
+//
+// The third form is the useful one. "Why is this not caching" is the question
+// every cache leaves people asking, and it is answered on the response rather
+// than only in a log nobody is reading at the time.

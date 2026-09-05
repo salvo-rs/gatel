@@ -11,6 +11,7 @@
 pub mod access_log;
 pub mod basic_auth;
 pub mod body_limit;
+pub mod cache;
 pub mod cors;
 pub mod encode;
 pub mod error_pages;
@@ -52,6 +53,7 @@ pub fn bundle() -> Bundle {
         .with(request_id::RequestId)
         .with(ip_filter::IpFilter)
         .with(rate_limit::RateLimit)
+        .with(cache::Cache)
         .with(file_server::FileServerDirective)
         .with(encode::Encode)
         .with(rewrite::Rewrite)
@@ -82,6 +84,7 @@ mod tests {
                 "access-log",
                 "basic-auth",
                 "body-limit",
+                "cache",
                 "cors",
                 "encode",
                 "error-pages",

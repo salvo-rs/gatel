@@ -31,6 +31,8 @@ pub enum StateKind {
     Selector,
     /// Token buckets.
     RateLimit,
+    /// Stored responses.
+    Cache,
     /// Breaker counters and trip state.
     CircuitBreaker,
     /// Loaded and issued certificates.
@@ -45,6 +47,7 @@ impl StateKind {
             StateKind::Pool => "pool",
             StateKind::Selector => "selector",
             StateKind::RateLimit => "rate-limit",
+            StateKind::Cache => "cache",
             StateKind::CircuitBreaker => "circuit-breaker",
             StateKind::Certificate => "certificate",
         }

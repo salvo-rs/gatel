@@ -115,7 +115,7 @@ carries; it is the same list, generated rather than written down.
 | `error-pages` | yes | done | `tests/guards.rs` |
 | `metrics`, `health` | yes | done | `gatel-http/tests/observe.rs` |
 | `forward-auth` | no (2.1) | not started | needs controlled outbound requests, which belongs with the proxy |
-| `cache` | no (2.1) | not started | — |
+| `cache` — in memory, bounded, honouring the response and `Vary` | yes | done | `gatel-bundle-std/src/cache/`, `gatel-http/tests/cache.rs`; no revalidation yet, so a stale entry is a full re-fetch, as in nginx without `proxy_cache_revalidate` |
 | Argon2, scrypt and PBKDF2 for `basic-auth` | no | not started | bcrypt covers what people have |
 | The CGI family | no | not started | deliberately after 2.0 |
 

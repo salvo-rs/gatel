@@ -55,6 +55,8 @@ matters more often than the first two.
 | Spoofing a client address through a PROXY header | Read only on a listener told to expect one, only from a `trusted-proxy`, and a connection from anywhere else is closed. A listener with no `trusted-proxy` does not compile | `gatel-http/tests/proxy_protocol.rs`, `gatel-plan/tests/normalize.rs` |
 | Request smuggling via hop-by-hop headers | The outbound request is rebuilt rather than edited, so nothing survives that was not deliberately copied | `gatel-http/src/proxy.rs` |
 | A rewrite slipping past a guard | `rewrite` is in the request phase, after every guard, and position in the file cannot move it | `gatel-bundle-std/src/rewrite.rs` |
+| A cached response reaching somebody a guard would have refused | `cache` is a request-phase directive, so every guard runs on a hit exactly as on a miss | `gatel-http/tests/cache.rs` |
+| One person's response served to another | A response that sets a cookie, says `private`, or answers an `Authorization` without saying `public` is never stored; `Vary` is part of the key, and `Vary: *` is not stored at all | `gatel-bundle-std/src/cache/policy.rs` |
 | A metrics or health endpoint exposed by accident | They are ordinary routes on a listener the operator chose, subject to the guards written on them. There is no admin port | `gatel-http/tests/observe.rs` |
 | High-cardinality labels exhausting memory | A metric series can only be created from a name in the plan; the request path holds a resolved handle with no way back to the registry | `gatel-http/tests/observe.rs` |
 | A crafted path reading the challenge store | The token alphabet is checked before any lookup | `gatel-http/tests/acme.rs` |
