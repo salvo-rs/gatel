@@ -287,7 +287,6 @@ pub struct Global {
     pub limits: Limits,
     /// Peers whose forwarding headers are believed.
     pub trusted_proxies: Vec<(IpAddr, u8)>,
-    pub admin: Option<Admin>,
     /// Present exactly when the configuration asked for automatic
     /// certificates. A site that says `tls acme` without it is an error.
     pub acme: Option<Acme>,
@@ -300,7 +299,6 @@ impl Default for Global {
             grace_period: Duration::from_secs(30),
             limits: Limits::default(),
             trusted_proxies: Vec::new(),
-            admin: None,
             acme: None,
             log: Log::default(),
         }
@@ -320,12 +318,6 @@ impl Global {
             hasher.update_str(&network.to_string());
             hasher.update_u64(*prefix as u64);
         });
-        match &self.admin {
-            Some(admin) => admin.hash_into(hasher),
-            None => {
-                hasher.update_none();
-            }
-        }
         match &self.acme {
             Some(acme) => acme.hash_into(hasher),
             None => {
@@ -367,40 +359,6 @@ impl Acme {
         hasher.update_bool(self.agreed);
         hasher.update_opt_str(self.directory_path.as_deref());
         hasher.update_duration(self.renew_before);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Admin {
-    /// A unix socket path or a loopback socket address.
-    pub bind: AdminBind,
-    pub token: Option<SecretRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdminBind {
-    Unix(String),
-    Tcp(SocketAddr),
-}
-
-impl Admin {
-    pub fn hash_into(&self, hasher: &mut Hasher) {
-        match &self.bind {
-            AdminBind::Unix(path) => {
-                hasher.update_str("unix");
-                hasher.update_str(path);
-            }
-            AdminBind::Tcp(address) => {
-                hasher.update_str("tcp");
-                hasher.update_str(&address.to_string());
-            }
-        }
-        match &self.token {
-            Some(token) => token.hash_into(hasher),
-            None => {
-                hasher.update_none();
-            }
-        }
     }
 }
 

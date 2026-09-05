@@ -36,8 +36,8 @@ pub use plan::{
     diff_bindings,
 };
 pub use spec::{
-    Acme, Admin, AdminBind, CertificateSource, ClientAuth, Global, Limits, Listener, ListenerProtocol, Log,
-    Route, Site, SiteTls, Spec, Terminal,
+    Acme, CertificateSource, ClientAuth, Global, Limits, Listener, ListenerProtocol, Log, Route, Site,
+    SiteTls, Spec, Terminal,
 };
 pub use subrequest::{
     Answer, Ask, HeaderMap, Method, NoUpstreams, SharedUpstreams, StatusCode, Upstreams, async_trait,

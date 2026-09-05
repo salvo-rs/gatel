@@ -16,7 +16,7 @@ use gatel_model::{
 
 use super::Context;
 use crate::matcher::parse_cidr;
-use crate::spec::{Acme, Admin, AdminBind, Global, Limits, Listener, ListenerProtocol, Log};
+use crate::spec::{Acme, Global, Limits, Listener, ListenerProtocol, Log};
 use crate::upstream::{Upstream, decode_upstream_body};
 
 #[derive(Debug, FromNode)]
@@ -136,11 +136,7 @@ impl Context<'_> {
                         };
                     }
                 }
-                "admin" => {
-                    if let Some(admin) = self.admin(child) {
-                        global.admin = Some(admin);
-                    }
-                }
+                "admin" => self.admin(child),
                 "acme" => {
                     if let Some(acme) = self.acme(child) {
                         global.acme = Some(acme);
@@ -274,7 +270,29 @@ impl Context<'_> {
         })
     }
 
-    pub(super) fn admin(&mut self, node: &Node) -> Option<Admin> {
+    /// Check an `admin` block, and then refuse it.
+    ///
+    /// Nothing in this binary serves an admin API. Accepting the block anyway
+    /// would leave an operator believing they had opened a control socket that
+    /// does not exist, which is the one outcome worse than saying no — so the
+    /// block is still validated, so its address and token are diagnosed if they
+    /// are also wrong, and then refused for what it actually is.
+    pub(super) fn admin(&mut self, node: &Node) {
+        self.check_admin(node);
+        self.diagnostics.push(
+            Diagnostic::error(
+                Code::UnknownNode,
+                node.origin.clone(),
+                "this build has no admin API",
+            )
+            .with_help(
+                "reload by editing the configuration file or sending SIGHUP; \
+                 expose status with the `metrics` and `health` directives",
+            ),
+        );
+    }
+
+    fn check_admin(&mut self, node: &Node) -> Option<()> {
         let Some(text) = node.args.first().and_then(|value| value.as_str()) else {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -286,8 +304,8 @@ impl Context<'_> {
             );
             return None;
         };
-        let bind = match text.strip_prefix("unix:") {
-            Some(path) => AdminBind::Unix(path.to_string()),
+        match text.strip_prefix("unix:") {
+            Some(_) => {}
             None => match gatel_model::parse_socket_addr(text) {
                 Ok(address) => {
                     if !address.ip().is_loopback() {
@@ -303,26 +321,21 @@ impl Context<'_> {
                         );
                         return None;
                     }
-                    AdminBind::Tcp(address)
                 }
                 Err(message) => {
                     self.error(Code::InvalidValue, &node.args[0].origin, message);
                     return None;
                 }
             },
-        };
-        let token = node.prop("token").and_then(|property| {
-            let text = property.value.as_str()?;
-            match SecretRef::parse(text) {
-                Ok(reference) => Some(reference),
-                Err(message) => {
-                    self.diagnostics
-                        .error(Code::InvalidSecret, property.origin.clone(), message);
-                    None
-                }
-            }
-        });
-        Some(Admin { bind, token })
+        }
+        if let Some(property) = node.prop("token")
+            && let Some(text) = property.value.as_str()
+            && let Err(message) = SecretRef::parse(text)
+        {
+            self.diagnostics
+                .error(Code::InvalidSecret, property.origin.clone(), message);
+        }
+        Some(())
     }
 
     pub(super) fn single_duration(&mut self, node: &Node) -> Option<Duration> {

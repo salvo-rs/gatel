@@ -24,7 +24,7 @@ carries; it is the same list, generated rather than written down.
 | Provenance and clean-room rules written down | yes | done | `docs/design/provenance.md` |
 | Threat model, with which defences are tested and which are not | yes | done | `docs/design/threat-model.md` |
 | `validate`, `explain`, `diff`, `capabilities`, `trust` | yes | done | exit codes covered by `crates/gatel/src/main.rs`; every example compiles in `gatel-http/tests/examples.rs` |
-| Admin API as a second source under `runtime/` | no (2.1) | not started | — |
+| Admin API as a second source under `runtime/` | no (2.1) | not started | the `admin` block is refused at compile time rather than accepted and ignored: `gatel-plan/tests/normalize.rs` |
 | Kubernetes source | no | not started | — |
 
 ## Reload

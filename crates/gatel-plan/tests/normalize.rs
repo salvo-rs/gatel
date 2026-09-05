@@ -536,6 +536,30 @@ site "*" { route "/" { respond "hi" } }
 }
 
 #[test]
+fn an_admin_block_is_refused_rather_than_accepted_and_ignored() {
+    // It used to compile: the block was decoded, checked and stored, and no
+    // part of the process ever opened the socket it named. An operator would
+    // have had a control plane that did not exist and no way to find out.
+    let diagnostics = errors(
+        r#"
+global {
+    http ":8080"
+    admin "unix:/run/gatel/admin.sock"
+}
+site "*" { route "/" { respond "hi" } }
+"#,
+    );
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.message.contains("admin API"))
+        .expect("the block should be refused");
+    assert!(
+        diagnostic.help.as_deref().unwrap().contains("SIGHUP"),
+        "{diagnostic:?}"
+    );
+}
+
+#[test]
 fn cosmetic_edits_do_not_change_the_spec_fingerprint() {
     let plain = spec(MINIMAL).fingerprint();
     let commented = spec(
