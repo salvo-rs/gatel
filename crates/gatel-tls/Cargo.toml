@@ -16,7 +16,6 @@ async-trait.workspace = true
 certon.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

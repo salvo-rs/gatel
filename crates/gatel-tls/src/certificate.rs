@@ -8,8 +8,28 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::crypto::ring::sign::any_supported_type;
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
+
+/// Read a PEM chain, in the order it was written.
+///
+/// `what` names the thing in every message this can produce, because "cannot
+/// read the certificate" is not a useful sentence when a configuration has a
+/// server certificate, a client identity and two authorities in it.
+///
+/// PEM parsing comes from `rustls-pki-types`, which is where rustls itself
+/// keeps it. The separate `rustls-pemfile` crate was a thin wrapper over the
+/// same code and is now unmaintained.
+pub(crate) fn read_chain(bytes: &[u8], what: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let certificates: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(bytes)
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("cannot read the {what}: {error}"))?;
+    if certificates.is_empty() {
+        return Err(format!("the {what} file contains no certificate"));
+    }
+    Ok(certificates)
+}
 
 /// A certificate chain with its private key, ready for rustls.
 #[derive(Debug, Clone)]
@@ -31,17 +51,12 @@ impl Certificate {
     }
 
     pub fn from_pem(chain: &[u8], key: &[u8], source: &str) -> Result<Self, String> {
-        let certificates: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut std::io::Cursor::new(chain))
-                .collect::<Result<_, _>>()
-                .map_err(|error| format!("cannot read the certificate chain: {error}"))?;
-        if certificates.is_empty() {
-            return Err("the certificate file contains no certificate".to_string());
-        }
+        let certificates = read_chain(chain, "certificate chain")?;
 
-        let private_key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut std::io::Cursor::new(key))
-            .map_err(|error| format!("cannot read the private key: {error}"))?
-            .ok_or_else(|| "the key file contains no private key".to_string())?;
+        let private_key = PrivateKeyDer::from_pem_slice(key).map_err(|error| match error {
+            pem::Error::NoItemsFound => "the key file contains no private key".to_string(),
+            error => format!("cannot read the private key: {error}"),
+        })?;
 
         // Building the signing key is also what proves the key belongs to the
         // certificate, and it happens here — during prepare — rather than on

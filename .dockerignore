@@ -1,10 +1,11 @@
+# Everything a build does not read. Keeping `target/` out matters most: it is
+# larger than the rest of the repository put together, and sending it would be
+# sending a host's build products into a container build that cannot use them.
 target/
 .git/
 .github/
-.claude/
+docs/
 *.md
 !README.md
-LICENSE
-docs/
-.tmp*
-_*.md
+.gitignore
+.dockerignore

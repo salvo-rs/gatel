@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use gatel_model::SecretRef;
 use gatel_plan::{UpstreamProtocol, UpstreamTls};
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -120,12 +121,7 @@ fn describe(spec: &UpstreamTls) -> String {
 fn private_roots(ca: &SecretRef, root: &Path) -> Result<RootCertStore, String> {
     let path = ca.resolve_path(root)?;
     let bytes = std::fs::read(&path).map_err(|error| format!("cannot read the upstream CA: {error}"))?;
-    let certificates: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::Cursor::new(bytes))
-        .collect::<Result<_, _>>()
-        .map_err(|error| format!("cannot read the upstream CA: {error}"))?;
-    if certificates.is_empty() {
-        return Err("the upstream CA file contains no certificate".to_string());
-    }
+    let certificates = crate::certificate::read_chain(&bytes, "upstream CA")?;
     let mut roots = RootCertStore::empty();
     for certificate in certificates {
         roots
@@ -145,15 +141,11 @@ fn identity(
     let key_bytes = std::fs::read(key.resolve_path(root)?)
         .map_err(|error| format!("cannot read the client key: {error}"))?;
 
-    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
-        .collect::<Result<_, _>>()
-        .map_err(|error| format!("cannot read the client certificate: {error}"))?;
-    if chain.is_empty() {
-        return Err("the client certificate file contains no certificate".to_string());
-    }
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_bytes))
-        .map_err(|error| format!("cannot read the client key: {error}"))?
-        .ok_or_else(|| "the client key file contains no private key".to_string())?;
+    let chain = crate::certificate::read_chain(&cert_bytes, "client certificate")?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|error| match error {
+        pem::Error::NoItemsFound => "the client key file contains no private key".to_string(),
+        error => format!("cannot read the client key: {error}"),
+    })?;
     Ok((chain, key))
 }
 

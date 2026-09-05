@@ -43,3 +43,84 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+
+  # What the tree contains, rather than how it is arranged: an advisory nobody
+  # noticed, a licence nobody may ship, or a second copy of a crate that was
+  # supposed to appear once.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # A release workflow nobody runs until a tag is a release workflow that is
+  # discovered broken at the worst moment. This runs everything the tag would,
+  # short of publishing: the same build, the same packaging, the same smoke
+  # test on the binary that comes out.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --locked -p gatel
+
+      - name: Package the way a release does
+        run: |
+          set -euo pipefail
+          staging="gatel-ci-x86_64-unknown-linux-gnu"
+          mkdir -p "$staging"
+          cp target/release/gatel "$staging/"
+          cp LICENSE README.md "$staging/"
+          cp -r examples "$staging/examples"
+          tar czf "$staging.tar.gz" "$staging"
+          sha256sum "$staging.tar.gz" | tee SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Smoke test the binary that was packaged
+        run: |
+          set -euo pipefail
+          ./target/release/gatel --version
+          ./target/release/gatel capabilities | grep -q "file-server"
+          ./target/release/gatel validate examples/minimal.kdl
+          # `dry-run` compiles and binds, then exits. It is the check a
+          # deployment runs before it swaps a process, so it is the check CI
+          # should run before a release claims to work.
+          ./target/release/gatel run examples/minimal.kdl --dry-run
+
+      # The container image is part of the deliverable, so a Dockerfile that
+      # does not build is a broken release. Built, not pushed.
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: gatel:ci
+
+      - name: The image serves
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/conf
+          cat > /tmp/conf/gatel.kdl <<'KDL'
+          global { http ":8080" }
+          site "*" { route "/" { respond "ok" } }
+          KDL
+          docker run -d --name gatel-ci -p 18080:8080 \
+            -v /tmp/conf:/etc/gatel:ro gatel:ci
+          for _ in $(seq 30); do
+            if curl -fsS http://127.0.0.1:18080/ | grep -q ok; then
+              docker rm -f gatel-ci
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the image never answered"
+          docker logs gatel-ci
+          docker rm -f gatel-ci
+          exit 1

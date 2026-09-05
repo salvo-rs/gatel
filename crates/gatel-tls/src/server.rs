@@ -10,7 +10,6 @@ use std::sync::Arc;
 use gatel_model::{ResourceId, SecretRef};
 use gatel_plan::{CertificateSource, HostMatch, ListenerPlan, SiteTls};
 use rustls::ServerConfig;
-use rustls::pki_types::CertificateDer;
 use rustls::server::WebPkiClientVerifier;
 
 use crate::certificate::Certificate;
@@ -199,12 +198,7 @@ fn load_certificate(
 fn load_roots(ca: &SecretRef, root: &Path) -> Result<rustls::RootCertStore, String> {
     let path = ca.resolve_path(root)?;
     let bytes = std::fs::read(&path).map_err(|error| format!("cannot read the client CA: {error}"))?;
-    let certificates: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::Cursor::new(bytes))
-        .collect::<Result<_, _>>()
-        .map_err(|error| format!("cannot read the client CA: {error}"))?;
-    if certificates.is_empty() {
-        return Err("the client CA file contains no certificate".to_string());
-    }
+    let certificates = crate::certificate::read_chain(&bytes, "client CA")?;
     let mut roots = rustls::RootCertStore::empty();
     for certificate in certificates {
         roots

@@ -58,7 +58,6 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
     "tls12",
 ] }
-rustls-pemfile = "2"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 webpki-roots = "1"
 salvo_core = { version = "0.96", default-features = false }

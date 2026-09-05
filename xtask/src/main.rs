@@ -113,7 +113,6 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "gatel-observe",
             "rcgen",
             "rustls",
-            "rustls-pemfile",
             "time",
             "tokio",
             "tokio-rustls",

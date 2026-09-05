@@ -1,0 +1,86 @@
+# What may be in the dependency tree.
+#
+# `cargo run -p xtask` already says which crate may depend on which — that is
+# an architectural rule. This says what the tree as a whole may contain, which
+# is a different question with different consequences: a licence nobody may
+# ship, an advisory nobody noticed, or two versions of the same crate compiled
+# into one binary.
+#
+# Run it with `cargo deny check`, or let CI do it.
+
+[graph]
+all-features = true
+
+[advisories]
+# An advisory against something we depend on fails the build. There is no
+# "warn" setting that anyone reads.
+yanked = "deny"
+
+# An entry here is a decision, and a decision has to say what it is waiting
+# for. An ignore with no reason is how a tree ends up carrying an advisory
+# nobody remembers accepting.
+ignore = [
+    # RUSTSEC-2023-0071 - a timing side channel in `rsa`'s private-key
+    # operations (the Marvin attack). It arrives through `certon`, which is
+    # the ACME client, and no fixed version exists.
+    #
+    # Accepted because nothing here performs an RSA private-key operation: the
+    # ACME account key and every certificate key this project generates are
+    # ECDSA, produced by `rcgen`. The crate is in the tree for RSA key support
+    # that is never reached.
+    #
+    # Revisit when `rsa` publishes a fix, or if a configuration is ever able
+    # to hand a certificate an RSA private key - at which point this stops
+    # being unreachable and the answer changes.
+    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operation is reachable; no fix exists" },
+]
+
+# The tool spells this key the American way; the prose here does not.
+[licenses]
+# Anything not listed fails, rather than being allowed by default and hoped
+# about.
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    # The Mozilla root store, as data rather than as code: `webpki-roots`. A
+    # permissive data licence, and the reason a container with no trust store
+    # reaches the same verdict as a workstation.
+    "CDLA-Permissive-2.0",
+]
+
+[[licenses.exceptions]]
+# `ring` carries an OpenSSL-derived notice alongside its ISC licence. It is the
+# cryptography provider this project uses on purpose, and the terms are
+# compatible; naming it here is the honest way to accept it.
+name = "ring"
+allow = ["ISC", "MIT", "OpenSSL"]
+
+[bans]
+# Two versions of one crate in a binary is usually somebody's transitive
+# dependency drifting, and it is worth seeing rather than absorbing.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # Ring is the only provider. aws-lc-rs pulls in a C toolchain and a second
+    # implementation of the same primitives, and one of the two would be the
+    # one nobody tests.
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    # `openssl` would make the build depend on what is installed on the host,
+    # which is the thing rustls was chosen to avoid.
+    { name = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
