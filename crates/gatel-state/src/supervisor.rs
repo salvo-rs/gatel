@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use crate::census::{self, Census};
 use crate::endpoint::{EndpointSet, probe_delay};
 use crate::probe::probe;
+use crate::resolve;
 use crate::upstream::{UpstreamRuntime, UpstreamRuntimes};
 
 struct Worker {
@@ -31,6 +32,11 @@ struct Worker {
 /// Owns every background task, and keeps them in step with the current plan.
 pub struct Supervisor {
     workers: tokio::sync::Mutex<BTreeMap<ResourceId, Worker>>,
+    /// Kept apart from the probe workers because the two are wanted
+    /// independently: an upstream may be probed and not resolved, resolved and
+    /// not probed, or both - and a reload that changes one must not restart
+    /// the other.
+    resolvers: tokio::sync::Mutex<BTreeMap<ResourceId, Worker>>,
     /// Sampling what probing does not report. One task for the whole process.
     census: Census,
     telemetry: Arc<Telemetry>,
@@ -46,6 +52,7 @@ impl Supervisor {
     pub fn new(telemetry: Arc<Telemetry>) -> Self {
         Self {
             workers: tokio::sync::Mutex::new(BTreeMap::new()),
+            resolvers: tokio::sync::Mutex::new(BTreeMap::new()),
             census: Census::new(),
             telemetry,
         }
@@ -56,6 +63,7 @@ impl Supervisor {
     /// Called after a commit, never before.
     pub async fn reconcile(&self, runtimes: &Arc<UpstreamRuntimes>) {
         self.census.follow(runtimes, &self.telemetry).await;
+        self.reconcile_resolvers(runtimes).await;
         let mut workers = self.workers.lock().await;
 
         let wanted: Vec<(&ResourceId, Fingerprint, &Arc<UpstreamRuntime>)> = runtimes
@@ -114,18 +122,84 @@ impl Supervisor {
         }
     }
 
+    /// Start, keep or stop the workers that look names up.
+    ///
+    /// Wanted for any upstream with a named backend, whether or not it is also
+    /// probed: a name still has to be followed when nobody asked for health
+    /// checks.
+    async fn reconcile_resolvers(&self, runtimes: &Arc<UpstreamRuntimes>) {
+        let mut resolvers = self.resolvers.lock().await;
+
+        let wanted: Vec<(&ResourceId, Fingerprint, &Arc<UpstreamRuntime>)> = runtimes
+            .iter()
+            .filter(|runtime| runtime.spec.has_names())
+            .map(|runtime| (&runtime.spec.id, resolve::worker_identity(runtime), runtime))
+            .collect();
+
+        for (id, identity, runtime) in &wanted {
+            match resolvers.get(*id) {
+                // The same names, looked up the same way: leave it running, so
+                // a reload does not cost a round of lookups.
+                Some(existing) if existing.identity == *identity => continue,
+                Some(_) => {
+                    if let Some(previous) = resolvers.remove(*id) {
+                        stop(previous).await;
+                    }
+                }
+                None => {}
+            }
+            let (sender, receiver) = watch::channel(false);
+            let handle = tokio::spawn(resolve::resolve_loop(Arc::clone(runtime), receiver));
+            resolvers.insert(
+                (*id).clone(),
+                Worker {
+                    identity: *identity,
+                    stop: sender,
+                    handle,
+                },
+            );
+            tracing::debug!(
+                target: "gatel::runtime",
+                event = "resolver_started",
+                upstream = id.name(),
+            );
+        }
+
+        let retired: Vec<ResourceId> = resolvers
+            .keys()
+            .filter(|id| !wanted.iter().any(|(wanted, ..)| wanted == id))
+            .cloned()
+            .collect();
+        for id in retired {
+            if let Some(worker) = resolvers.remove(&id) {
+                stop(worker).await;
+                tracing::debug!(
+                    target: "gatel::runtime",
+                    event = "resolver_stopped",
+                    upstream = id.name(),
+                );
+            }
+        }
+    }
+
     /// Stop every worker and wait for it, so a process exit leaves nothing
     /// half-done.
     pub async fn shutdown(&self) {
         self.census.shutdown().await;
-        let mut workers = self.workers.lock().await;
-        for (_, worker) in std::mem::take(&mut *workers) {
-            stop(worker).await;
+        for map in [&self.workers, &self.resolvers] {
+            let mut workers = map.lock().await;
+            for (_, worker) in std::mem::take(&mut *workers) {
+                stop(worker).await;
+            }
         }
     }
 
     pub async fn running(&self) -> Vec<ResourceId> {
         self.workers.lock().await.keys().cloned().collect()
+    }
+
+    pub async fn resolving(&self) -> Vec<ResourceId> {
+        self.resolvers.lock().await.keys().cloned().collect()
     }
 }
 
@@ -149,7 +223,7 @@ fn worker_identity(runtime: &UpstreamRuntime) -> Fingerprint {
     hasher.update_u64(runtime.spec.protocol as u64);
     hasher.update_unordered(&runtime.spec.endpoints, |endpoint, hasher| {
         hasher.update_str(&endpoint.id);
-        hasher.update_str(&endpoint.address.to_string());
+        endpoint.target.hash_into(hasher);
     });
     hasher.finish()
 }
@@ -168,18 +242,20 @@ async fn probe_loop(
 
     loop {
         // Probe every endpoint at once: a hundred backends should take one
-        // round trip, not a hundred.
+        // round trip, not a hundred. Read from the endpoint set rather than
+        // the plan, because a name's addresses live there and change without
+        // the plan changing.
         let mut checks = Vec::new();
-        for (index, endpoint) in runtime.spec.endpoints.iter().enumerate() {
+        for endpoint in runtime.endpoints.all() {
             let kind = policy.kind.clone();
-            let address = endpoint.address;
+            let addresses = endpoint.addresses();
             let id = endpoint.id.clone();
             let timeout = policy.timeout;
-            checks.push(async move { (id, index, probe(address, &kind, protocol, timeout).await) });
+            checks.push(async move { (id, probe_any(&addresses, &kind, protocol, timeout).await) });
         }
 
-        let results = futures_join(checks).await;
-        for (id, _, result) in &results {
+        let results = join_all(checks).await;
+        for (id, result) in &results {
             report(&runtime.endpoints, &upstream, id, result);
         }
         // Immediately, not on the census tick: a backend going down is exactly
@@ -194,6 +270,31 @@ async fn probe_loop(
             _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+/// Probe every address a target currently has, and count the endpoint as
+/// answering if any of them did.
+///
+/// The endpoint the balancer picks is the *name*, and dialling it tries each
+/// address in turn — so "one address is dead" is already handled, and reporting
+/// the name as unhealthy for it would take a working backend out of rotation.
+async fn probe_any(
+    addresses: &[std::net::SocketAddr],
+    kind: &gatel_plan::HealthKind,
+    protocol: gatel_plan::UpstreamProtocol,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    if addresses.is_empty() {
+        return Err("the name has not resolved to an address".to_string());
+    }
+    let mut failures = Vec::new();
+    for address in addresses {
+        match probe(*address, kind, protocol, timeout).await {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(format!("{address}: {error}")),
+        }
+    }
+    Err(failures.join("; "))
 }
 
 fn report(endpoints: &EndpointSet, upstream: &str, id: &str, result: &Result<(), String>) {
@@ -215,7 +316,7 @@ fn report(endpoints: &EndpointSet, upstream: &str, id: &str, result: &Result<(),
 ///
 /// Written out rather than pulled in from `futures` so this crate keeps its
 /// short dependency list; the set is small and known.
-async fn futures_join<F, T>(futures: Vec<F>) -> Vec<T>
+pub(crate) async fn join_all<F, T>(futures: Vec<F>) -> Vec<T>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,

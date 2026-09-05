@@ -39,6 +39,6 @@ pub use spec::{
     Route, Site, SiteTls, Spec, Terminal,
 };
 pub use upstream::{
-    Balance, Endpoint, Health, HealthKind, PassiveHealth, Pool, Retry, RetryMode, Timeouts, Upstream,
-    UpstreamProtocol, UpstreamTls,
+    Balance, Endpoint, Family, Health, HealthKind, PassiveHealth, Pool, Resolve, Retry, RetryMode, Target,
+    Timeouts, Upstream, UpstreamProtocol, UpstreamTls,
 };

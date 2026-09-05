@@ -86,7 +86,7 @@ impl UpstreamRuntimes {
             let (selector, selector_resolution) =
                 state.bind(&binding(StateKind::Selector), SelectorState::new);
             let (pool, pool_resolution) = state.bind(&binding(StateKind::Pool), || {
-                ConnectionPool::new(upstream.pool, upstream.protocol, tls)
+                ConnectionPool::new(upstream.pool, upstream.protocol, upstream.resolve, tls)
             });
 
             resolutions.push((

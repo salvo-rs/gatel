@@ -7,6 +7,7 @@
 //! covered by the `queue` timeout.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +39,8 @@ pub enum CheckoutError {
     ConnectTimeout(Duration),
     /// The connection attempt itself failed.
     Connect(String),
+    /// The backend is named, and the name could not be turned into an address.
+    Resolve(String),
     /// The connection opened but the HTTP handshake failed.
     Handshake(String),
     /// The pool is shutting down.
@@ -59,6 +62,7 @@ impl CheckoutError {
             CheckoutError::QueueTimeout(after) => format!("no connection slot within {after:?}"),
             CheckoutError::ConnectTimeout(after) => format!("could not connect within {after:?}"),
             CheckoutError::Connect(message) => format!("connect failed: {message}"),
+            CheckoutError::Resolve(message) => format!("could not resolve the backend: {message}"),
             CheckoutError::Handshake(message) => format!("handshake failed: {message}"),
             CheckoutError::Draining => "the pool is draining".to_string(),
         }
@@ -82,6 +86,10 @@ enum Sender {
 
 struct Idle {
     sender: Sender,
+    /// Which address this connection actually reached. Kept so that when a
+    /// name stops resolving to an address, the sockets to it can be dropped
+    /// and the ones to addresses it still has can be left alone.
+    address: SocketAddr,
     opened: Instant,
     returned: Instant,
 }
@@ -113,12 +121,19 @@ struct EndpointPool {
     idle: Mutex<VecDeque<Idle>>,
     waiting: AtomicU64,
     counters: Counters,
+    /// The addresses this endpoint currently has, or empty for "everything is
+    /// still current". Read when a connection is returned, so one that reached
+    /// a replaced container is dropped rather than parked.
+    live: Mutex<Vec<SocketAddr>>,
 }
 
 /// Live connections to one upstream's backends.
 pub struct ConnectionPool {
     config: gatel_plan::Pool,
     protocol: UpstreamProtocol,
+    /// Only used on the on-demand path, when a request arrives before the
+    /// resolver task has answered for the first time.
+    resolve: gatel_plan::Resolve,
     /// Present exactly when the configuration said the backend speaks TLS.
     /// Built during prepare, so a certificate authority that will not load
     /// stops a reload rather than turning into a connection error under
@@ -153,11 +168,13 @@ impl ConnectionPool {
     pub fn new(
         config: gatel_plan::Pool,
         protocol: UpstreamProtocol,
+        resolve: gatel_plan::Resolve,
         tls: Option<Arc<gatel_tls::ClientTls>>,
     ) -> Self {
         Self {
             config,
             protocol,
+            resolve,
             tls,
             endpoints: Mutex::new(HashMap::new()),
         }
@@ -171,6 +188,7 @@ impl ConnectionPool {
                 idle: Mutex::new(VecDeque::new()),
                 waiting: AtomicU64::new(0),
                 counters: Counters::default(),
+                live: Mutex::new(Vec::new()),
             })
         }))
     }
@@ -214,6 +232,7 @@ impl ConnectionPool {
                     slot.counters.reused.fetch_add(1, Ordering::Relaxed);
                     return Ok(Lease {
                         sender: Some(entry.sender),
+                        address: entry.address,
                         opened: entry.opened,
                         slot,
                         permit,
@@ -228,10 +247,11 @@ impl ConnectionPool {
             }
         }
 
-        let sender = self.dial(endpoint, timeouts).await?;
+        let (sender, address) = self.dial(endpoint, timeouts).await?;
         slot.counters.opened.fetch_add(1, Ordering::Relaxed);
         Ok(Lease {
             sender: Some(sender),
+            address,
             opened: Instant::now(),
             slot,
             permit,
@@ -240,12 +260,68 @@ impl ConnectionPool {
         })
     }
 
-    async fn dial(&self, endpoint: &Endpoint, timeouts: &Timeouts) -> Result<Sender, CheckoutError> {
-        let stream = match tokio::time::timeout(timeouts.connect, TcpStream::connect(endpoint.address)).await
-        {
+    /// Reach the backend, and say which of its addresses answered.
+    ///
+    /// `timeouts.connect` bounds the whole of this - resolving the name if it
+    /// has not been resolved yet, and every address tried - so a name with four
+    /// dead addresses cannot take four times as long as one dead address does.
+    async fn dial(
+        &self,
+        endpoint: &Endpoint,
+        timeouts: &Timeouts,
+    ) -> Result<(Sender, SocketAddr), CheckoutError> {
+        let deadline = Instant::now() + timeouts.connect;
+        let addresses = self.addresses_for(endpoint, deadline).await?;
+
+        let mut last: Option<CheckoutError> = None;
+        for address in addresses {
+            let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match self.dial_one(address, budget).await {
+                Ok(sender) => return Ok((sender, address)),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(CheckoutError::ConnectTimeout(timeouts.connect)))
+    }
+
+    /// The addresses to try, resolving on demand when a name has none yet.
+    ///
+    /// The resolver task fills this in the background, so this path is only
+    /// reached in the moments after a start - but it has to exist, or the first
+    /// request after a start would fail for a reason that has nothing to do
+    /// with the backend.
+    async fn addresses_for(
+        &self,
+        endpoint: &Endpoint,
+        deadline: Instant,
+    ) -> Result<Vec<SocketAddr>, CheckoutError> {
+        let ordered = endpoint.dial_order();
+        if !ordered.is_empty() {
+            return Ok(ordered);
+        }
+        let budget = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| CheckoutError::Resolve("no time left to look the name up".to_string()))?;
+        let policy = gatel_plan::Resolve {
+            timeout: budget.min(self.resolve.timeout),
+            ..self.resolve
+        };
+        match crate::resolve::lookup(&endpoint.target, policy).await {
+            Ok(addresses) => {
+                endpoint.set_addresses(addresses);
+                Ok(endpoint.dial_order())
+            }
+            Err(error) => Err(CheckoutError::Resolve(error)),
+        }
+    }
+
+    async fn dial_one(&self, address: SocketAddr, budget: Duration) -> Result<Sender, CheckoutError> {
+        let stream = match tokio::time::timeout(budget, TcpStream::connect(address)).await {
             Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => return Err(CheckoutError::Connect(error.to_string())),
-            Err(_) => return Err(CheckoutError::ConnectTimeout(timeouts.connect)),
+            Ok(Err(error)) => return Err(CheckoutError::Connect(format!("{address}: {error}"))),
+            Err(_) => return Err(CheckoutError::ConnectTimeout(budget)),
         };
         // Interactive traffic; batching small writes only adds latency.
         let _ = stream.set_nodelay(true);
@@ -256,10 +332,10 @@ impl ConnectionPool {
         match &self.tls {
             None => self.handshake(TokioIo::new(stream)).await,
             Some(tls) => {
-                let secured = match tokio::time::timeout(timeouts.connect, tls.connect(stream)).await {
+                let secured = match tokio::time::timeout(budget, tls.connect(stream)).await {
                     Ok(Ok(secured)) => secured,
                     Ok(Err(error)) => return Err(CheckoutError::Connect(error)),
-                    Err(_) => return Err(CheckoutError::ConnectTimeout(timeouts.connect)),
+                    Err(_) => return Err(CheckoutError::ConnectTimeout(budget)),
                 };
                 self.handshake(TokioIo::new(secured)).await
             }
@@ -317,6 +393,30 @@ impl ConnectionPool {
         stats
     }
 
+    /// Drop idle connections to addresses an endpoint no longer has.
+    ///
+    /// Called when a name resolves to something different. Connections to an
+    /// address that is still in the set are kept: adding one replica must not
+    /// cost every connection to the others.
+    ///
+    /// In-flight leases are not touched here. They finish, and are then not
+    /// parked, because returning one checks the same list.
+    pub fn retire(&self, endpoint: &str, keep: &[SocketAddr]) -> usize {
+        let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(slot) = endpoints.get(endpoint) else {
+            return 0;
+        };
+        *slot.live.lock().unwrap_or_else(|p| p.into_inner()) = keep.to_vec();
+        let mut idle = slot.idle.lock().unwrap_or_else(|p| p.into_inner());
+        let before = idle.len();
+        idle.retain(|entry| keep.contains(&entry.address));
+        let dropped = before - idle.len();
+        slot.counters
+            .discarded
+            .fetch_add(dropped as u64, Ordering::Relaxed);
+        dropped
+    }
+
     /// Stop handing out connections and drop every idle one. In-flight leases
     /// finish normally; their connections are simply not returned.
     pub fn drain(&self) {
@@ -342,6 +442,7 @@ impl Drop for WaitingGuard {
 /// unusable.
 pub struct Lease {
     sender: Option<Sender>,
+    address: SocketAddr,
     opened: Instant,
     slot: Arc<EndpointPool>,
     permit: OwnedSemaphorePermit,
@@ -405,6 +506,15 @@ impl Drop for Lease {
         if !self.reusable || closed || expired {
             return;
         }
+        // A connection to an address the name has since stopped resolving to
+        // reached a container that is being replaced. Parking it would hand the
+        // next request a socket to something on its way out.
+        {
+            let live = self.slot.live.lock().unwrap_or_else(|p| p.into_inner());
+            if !live.is_empty() && !live.contains(&self.address) {
+                return;
+            }
+        }
         let mut idle = self.slot.idle.lock().unwrap_or_else(|p| p.into_inner());
         if idle.len() >= self.config.max_idle_per_endpoint as usize {
             // Keeping more idle sockets than configured wastes file
@@ -413,6 +523,7 @@ impl Drop for Lease {
         }
         idle.push_back(Idle {
             sender,
+            address: self.address,
             opened: self.opened,
             returned: now,
         });
@@ -465,7 +576,7 @@ mod tests {
             owner: SourceId::file("main"),
             endpoints: vec![gatel_plan::Endpoint {
                 id: "a".into(),
-                address,
+                target: gatel_plan::Target::Address(address),
                 weight: 1,
                 priority: 0,
                 origin: Origin::synthetic("test"),
@@ -478,9 +589,10 @@ mod tests {
             passive_health: None,
             protocol: Default::default(),
             tls: None,
+            resolve: Default::default(),
             origin: Origin::synthetic("test"),
         };
-        let pool = ConnectionPool::new(config, UpstreamProtocol::Http1, None);
+        let pool = ConnectionPool::new(config, UpstreamProtocol::Http1, Default::default(), None);
         (EndpointSet::new(&upstream), pool)
     }
 

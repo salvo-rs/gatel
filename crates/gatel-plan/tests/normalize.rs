@@ -883,13 +883,29 @@ fn writing_it_out_and_having_it_inferred_are_the_same_request() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_backend_named_rather_than_addressed_says_so_once() {
+fn a_backend_may_be_named_rather_than_addressed() {
+    // Every containerised deployment names its backends. The name is kept as
+    // the endpoint's identity; what it resolves to is a runtime fact.
+    let plan = spec(
+        r#"
+global { http ":8080" }
+site "*" { route "/" { proxy "api.example.com:8080" } }
+"#,
+    );
+    let endpoint = &plan.upstreams[0].endpoints[0];
+    assert_eq!(endpoint.target.host(), Some("api.example.com"));
+    assert_eq!(endpoint.target.port(), 8080);
+    assert_eq!(endpoint.id, "api.example.com:8080");
+}
+
+#[test]
+fn a_backend_that_is_neither_a_name_nor_an_address_says_which_it_failed_to_be() {
     // The reason used to be reported after the three errors it caused, so the
     // reader saw the cascade first and the cause last.
     let diagnostics = errors(
         r#"
 global { http ":8080" }
-site "*" { route "/" { proxy "api.example.com:8080" } }
+site "*" { route "/" { proxy "http://api.example.com:8080" } }
 "#,
     );
     assert_eq!(
@@ -898,13 +914,100 @@ site "*" { route "/" { proxy "api.example.com:8080" } }
         "one cause, one message:\n{diagnostics}"
     );
     let only = diagnostics.iter().next().unwrap();
-    assert!(only.message.contains("is not a numeric `address:port`"));
+    assert!(only.message.contains("cannot contain"), "{}", only.message);
+}
+
+#[test]
+fn a_name_written_without_a_port_is_told_what_to_write() {
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+site "*" { route "/" { proxy "api.example.com" } }
+"#,
+    );
+    let only = diagnostics.iter().next().unwrap();
+    assert!(only.message.contains("needs a port"), "{}", only.message);
     assert!(
-        only.help
-            .as_deref()
-            .is_some_and(|help| help.contains("not resolved yet")),
-        "the question this always raises next has to be answered: {:?}",
-        only.help
+        only.message.contains("api.example.com:8080"),
+        "the message should show the fix: {}",
+        only.message
+    );
+}
+
+#[test]
+fn looking_up_names_can_be_tuned_where_there_are_names_to_look_up() {
+    let plan = spec(
+        r#"
+global { http ":8080" }
+upstream "api" {
+    endpoint "api.internal:8080"
+    resolve interval="10s" family="ipv4"
+}
+site "*" { route "/" { proxy upstream="api" } }
+"#,
+    );
+    let upstream = &plan.upstreams[0];
+    assert_eq!(upstream.resolve.interval, std::time::Duration::from_secs(10));
+    assert_eq!(upstream.resolve.family, gatel_plan::Family::Ipv4);
+    assert!(upstream.has_names());
+}
+
+#[test]
+fn tuning_lookups_for_an_upstream_with_no_names_is_refused() {
+    // Configuration that cannot have an effect was written expecting one.
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+upstream "api" {
+    endpoint "127.0.0.1:8080"
+    resolve interval="10s"
+}
+site "*" { route "/" { proxy upstream="api" } }
+"#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("nothing to look up")),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn a_named_backend_over_tls_does_not_have_to_repeat_its_name() {
+    // Writing it twice is a chance to disagree with yourself.
+    let plan = spec(
+        r#"
+global { http ":8080" }
+upstream "api" {
+    endpoint "api.internal:8443"
+    tls
+}
+site "*" { route "/" { proxy upstream="api" } }
+"#,
+    );
+    let tls = plan.upstreams[0].tls.as_ref().expect("tls was asked for");
+    assert_eq!(tls.server_name, "api.internal");
+}
+
+#[test]
+fn several_different_names_must_say_which_one_the_certificate_carries() {
+    let diagnostics = errors(
+        r#"
+global { http ":8080" }
+upstream "api" {
+    endpoint "one.internal:8443"
+    endpoint "two.internal:8443"
+    tls
+}
+site "*" { route "/" { proxy upstream="api" } }
+"#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("requires `server-name`")),
+        "{diagnostics}"
     );
 }
 

@@ -263,7 +263,7 @@ fn collect_bindings(spec: &Spec, upstreams: &[Arc<Upstream>]) -> Vec<StateBindin
         let mut transport = Hasher::new();
         transport.update_unordered(&upstream.endpoints, |endpoint, hasher| {
             hasher.update_str(&endpoint.id);
-            hasher.update_str(&endpoint.address.to_string());
+            hasher.update_str(&endpoint.target.describe());
         });
         transport.update_u64(upstream.protocol as u64);
         match &upstream.tls {
@@ -468,13 +468,14 @@ mod tests {
 
     fn upstream(name: &str, addresses: &[&str], balance: crate::upstream::Balance) -> Upstream {
         Upstream {
+            resolve: crate::Resolve::default(),
             id: ResourceId::new(ResourceKind::Upstream, name),
             owner: SourceId::file("main"),
             endpoints: addresses
                 .iter()
                 .map(|address| crate::upstream::Endpoint {
                     id: (*address).to_string(),
-                    address: address.parse().unwrap(),
+                    target: crate::Target::parse(address).unwrap(),
                     weight: 1,
                     priority: 0,
                     origin: Origin::synthetic("test"),

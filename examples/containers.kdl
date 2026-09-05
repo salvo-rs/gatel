@@ -1,0 +1,65 @@
+// Backends named rather than addressed — the shape a containerised deployment
+// has, where a service is reached by a name and its addresses change under it.
+//
+// The name is the endpoint's identity. Health, connection pools and metrics
+// stay keyed to it, so a container being replaced does not reset any of them —
+// and does not produce a new generation, because a container being replaced is
+// not a configuration change.
+global {
+    http ":8080"
+
+    // Behind a load balancer that terminates TLS and forwards the client
+    // address.
+    trusted-proxy "10.0.0.0/8"
+}
+
+upstream "api" {
+    // A Kubernetes service, or a Compose service name, or anything the
+    // machine's own resolver knows about. The port is always written: guessing
+    // 80 or 443 from nothing is the kind of default that is wrong quietly.
+    endpoint "api.default.svc.cluster.local:8080"
+
+    // How often the name is looked up again. On an interval rather than on a
+    // TTL: the system resolver is used, so that a container's search domains,
+    // `/etc/hosts` and any split DNS mean the same thing here as for every
+    // other process on the machine — and that path hands back addresses
+    // without the TTL that produced them. An interval that is stated beats a
+    // TTL that is invented.
+    //
+    // `family` is worth setting on a dual-stack cluster where the backend only
+    // listens on one of them.
+    resolve interval="10s" timeout="2s" family="ipv4"
+
+    // A name whose addresses have all gone is a backend that is down, and is
+    // reported the same way. Probing a name checks every address it has and
+    // counts it as answering if any of them did — because dialling it tries
+    // each in turn, so one dead replica is already handled.
+    health "http" path="/healthz" interval="5s" timeout="2s"
+
+    passive-health max-fails=5 window="30s" cooldown="60s"
+
+    timeouts connect="5s" queue="2s" response-head="10s" overall="5m"
+    pool max-per-endpoint=64 max-idle-per-endpoint=16
+}
+
+// A second service, reached over TLS. The certificate has to carry the name
+// the backend is known by — which the endpoint has already said, so `tls` on
+// its own is enough. Repeating it would be a chance to disagree with yourself,
+// and the disagreement would only appear as a handshake failure under traffic.
+upstream "billing" {
+    endpoint "billing.default.svc.cluster.local:8443"
+    resolve interval="10s"
+    tls
+}
+
+site "*" {
+    access-log format="json"
+
+    route "/billing/*" {
+        proxy upstream="billing"
+    }
+
+    route "/*" {
+        proxy upstream="api"
+    }
+}

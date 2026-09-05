@@ -8,8 +8,9 @@
 use gatel_model::{Code, Diagnostics, FromNode as _, Node, ResourceId, ResourceKind, SourceId};
 
 use super::{
-    Balance, Endpoint, EndpointNode, Health, HealthKind, HealthNode, PassiveHealth, PassiveHealthNode, Pool,
-    PoolNode, Retry, RetryMode, RetryNode, Timeouts, TimeoutsNode, Upstream, UpstreamProtocol, UpstreamTls,
+    Balance, Endpoint, EndpointNode, Family, Health, HealthKind, HealthNode, PassiveHealth,
+    PassiveHealthNode, Pool, PoolNode, Resolve, ResolveNode, Retry, RetryMode, RetryNode, Target, Timeouts,
+    TimeoutsNode, Upstream, UpstreamProtocol, UpstreamTls,
 };
 
 pub fn decode_upstream_body(
@@ -26,18 +27,10 @@ pub fn decode_upstream_body(
         let Some(decoded) = EndpointNode::from_node(child, diagnostics) else {
             continue;
         };
-        let address = match gatel_model::parse_socket_addr(&decoded.address) {
-            Ok(address) => address,
+        let target = match Target::parse(&decoded.address) {
+            Ok(target) => target,
             Err(message) => {
-                let mut diagnostic =
-                    gatel_model::Diagnostic::error(Code::InvalidValue, child.args[0].origin.clone(), message);
-                // The question this always raises next.
-                if decoded.address.split(':').next().is_some_and(is_name) {
-                    diagnostic = diagnostic.with_help(
-                        "host names are not resolved yet: give the address, and if the backend speaks TLS put its name in `tls server-name=`",
-                    );
-                }
-                diagnostics.push(diagnostic);
+                diagnostics.error(Code::InvalidValue, child.args[0].origin.clone(), message);
                 continue;
             }
         };
@@ -49,7 +42,7 @@ pub fn decode_upstream_body(
             );
             continue;
         }
-        let id = decoded.id.unwrap_or_else(|| address.to_string());
+        let id = decoded.id.unwrap_or_else(|| target.describe());
         if let Some(previous) = endpoints.iter().find(|existing| existing.id == id) {
             diagnostics.push(
                 gatel_model::Diagnostic::error(
@@ -63,7 +56,7 @@ pub fn decode_upstream_body(
         }
         endpoints.push(Endpoint {
             id,
-            address,
+            target,
             weight: decoded.weight,
             priority: decoded.priority,
             origin: child.origin.clone(),
@@ -316,21 +309,89 @@ pub fn decode_upstream_body(
         None => UpstreamProtocol::default(),
     };
 
-    let tls = match node.child("tls") {
+    let resolve = match node.child("resolve") {
         Some(child) => {
-            let Some(server_name) = child
-                .prop("server-name")
-                .and_then(|property| property.value.as_str())
-            else {
+            let decoded = ResolveNode::from_node(child, diagnostics)?;
+            let base = Resolve::default();
+            let family = match decoded.family.as_deref() {
+                Some(text) => match Family::parse(text) {
+                    Some(family) => family,
+                    None => {
+                        diagnostics.push(
+                            gatel_model::Diagnostic::error(
+                                Code::InvalidValue,
+                                child.origin.clone(),
+                                format!("unknown address family `{text}`"),
+                            )
+                            .with_help("known families: any, ipv4, ipv6"),
+                        );
+                        return None;
+                    }
+                },
+                None => base.family,
+            };
+            let resolve = Resolve {
+                interval: decoded.interval.unwrap_or(base.interval),
+                timeout: decoded.timeout.unwrap_or(base.timeout),
+                family,
+            };
+            if resolve.interval.is_zero() {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "`interval` must be longer than nothing",
+                );
+            }
+            if resolve.timeout > resolve.interval {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "resolve `timeout` must not exceed `interval`",
+                );
+            }
+            // Configuration that cannot do anything is a mistake, not a
+            // harmless extra: someone wrote it expecting an effect.
+            if !endpoints.iter().any(|endpoint| endpoint.target.is_name()) {
                 diagnostics.push(
                     gatel_model::Diagnostic::error(
-                        Code::MissingField,
+                        Code::InvalidValue,
                         child.origin.clone(),
-                        "upstream `tls` requires `server-name`",
+                        "`resolve` has nothing to look up: every endpoint is already an address",
                     )
-                    .with_help("it is both the SNI value and the name the certificate is checked against"),
+                    .with_help("write a backend as `name:port` for it to be resolved"),
                 );
-                return None;
+            }
+            resolve
+        }
+        None => Resolve::default(),
+    };
+
+    let tls = match node.child("tls") {
+        Some(child) => {
+            let server_name = match child
+                .prop("server-name")
+                .and_then(|property| property.value.as_str())
+            {
+                Some(written) => written.to_string(),
+                // A backend written as a name has already said what the
+                // certificate must carry. Repeating it is a chance to disagree
+                // with yourself.
+                None => match sole_host(&endpoints) {
+                    Some(host) => host,
+                    None => {
+                        diagnostics.push(
+                            gatel_model::Diagnostic::error(
+                                Code::MissingField,
+                                child.origin.clone(),
+                                "upstream `tls` requires `server-name`",
+                            )
+                            .with_help(
+                                "it is both the SNI value and the name the certificate is checked against;                                  it is only implied when every backend is the same name",
+                            ),
+                        );
+                        return None;
+                    }
+                },
             };
             for property in &child.props {
                 if !["server-name", "ca", "client-cert", "client-key"].contains(&property.name.as_str()) {
@@ -357,7 +418,7 @@ pub fn decode_upstream_body(
                 );
             }
             Some(UpstreamTls {
-                server_name: server_name.to_string(),
+                server_name,
                 ca: secret_property(child, "ca", diagnostics),
                 client_cert,
                 client_key,
@@ -367,7 +428,7 @@ pub fn decode_upstream_body(
     };
 
     for child in &node.children {
-        const KNOWN: [&str; 9] = [
+        const KNOWN: [&str; 10] = [
             "endpoint",
             "balance",
             "timeouts",
@@ -376,6 +437,7 @@ pub fn decode_upstream_body(
             "health",
             "passive-health",
             "protocol",
+            "resolve",
             "tls",
         ];
         if !KNOWN.contains(&child.name.as_str()) {
@@ -407,6 +469,7 @@ pub fn decode_upstream_body(
         passive_health,
         protocol,
         tls,
+        resolve,
         origin: node.origin.clone(),
     })
 }
@@ -433,14 +496,12 @@ pub fn anonymous_upstream_id(route: &ResourceId, addresses: &[String]) -> Resour
     ResourceId::derived(ResourceKind::Upstream, &key)
 }
 
-/// Whether this looks like a host name rather than a typo of an address.
+/// The one name every backend shares, if they share one.
 ///
-/// Only used to decide whether to explain the limitation, so being generous
-/// costs nothing: the message is help on an error that is already correct.
-fn is_name(text: &str) -> bool {
-    !text.is_empty()
-        && text.parse::<std::net::IpAddr>().is_err()
-        && text
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '.')
+/// `None` when the backends are addresses, or are several different names — in
+/// both cases only the operator can say which name the certificate must carry.
+fn sole_host(endpoints: &[Endpoint]) -> Option<String> {
+    let mut hosts = endpoints.iter().map(|endpoint| endpoint.target.host());
+    let first = hosts.next()??;
+    hosts.all(|host| host == Some(first)).then(|| first.to_string())
 }

@@ -247,7 +247,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, (id, weight, priority))| gatel_plan::Endpoint {
                     id: (*id).to_string(),
-                    address: format!("127.0.0.1:{}", 9000 + index).parse().unwrap(),
+                    target: gatel_plan::Target::parse(&format!("127.0.0.1:{}", 9000 + index)).unwrap(),
                     weight: *weight,
                     priority: *priority,
                     origin: Origin::synthetic("test"),
@@ -261,6 +261,7 @@ mod tests {
             passive_health: None,
             protocol: Default::default(),
             tls: None,
+            resolve: Default::default(),
             origin: Origin::synthetic("test"),
         };
         EndpointSet::new(&upstream)

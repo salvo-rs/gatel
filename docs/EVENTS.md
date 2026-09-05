@@ -75,6 +75,10 @@ attempt.
 | `endpoint_health_changed` | A probe changed an endpoint's verdict. Only a change, never a round. |
 | `probe_started` | A health check worker started for an upstream. |
 | `probe_stopped` | A worker stopped, because a reload no longer asks for it. |
+| `endpoint_resolved` | A named backend now resolves to a different set of addresses. Carries the new set and how many idle connections were dropped because their address is gone. |
+| `endpoint_resolve_failed` | A name could not be looked up. Only the first failure since the last success, so a name that is down does not log every round. The addresses already held are kept. |
+| `resolver_started` | A worker that looks names up started for an upstream. |
+| `resolver_stopped` | A worker stopped, because no backend of that upstream is named any more. |
 | `state_retired` | State nothing in the new generation needs was released. |
 
 ## `gatel::certificate`

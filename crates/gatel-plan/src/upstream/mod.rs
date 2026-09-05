@@ -4,7 +4,6 @@
 //! code, because the right pool size for a gateway in front of two backends is
 //! not the right one for a gateway in front of two hundred.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use gatel_macros::FromNode;
@@ -12,8 +11,11 @@ use gatel_model::{ByteSize, Code, Diagnostics, Hasher, Node, Origin, ResourceId,
 
 /// How a request picks among healthy endpoints.
 mod decode;
+mod target;
 
 pub use decode::{anonymous_upstream_id, decode_upstream_body};
+pub(crate) use target::ResolveNode;
+pub use target::{Family, Resolve, Target};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Balance {
@@ -145,13 +147,14 @@ impl Balance {
     }
 }
 
-/// One backend address.
+/// One backend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Endpoint {
-    /// Stable identity. Derived from the address when not written, so
-    /// reordering the list never resets health or pool state.
+    /// Stable identity. Derived from the target when not written, so
+    /// reordering the list never resets health or pool state — and so a name
+    /// keeps its health and its connections across a change of address.
     pub id: String,
-    pub address: SocketAddr,
+    pub target: Target,
     pub weight: u32,
     pub priority: i32,
     pub origin: Origin,
@@ -160,7 +163,7 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn hash_into(&self, hasher: &mut Hasher) {
         hasher.update_str(&self.id);
-        hasher.update_str(&self.address.to_string());
+        self.target.hash_into(hasher);
         hasher.update_u64(self.weight as u64);
         hasher.update_i64(self.priority as i64);
     }
@@ -507,6 +510,9 @@ pub struct Upstream {
     pub passive_health: Option<PassiveHealth>,
     pub protocol: UpstreamProtocol,
     pub tls: Option<UpstreamTls>,
+    /// How often a named backend is looked up again. Present whether or not
+    /// any endpoint is a name, so the runtime never has to ask twice.
+    pub resolve: Resolve,
     pub origin: Origin,
 }
 
@@ -544,6 +550,13 @@ impl Upstream {
                 hasher.update_none();
             }
         }
+        self.resolve.hash_into(hasher);
+    }
+
+    /// Whether anything here has to be looked up. Drives whether a resolver
+    /// worker is wanted, and whether `resolve` was worth writing.
+    pub fn has_names(&self) -> bool {
+        self.endpoints.iter().any(|endpoint| endpoint.target.is_name())
     }
 }
 

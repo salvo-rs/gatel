@@ -68,9 +68,21 @@ pub fn explain(plan: &Plan) -> String {
                 upstream.pool.max_per_endpoint
             ));
             for endpoint in &upstream.endpoints {
+                // The target as written, so a name reads as a name. What it
+                // resolves to is a runtime fact and belongs in the metrics,
+                // not in an explanation of the configuration.
                 out.push_str(&format!(
                     "    {} weight {} priority {}\n",
-                    endpoint.address, endpoint.weight, endpoint.priority
+                    endpoint.target.describe(),
+                    endpoint.weight,
+                    endpoint.priority
+                ));
+            }
+            if upstream.has_names() {
+                out.push_str(&format!(
+                    "    names looked up every {:?} ({})\n",
+                    upstream.resolve.interval,
+                    upstream.resolve.family.as_str()
                 ));
             }
         }

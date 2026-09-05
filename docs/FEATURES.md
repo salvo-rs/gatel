@@ -67,7 +67,8 @@ carries; it is the same list, generated rather than written down.
 | `X-Forwarded-For` from a canonical client address, decided once | yes | done | `gatel-http/tests/proxy.rs` |
 | TLS to a backend: SNI, a private authority, a client identity | yes | done | `gatel-tls/src/client.rs`, `gatel-http/tests/proxy.rs` |
 | No way to skip verifying a backend's certificate | yes | done | the option does not exist; `tests/proxy.rs` proves an untrusted backend is refused |
-| Backends named by host rather than address (DNS, with TTL) | no (2.1) | **not started** | refused with a diagnostic that says so; this is the largest remaining gap for containerised deployments |
+| Backends named by host rather than address | yes | done | `gatel-plan/src/upstream/target.rs`, `gatel-state/src/resolve.rs`, `gatel-http/tests/resolve.rs` |
+| A name's addresses refreshed without a reload, and without resetting health or pools | yes | done | the name is the endpoint's identity; `gatel-state/src/resolve.rs`, `tests/stability.rs` |
 | Retry with a replayed body | no | not started | only `safe` is implemented, deliberately |
 | Circuit breaker as a directive | no (2.1) | not started | passive ejection covers the common case |
 | Forward proxying | no | not started | — |
@@ -154,11 +155,6 @@ In order of what a deployment would miss first:
 2. **Release engineering** — the matrix, signed artefacts, a soak test, fuzzing.
 3. **Interoperability against real clients** — the tests speak raw HTTP, which
    is not the same as having been through a browser and a CDN.
-
-Worth naming separately, because it is the gap most likely to be hit first:
-a backend can only be given as an address. Every containerised deployment names
-its backends, so this is 2.1's headline rather than a nicety. It is refused
-with a diagnostic that says exactly that, rather than failing obscurely.
 
 Everything marked 2.1 is deliberate: `cache`, `forward-auth`, `circuit-breaker`,
 the other ACME challenge types and the Admin API are each large enough to want

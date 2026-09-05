@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gatel_plan::Upstream;
+use gatel_plan::{Target, Upstream};
 
 /// What the gateway currently believes about a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +55,15 @@ impl Health {
 }
 
 /// One backend, with the counters the balancer and health logic read.
+///
+/// The *target* is the identity and comes from the plan; the *addresses* are
+/// what it currently resolves to and come from the network. Keeping health,
+/// pool slots and metric labels on the identity is what lets a container be
+/// replaced without any of them being reset.
 #[derive(Debug)]
 pub struct Endpoint {
     pub id: String,
-    pub address: SocketAddr,
+    pub target: Target,
     pub weight: u32,
     pub priority: i32,
     /// Requests currently assigned to this endpoint: from the moment the
@@ -75,13 +80,22 @@ pub struct Endpoint {
     ejected_until: Mutex<Option<Instant>>,
     /// Smoothed weighted round robin's current credit.
     current_weight: AtomicI64,
+    /// What the target currently resolves to. Filled once and never changed
+    /// for an address; refreshed on an interval for a name.
+    addresses: Mutex<Arc<Vec<SocketAddr>>>,
+    /// Where the next dial starts in that list, so a name with three addresses
+    /// spreads connections over all three rather than piling them on the first.
+    rotation: AtomicU64,
+    /// Whether the last lookup failed, so a name that is down reports once
+    /// rather than every round.
+    failing: AtomicU32,
 }
 
 impl Endpoint {
     fn new(spec: &gatel_plan::Endpoint, probed: bool) -> Self {
         Self {
             id: spec.id.clone(),
-            address: spec.address,
+            target: spec.target.clone(),
             weight: spec.weight,
             priority: spec.priority,
             in_flight: AtomicU64::new(0),
@@ -92,7 +106,62 @@ impl Endpoint {
             window_started: Mutex::new(None),
             ejected_until: Mutex::new(None),
             current_weight: AtomicI64::new(0),
+            addresses: Mutex::new(Arc::new(spec.target.address().into_iter().collect())),
+            rotation: AtomicU64::new(0),
+            failing: AtomicU32::new(0),
         }
+    }
+
+    /// What the target resolves to right now. Empty only for a name whose
+    /// first lookup has not finished or has never succeeded.
+    pub fn addresses(&self) -> Arc<Vec<SocketAddr>> {
+        Arc::clone(&self.addresses.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// The addresses to try, in the order to try them. Advances the rotation,
+    /// so two concurrent dials of a three-address name start in two places.
+    pub fn dial_order(&self) -> Vec<SocketAddr> {
+        let addresses = self.addresses();
+        if addresses.len() < 2 {
+            return addresses.as_ref().clone();
+        }
+        let start = self.rotation.fetch_add(1, Ordering::Relaxed) as usize % addresses.len();
+        let mut ordered = Vec::with_capacity(addresses.len());
+        ordered.extend_from_slice(&addresses[start..]);
+        ordered.extend_from_slice(&addresses[..start]);
+        ordered
+    }
+
+    /// Record a fresh answer. Returns what changed, or `None` when the answer
+    /// is the one already held — which is the common case, and must not cost
+    /// the pool anything.
+    pub fn set_addresses(&self, addresses: Vec<SocketAddr>) -> Option<crate::resolve::Change> {
+        self.failing.store(0, Ordering::Relaxed);
+        let mut held = self.addresses.lock().unwrap_or_else(|p| p.into_inner());
+        if held.as_slice() == addresses.as_slice() {
+            return None;
+        }
+        let before = held.as_ref().clone();
+        *held = Arc::new(addresses.clone());
+        Some(crate::resolve::Change {
+            before,
+            now: addresses,
+        })
+    }
+
+    /// Note that a lookup failed. Returns whether this is the first failure
+    /// since the last success, which is the only one worth an event.
+    ///
+    /// The addresses already held are kept: a resolver that cannot be reached
+    /// is not evidence that the backend moved, and throwing away a working
+    /// answer would turn a DNS blip into an outage.
+    pub fn record_resolve_failure(&self) -> bool {
+        self.failing.fetch_add(1, Ordering::Relaxed) == 0
+    }
+
+    /// Whether a lookup has yet to succeed for this endpoint.
+    pub fn is_unresolved(&self) -> bool {
+        self.addresses().is_empty()
     }
 
     pub fn health(&self) -> Health {
@@ -332,13 +401,14 @@ mod tests {
 
     fn upstream(active: bool, passive: Option<gatel_plan::PassiveHealth>) -> Upstream {
         Upstream {
+            resolve: gatel_plan::Resolve::default(),
             id: ResourceId::new(ResourceKind::Upstream, "api"),
             owner: SourceId::file("main"),
             endpoints: ["127.0.0.1:1", "127.0.0.1:2"]
                 .iter()
                 .map(|address| gatel_plan::Endpoint {
                     id: (*address).to_string(),
-                    address: address.parse().unwrap(),
+                    target: gatel_plan::Target::parse(address).unwrap(),
                     weight: 1,
                     priority: 0,
                     origin: Origin::synthetic("test"),
