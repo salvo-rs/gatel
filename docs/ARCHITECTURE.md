@@ -37,7 +37,12 @@ first one's plan for its own.
 ## What each layer may not do
 
 The layering is enforced by `cargo run -p xtask`, which reads each crate's
-declared dependencies and compares them against a whitelist.
+declared dependencies and compares them against a whitelist. The same command
+enforces three other things the compiler cannot: file length, agreement between
+the events the code emits and `docs/EVENTS.md` in both directions, and that
+every configuration field the compiler produces is read by something above it —
+because a knob that is accepted and quietly ignored sends an operator looking
+in the wrong place.
 
 | Crate | Cannot reach |
 |---|---|

@@ -140,6 +140,7 @@ carries; it is the same list, generated rather than written down.
 |---|---|---|---|
 | Layering enforced rather than documented | yes | done | `cargo run -p xtask` |
 | File length ceilings enforced | yes | done | `cargo run -p xtask` |
+| No configuration that is accepted and then ignored | yes | done | `cargo run -p xtask` fails on a field the compiler carries and nothing above it reads. Added after finding three: `retry`'s mode, per-try, buffer and budget, `timeouts body-idle`, and the whole `admin` block |
 | Every example validated | yes | done | `gatel-http/tests/examples.rs` compiles every one, and refuses a secret written in place |
 | Three-platform CI | yes | **configured, never run** | `.github/workflows/ci.yml` covers Linux, macOS and Windows — but this branch has never been pushed, so none of it has executed. The suite has been run by hand on Linux in a container, and on Windows; macOS has not been tried at all |
 | Fuzzing of the frontend, the compile path, the range parser and the matchers | yes | done | `fuzz/`, four targets, run in CI on every push; found three bugs on its first run |

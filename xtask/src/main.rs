@@ -1,12 +1,16 @@
 //! Repository checks that `cargo` cannot express.
 //!
-//! Two rules, both from the architecture rather than from taste:
+//! Four rules, all from the architecture rather than from taste:
 //!
 //! - A crate may only depend on the layers below it. The layering is what makes "the compiler cannot touch a
 //!   socket" a fact rather than a convention.
 //! - Files stay small enough to hold in one's head. This is a target with a hard ceiling, not a style
 //!   preference: the previous generation of this project had a 3,142-line configuration parser, and that is
 //!   exactly how a codebase stops being reviewable.
+//! - Every event the code emits is in `docs/EVENTS.md`, and every event documented there is emitted.
+//! - Every configuration field the compiler produces is read by something above it. A knob that is accepted
+//!   and then ignored is worse than one that was never offered, because the operator who sets it stops
+//!   looking for the real problem — and this rule exists because three of them were found that way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -140,14 +144,16 @@ fn main() -> ExitCode {
         "deps" => check_dependencies(&root),
         "loc" => check_file_sizes(&root),
         "events" => check_events(&root),
+        "inert" => check_inert_configuration(&root),
         "check" => {
             let mut failures = check_dependencies(&root);
             failures.extend(check_file_sizes(&root));
             failures.extend(check_events(&root));
+            failures.extend(check_inert_configuration(&root));
             failures
         }
         other => {
-            eprintln!("xtask: unknown task `{other}`; try deps, loc, events or check");
+            eprintln!("xtask: unknown task `{other}`; try deps, loc, events, inert or check");
             return ExitCode::from(2);
         }
     };
@@ -161,6 +167,138 @@ fn main() -> ExitCode {
     }
     eprintln!("\nxtask: {} problem(s)", failures.len());
     ExitCode::FAILURE
+}
+
+/// Fields that are genuinely read, in a way this check cannot see.
+///
+/// Empty on purpose. Anything added here needs a sentence saying where the
+/// field is actually consulted, because the whole point of the rule is that
+/// "it is used somewhere, trust me" is what let three dead knobs survive.
+const READ_ELSEWHERE: &[&str] = &[];
+
+/// The files the compiler's output is described in. A `pub` field on a type
+/// here is something an operator can write in a configuration file.
+const CONFIGURATION: &[&str] = &[
+    "spec.rs",
+    "plan.rs",
+    "upstream/mod.rs",
+    "matcher.rs",
+    "directive.rs",
+];
+
+/// Everything above the compiler. A field has to reach one of these to do
+/// anything at all.
+const CONSUMERS: &[&str] = &[
+    "gatel-state",
+    "gatel-http",
+    "gatel-tls",
+    "gatel-observe",
+    "gatel-bundle-std",
+    "gatel",
+];
+
+/// Find configuration the compiler carries and nothing acts on.
+///
+/// Deliberately crude: it collects `pub` field names from the plan's public
+/// types and then checks whether the identifier appears anywhere in the crates
+/// above. That cannot prove a field is *applied* — only that something at least
+/// mentions it — but it is enough to catch a whole block of settings that is
+/// decoded, validated, hashed and then dropped, which is the failure this is
+/// for.
+fn check_inert_configuration(root: &Path) -> Vec<String> {
+    let mut declared: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for name in CONFIGURATION {
+        let path = root.join("crates/gatel-plan/src").join(name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut owner = String::new();
+        for line in production(&text).lines() {
+            let line = line.trim();
+            if let Some(rest) = line
+                .strip_prefix("pub struct ")
+                .or_else(|| line.strip_prefix("pub enum "))
+            {
+                owner = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((field, _)) = rest.split_once(": ") else {
+                continue;
+            };
+            if owner.is_empty()
+                || field.is_empty()
+                || !field
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            {
+                continue;
+            }
+            declared
+                .entry(field.to_string())
+                .or_default()
+                .insert(owner.clone());
+        }
+    }
+
+    let mut mentioned = BTreeSet::new();
+    for crate_name in CONSUMERS {
+        for path in rust_files_under(&root.join("crates").join(crate_name).join("src")) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                mentioned.insert(word.to_string());
+            }
+        }
+    }
+
+    declared
+        .into_iter()
+        .filter(|(field, _)| !mentioned.contains(field) && !READ_ELSEWHERE.contains(&field.as_str()))
+        .map(|(field, owners)| {
+            let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
+            format!(
+                "`{field}` on {} is configuration nothing above the compiler reads\n           \
+                 either apply it, refuse it at compile time, or delete it",
+                owners.join(" and ")
+            )
+        })
+        .collect()
+}
+
+/// Everything before an inline `#[cfg(test)]`, so a field named only by a test
+/// fixture is not mistaken for a declaration.
+fn production(text: &str) -> &str {
+    match text.find("#[cfg(test)]") {
+        Some(index) => &text[..index],
+        None => text,
+    }
+}
+
+fn rust_files_under(directory: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![directory.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 fn repository_root() -> Option<PathBuf> {
