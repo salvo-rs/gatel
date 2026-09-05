@@ -934,4 +934,66 @@ mod tests {
         );
         drop(held);
     }
+
+    #[tokio::test]
+    async fn a_connection_to_an_address_a_name_no_longer_has_is_dropped() {
+        // What happens when a container is replaced: the name still resolves,
+        // to somewhere else. A socket to the old address reaches something on
+        // its way out, and handing it to the next request is handing it a
+        // connection that is about to close under them.
+        let address = backend().await;
+        let (set, pool) = set(address, gatel_plan::Pool::default());
+        let endpoint = Arc::clone(&set.all()[0]);
+        let timeouts = Timeouts::default();
+
+        let mut lease = pool.checkout(&endpoint, &timeouts).await.unwrap();
+        lease.send(request()).await.unwrap();
+        drop(lease);
+        assert_eq!(pool.stats()[0].idle, 1);
+
+        let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert_eq!(pool.retire("a", &[elsewhere]), 1, "the parked one is gone");
+        assert_eq!(pool.stats()[0].idle, 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_to_an_address_a_name_still_has_is_kept() {
+        // Adding one replica must not cost every connection to the others.
+        let address = backend().await;
+        let (set, pool) = set(address, gatel_plan::Pool::default());
+        let endpoint = Arc::clone(&set.all()[0]);
+        let timeouts = Timeouts::default();
+
+        let mut lease = pool.checkout(&endpoint, &timeouts).await.unwrap();
+        lease.send(request()).await.unwrap();
+        drop(lease);
+
+        let added: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert_eq!(pool.retire("a", &[address, added]), 0);
+        assert_eq!(pool.stats()[0].idle, 1, "it is still usable, so it is kept");
+    }
+
+    #[tokio::test]
+    async fn a_connection_in_flight_when_its_address_goes_is_not_parked_afterwards() {
+        // The request holding it finishes — cancelling it would turn a
+        // deployment into an error for whoever was mid-request — but the
+        // socket is not handed to anybody else.
+        let address = backend().await;
+        let (set, pool) = set(address, gatel_plan::Pool::default());
+        let endpoint = Arc::clone(&set.all()[0]);
+        let timeouts = Timeouts::default();
+
+        let mut lease = pool.checkout(&endpoint, &timeouts).await.unwrap();
+        let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        pool.retire("a", &[elsewhere]);
+
+        // Still works: it was already open and the request is already going.
+        lease.send(request()).await.unwrap();
+        drop(lease);
+        assert_eq!(
+            pool.stats()[0].idle,
+            0,
+            "a connection to somewhere that is gone must not be parked"
+        );
+    }
 }
