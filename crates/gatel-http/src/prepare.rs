@@ -112,6 +112,10 @@ pub fn prepare(
 
     let (upstreams, resolutions) = UpstreamRuntimes::resolve(plan, resources.state, resources.root)?;
     let upstreams = Arc::new(upstreams);
+    // The same handle every directive that has to ask a backend something is
+    // built with. It is a generation's worth of backends, so a directive holds
+    // the set its own generation had rather than whatever is current later.
+    let reachable: gatel_plan::SharedUpstreams = Arc::clone(&upstreams) as _;
     for (id, resolution) in &resolutions {
         if !resolution.all_reused() {
             tracing::debug!(
@@ -156,6 +160,7 @@ pub fn prepare(
                         root: resources.root,
                         state,
                         telemetry: resources.telemetry,
+                        upstreams: &reachable,
                     };
                     chain.push(directive.config.build(cx).map_err(|error| {
                         format!(
@@ -190,6 +195,7 @@ pub fn prepare(
                     root: resources.root,
                     state,
                     telemetry: resources.telemetry,
+                    upstreams: &reachable,
                 };
                 fallback.push(directive.config.build(cx).map_err(|error| {
                     format!("`{}` on site `{}`: {error}", directive.meta.name, site.id.name())
@@ -272,7 +278,7 @@ fn resolve_state(
 
 fn build_terminal(
     terminal: &Terminal,
-    upstreams: &UpstreamRuntimes,
+    upstreams: &Arc<UpstreamRuntimes>,
     resources: &Resources<'_>,
     route: &str,
 ) -> Result<Arc<dyn salvo_core::Handler>, String> {
@@ -288,10 +294,12 @@ fn build_terminal(
         }
         Terminal::Directive(instance) => {
             let state = resolve_state(instance, resources.state);
+            let reachable: gatel_plan::SharedUpstreams = Arc::clone(upstreams) as _;
             let cx = gatel_plan::BuildContext {
                 root: resources.root,
                 state,
                 telemetry: resources.telemetry,
+                upstreams: &reachable,
             };
             instance
                 .config

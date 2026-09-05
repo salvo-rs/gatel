@@ -96,6 +96,12 @@ attempt.
 | `challenge_presented` | An answer to an ACME challenge is now being served by every listener. |
 | `challenge_finished` | The authority is done with a challenge, and the answer has been withdrawn. |
 
+## `gatel::directive`
+
+| Event | When |
+|---|---|
+| `forward_auth_unreachable` | `forward-auth` could not reach the service that decides. The request was refused with 503: a check that cannot run is not a check that passed. |
+
 ## `gatel::file`
 
 | Event | When |

@@ -479,6 +479,7 @@ mod tests {
                 root: &directory,
                 state: None,
                 telemetry: crate::testing::telemetry(),
+                upstreams: crate::testing::no_upstreams(),
             })
             .err()
             .expect("appending to a directory cannot work");

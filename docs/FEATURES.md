@@ -115,7 +115,7 @@ carries; it is the same list, generated rather than written down.
 | `body-limit` | yes | done | `tests/guards.rs` |
 | `error-pages` | yes | done | `tests/guards.rs` |
 | `metrics`, `health` | yes | done | `gatel-http/tests/observe.rs` |
-| `forward-auth` | no (2.1) | not started | needs controlled outbound requests, which belongs with the proxy |
+| `forward-auth` | yes | done | `gatel-bundle-std/src/forward_auth.rs`, `gatel-http/tests/forward_auth.rs`; asks a declared upstream through the same pool the proxy uses, and one of those tests proves it shares the connection |
 | `cache` — in memory, bounded, honouring the response and `Vary` | yes | done | `gatel-bundle-std/src/cache/`, `gatel-http/tests/cache.rs`; no revalidation, no request coalescing, and expired entries are reclaimed on read or eviction rather than by a sweeper — see the module docs |
 | Argon2, scrypt and PBKDF2 for `basic-auth` | no | not started | bcrypt covers what people have |
 | The CGI family | no | not started | deliberately after 2.0 |
@@ -186,7 +186,7 @@ it:
 
 | | nginx | Caddy | here |
 |---|---|---|---|
-| `forward-auth` / `auth_request` | yes | yes | **no** — the SSO-gateway pattern (oauth2-proxy, Authelia) has no answer here |
+| `forward-auth` / `auth_request` | yes | yes | yes — the authoriser is a declared upstream, so it gets health checks, pooling and TLS like any other backend |
 | Unix-socket *listeners* | yes | yes | **no** — backends are done; listening on a path is not |
 | OCSP stapling | yes | yes | **no** |
 | HTTP/3 | yes | yes | no |
@@ -200,13 +200,21 @@ ways: active health checks (nginx Plus only), a reload that is transactional
 rather than best-effort, ten balancing strategies, and a compile step that
 refuses an ambiguous route instead of letting file order decide it.
 
-`forward-auth` is the largest of the gaps and is not simply unwritten. A
-directive lives in `gatel-bundle-std`, which may not depend on `gatel-state`,
-so it cannot reach the connection pool. Giving it its own HTTP client would
-mean a second dialling path with its own timeouts, no pooling and no health —
-which is the thing the proxy exists to avoid. It needs a capability passed
-through `BuildContext`, which is an architectural change rather than a
-directive, and is worth doing on purpose rather than in passing.
+`forward-auth` was the largest of these gaps, and it was an architectural one
+rather than an unwritten directive: a directive lives in `gatel-bundle-std`,
+which may not depend on `gatel-state`, so it could not reach the connection
+pool, and giving it a private HTTP client would have meant a second dialling
+path with its own timeouts, no pooling and no health — the thing the proxy
+exists to avoid.
+
+It was closed by adding the seam rather than the shortcut. `gatel-plan` now
+declares what it means to ask an upstream a question about a request
+(`Ask`/`Answer`/`Upstreams` in `subrequest.rs`), `gatel-state` implements it on
+the runtimes that already own the pools, and `BuildContext` hands a directive
+the set of backends its own generation can reach. `forward-auth` is the first
+user of it, and `gatel-http/tests/forward_auth.rs` asserts that three
+consecutive checks reach the authoriser over one pooled connection — which is
+the property the shortcut would have lost.
 
 Everything else marked 2.1 is deliberate: `circuit-breaker`, the other ACME
 challenge types and the Admin API are each large enough to want their own

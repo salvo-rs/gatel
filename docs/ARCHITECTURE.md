@@ -299,6 +299,37 @@ draining one. Directives contribute middleware and terminals that need nothing
 but a request and a response; the proxy needs the whole chain, so it is not a
 directive.
 
+## Asking a backend without becoming one
+
+`proxy` being in the kernel leaves a real problem behind: `forward-auth` has to
+reach a backend, and it is a directive. The two shortcuts are both bad. Giving
+the directive its own HTTP client means a second dialling path with its own
+timeouts, no connection reuse, no health and no TLS configuration — a copy of
+the thing the paragraph above exists to prevent. Moving the directive into the
+kernel means the kernel grows every time something needs a round trip.
+
+So the seam is a capability, not a client, and it is deliberately narrow:
+
+| | Where | What it says |
+|---|---|---|
+| `Ask` / `Answer` / `Upstreams` | `gatel-plan/src/subrequest.rs` | *ask one declared upstream one question about this request*, in the vocabulary of a method, a path and headers |
+| the implementation | `gatel-state/src/ask.rs` | the same selector, pool, health, timeouts and retry a proxied request uses, because it is the same backend |
+| `BuildContext::upstreams` | handed over when a handler is built | so the set a directive can reach is fixed at build time, not reachable from a request |
+| `DirectiveConfig::upstreams()` | checked while compiling | so a name with a typo in it is a diagnostic with a position, not a 502 the first time somebody is refused |
+
+A question carries no body and an answer carries at most 64 KiB of one, read to
+the end before the call returns. That bound is what keeps this from quietly
+becoming a second way to proxy: it is enough for the page an identity service
+writes when it refuses somebody — which is the whole point, since a refusal is
+useless without its `Location` — and nowhere near enough to stream a response
+through. Nothing about a subrequest outlives it, so a directive cannot hold a
+connection.
+
+The state model has the same shape and for the same reason: a directive names
+what it needs and the kernel decides how it is satisfied. Neither is an
+extension point that lets a directive reach past the kernel; both are the
+kernel offering something it already owns.
+
 ## What is deliberately absent
 
 - **No `tls-skip-verify`.** Development uses the built-in CA instead:

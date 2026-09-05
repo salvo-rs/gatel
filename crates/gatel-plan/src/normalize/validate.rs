@@ -171,29 +171,57 @@ pub(super) fn check_references(spec: &Spec, diagnostics: &mut Diagnostics) {
             );
         }
 
+        for directive in &site.directives {
+            check_directive_upstreams(spec, directive, diagnostics);
+        }
+
         for route in &site.routes {
+            for directive in &route.directives {
+                check_directive_upstreams(spec, directive, diagnostics);
+            }
             if let Terminal::Proxy { upstream } = &route.terminal
                 && spec.upstream(upstream).is_none()
             {
-                let names: Vec<&str> = spec
-                    .upstreams
-                    .iter()
-                    .map(|candidate| candidate.id.name())
-                    .collect();
-                let mut diagnostic = Diagnostic::error(
-                    Code::UnresolvedReference,
-                    route.origin.clone(),
-                    format!("unknown upstream `{}`", upstream.name()),
-                );
-                if let Some(suggestion) = did_you_mean(upstream.name(), names.iter().copied()) {
-                    diagnostic = diagnostic.with_help(format!("did you mean `{suggestion}`?"));
-                } else if names.is_empty() {
-                    diagnostic = diagnostic.with_help("no upstreams are declared; use `proxy \"host:port\"`");
-                }
-                diagnostics.push(diagnostic);
+                diagnostics.push(unknown_upstream(spec, upstream, route.origin.clone()));
             }
         }
     }
+}
+
+/// An upstream a directive named but the file does not declare.
+///
+/// The proxy terminal is not the only thing that reaches a backend: anything
+/// that has to ask one a question names it the same way, and gets the same
+/// answer to a name that is not there.
+fn check_directive_upstreams(
+    spec: &Spec,
+    directive: &crate::directive::DirectiveInstance,
+    diagnostics: &mut Diagnostics,
+) {
+    for upstream in directive.config.upstreams() {
+        if spec.upstream(&upstream).is_none() {
+            diagnostics.push(unknown_upstream(spec, &upstream, directive.origin.clone()));
+        }
+    }
+}
+
+fn unknown_upstream(spec: &Spec, upstream: &gatel_model::ResourceId, origin: Origin) -> Diagnostic {
+    let names: Vec<&str> = spec
+        .upstreams
+        .iter()
+        .map(|candidate| candidate.id.name())
+        .collect();
+    let mut diagnostic = Diagnostic::error(
+        Code::UnresolvedReference,
+        origin,
+        format!("unknown upstream `{}`", upstream.name()),
+    );
+    if let Some(suggestion) = did_you_mean(upstream.name(), names.iter().copied()) {
+        diagnostic = diagnostic.with_help(format!("did you mean `{suggestion}`?"));
+    } else if names.is_empty() {
+        diagnostic = diagnostic.with_help("no upstreams are declared; use `proxy \"host:port\"`");
+    }
+    diagnostic
 }
 
 /// Order routes so the most specific wins, once, at compile time. The request

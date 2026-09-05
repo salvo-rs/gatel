@@ -580,6 +580,7 @@ mod tests {
     fn empty_context() -> gatel_plan::BuildContext<'static> {
         gatel_plan::BuildContext {
             telemetry: crate::testing::telemetry(),
+            upstreams: crate::testing::no_upstreams(),
             root: std::path::Path::new("."),
             state: None,
         }
@@ -865,6 +866,7 @@ mod tests {
                     root: &directory,
                     state: None,
                     telemetry: crate::testing::telemetry(),
+                    upstreams: crate::testing::no_upstreams(),
                 })
                 .is_ok(),
             "the root is `www` under the configuration, not under the current directory"

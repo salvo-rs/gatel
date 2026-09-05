@@ -374,6 +374,7 @@ mod tests {
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),
+                upstreams: crate::testing::no_upstreams(),
             })
             .unwrap()
     }
@@ -544,6 +545,7 @@ mod tests {
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),
+                upstreams: crate::testing::no_upstreams(),
             })
             .err()
             .expect("a missing page must be found before it is needed");

@@ -17,3 +17,6 @@ salvo_core.workspace = true
 
 [dev-dependencies]
 gatel-kdl.workspace = true
+# Only to drive one async test to completion. Nothing this crate ships knows
+# what a runtime is.
+tokio = { workspace = true, features = ["macros", "rt"] }

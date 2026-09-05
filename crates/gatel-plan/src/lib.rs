@@ -21,6 +21,7 @@ pub mod matcher;
 pub mod normalize;
 pub mod plan;
 pub mod spec;
+pub mod subrequest;
 pub mod upstream;
 
 pub use directive::{
@@ -37,6 +38,9 @@ pub use plan::{
 pub use spec::{
     Acme, Admin, AdminBind, CertificateSource, ClientAuth, Global, Limits, Listener, ListenerProtocol, Log,
     Route, Site, SiteTls, Spec, Terminal,
+};
+pub use subrequest::{
+    Answer, Ask, HeaderMap, Method, NoUpstreams, SharedUpstreams, StatusCode, Upstreams, async_trait,
 };
 pub use upstream::{
     Balance, Endpoint, Family, Health, HealthKind, PassiveHealth, Pool, Resolve, Retry, RetryMode, Target,

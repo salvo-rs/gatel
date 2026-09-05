@@ -1042,6 +1042,7 @@ dependencies = [
  "gatel-model",
  "gatel-observe",
  "salvo_core",
+ "tokio",
 ]
 
 [[package]]

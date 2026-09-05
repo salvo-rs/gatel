@@ -212,6 +212,7 @@ mod tests {
     fn empty_context() -> gatel_plan::BuildContext<'static> {
         gatel_plan::BuildContext {
             telemetry: crate::testing::telemetry(),
+            upstreams: crate::testing::no_upstreams(),
             root: std::path::Path::new("."),
             state: None,
         }

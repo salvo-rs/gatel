@@ -1,0 +1,59 @@
+// Letting an identity service decide who gets in.
+//
+// Every request to the application is put to `auth` first. A 2xx means yes and
+// the request continues; anything else is what the client is shown, so a 302
+// to a sign-in page arrives as a 302 to a sign-in page.
+global { http ":8080" }
+
+// The authoriser is a declared upstream, exactly like the application. That is
+// what gives an authorisation check health probes, a connection pool, its own
+// timeouts, and more than one instance to ask — none of which a private
+// address written inside the directive would have, and all of which matter
+// when the check stands between every request and its answer.
+upstream "auth" {
+    endpoint "127.0.0.1:9100"
+    endpoint "127.0.0.1:9101"
+
+    health "http" path="/healthz" interval="5s"
+
+    // A check that hangs is an outage of everything behind it, so it is given
+    // less time than the application it guards.
+    timeouts connect="1s" queue="1s" response-head="2s" overall="4s"
+}
+
+upstream "app" {
+    endpoint "127.0.0.1:9000"
+}
+
+site "*" {
+    access-log
+    request-id
+
+    route "/health" {
+        // Deliberately outside the check: a probe that needed a session could
+        // not tell "the gateway is down" from "the identity service is down".
+        respond "ok\n"
+    }
+
+    route "/*" {
+        proxy upstream="app"
+
+        forward-auth upstream="auth" path="/verify" {
+            // What the authoriser is shown of the caller. It always gets the
+            // method, the target, the host and the client address as
+            // `X-Forwarded-*`; these are the headers that carry identity, and
+            // nothing else travels.
+            forward-headers "cookie" "authorization"
+
+            // What the authoriser tells the application about whoever it just
+            // approved. These replace anything the client sent under the same
+            // name, so the application can trust them.
+            copy-headers "x-auth-user" "x-auth-email" "x-auth-groups"
+        }
+
+        // Runs before the check, because refusing a flood is cheaper than
+        // asking another service about it. Phase and order decide that, not
+        // the order these are written in.
+        rate-limit max=600 window="1m" key="ip"
+    }
+}

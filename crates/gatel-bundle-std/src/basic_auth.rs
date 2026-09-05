@@ -429,6 +429,7 @@ mod tests {
         assert!(!diagnostics.has_errors(), "{diagnostics}");
         let error = match config.unwrap().build(BuildContext {
             telemetry: crate::testing::telemetry(),
+            upstreams: crate::testing::no_upstreams(),
             root: std::path::Path::new("."),
             state: None,
         }) {

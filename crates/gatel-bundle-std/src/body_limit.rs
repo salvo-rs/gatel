@@ -202,6 +202,7 @@ mod tests {
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),
+                upstreams: crate::testing::no_upstreams(),
             })
             .unwrap()
     }

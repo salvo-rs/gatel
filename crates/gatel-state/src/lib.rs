@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ask;
 pub mod census;
 pub mod endpoint;
 pub mod pool;
@@ -18,6 +19,7 @@ pub mod selector;
 pub mod supervisor;
 pub mod upstream;
 
+pub use ask::ask_upstream;
 pub use endpoint::{Endpoint, EndpointSet, Health, InFlight, probe_delay};
 pub use pool::{Body, BoxError, CheckoutError, ConnectionPool, Lease, PoolStats};
 pub use probe::probe;

@@ -253,6 +253,10 @@ pub struct BuildContext<'a> {
     /// older than any generation, like a socket: a directive that exposes it
     /// captures the handle, it is never rebuilt for a reload.
     pub telemetry: &'a Arc<gatel_observe::Telemetry>,
+    /// The backends this generation can reach, for a directive that has to ask
+    /// one something. Handed over here and nowhere else, so the set a directive
+    /// can reach is fixed when it is built.
+    pub upstreams: &'a crate::subrequest::SharedUpstreams,
 }
 
 impl BuildContext<'_> {
@@ -260,6 +264,18 @@ impl BuildContext<'_> {
     /// permission checks.
     pub fn secret(&self, reference: &gatel_model::SecretRef) -> Result<gatel_model::SecretString, String> {
         gatel_model::resolve_secret(reference, self.root)
+    }
+
+    /// The upstream this directive named, checked to exist.
+    ///
+    /// Compilation already refused an unknown name, so a failure here means the
+    /// runtime and the plan disagree — which is worth stopping a reload for
+    /// rather than discovering on a request.
+    pub fn upstream(&self, upstream: &ResourceId) -> Result<crate::subrequest::SharedUpstreams, String> {
+        if !self.upstreams.has(upstream) {
+            return Err(format!("upstream `{}` has no runtime", upstream.name()));
+        }
+        Ok(Arc::clone(self.upstreams))
     }
 
     /// Take the state as a concrete type, or say what went wrong.
@@ -290,6 +306,16 @@ pub trait DirectiveConfig: Any + Send + Sync + 'static {
     /// What this directive needs to keep between requests, if anything.
     fn state(&self) -> Option<DirectiveState> {
         None
+    }
+
+    /// Upstreams this directive refers to by name.
+    ///
+    /// Declared so compilation can check the names against what the file
+    /// actually declares. A directive that keeps this to itself would turn a
+    /// typo into a 502 the first time somebody was refused, at which point the
+    /// operator is reading the wrong logs.
+    fn upstreams(&self) -> Vec<ResourceId> {
+        Vec::new()
     }
 
     /// One line for `gatel explain`.

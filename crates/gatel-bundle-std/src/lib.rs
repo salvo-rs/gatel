@@ -17,6 +17,7 @@ pub mod encode;
 pub mod error_pages;
 pub mod file_server;
 pub mod force_https;
+pub mod forward_auth;
 pub mod headers;
 pub mod ip_filter;
 pub mod observe;
@@ -61,6 +62,7 @@ pub fn bundle() -> Bundle {
         .with(cors::Cors)
         .with(error_pages::ErrorPages)
         .with(force_https::ForceHttps)
+        .with(forward_auth::ForwardAuth)
         .with(trailing_slash::TrailingSlash)
         .with(timeout::Timeout)
         .with(body_limit::BodyLimit)
@@ -90,6 +92,7 @@ mod tests {
                 "error-pages",
                 "file-server",
                 "force-https",
+                "forward-auth",
                 "headers",
                 "health",
                 "ip-filter",
