@@ -622,3 +622,73 @@ site "*" id="all" {{
         .unwrap_or("");
     assert_eq!(body.len(), size, "every byte arrived");
 }
+
+#[tokio::test]
+async fn a_single_page_application_is_served_from_one_directory() {
+    // The shape every React, Vue or Svelte deployment has: the application's
+    // router owns most paths, and the server has to hand back the shell for
+    // them rather than a 404. Without this, hosting a SPA is not possible at
+    // all, which is why `try_files` is in every nginx configuration on the
+    // internet.
+    let gateway = Gateway::new("files-spa");
+    let port = free_port();
+    let root = gateway.directory.join("app");
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::write(root.join("index.html"), "<html>shell</html>").unwrap();
+    std::fs::write(root.join("assets/app.js"), "console.log(1)").unwrap();
+
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+site "*" {{
+    route "/*" {{
+        file-server root="{}" fallback="/index.html"
+    }}
+}}
+"#,
+            root.display().to_string().replace('\\', "/")
+        ))
+        .await;
+
+    let address = gateway.address();
+
+    // A route the application owns.
+    let deep = get(address, "/users/42/settings").await;
+    assert!(deep.starts_with("HTTP/1.1 200"), "{deep}");
+    assert!(deep.contains("shell"), "{deep}");
+    assert!(
+        deep.to_lowercase().contains("content-type: text/html"),
+        "the shell is HTML whatever path asked for it:\n{deep}"
+    );
+
+    // A real file still wins.
+    let asset = get(address, "/assets/app.js").await;
+    assert!(asset.contains("console.log(1)"), "{asset}");
+    assert!(
+        asset.to_lowercase().contains("text/javascript"),
+        "a real file keeps its own type:\n{asset}"
+    );
+
+    // And the root itself is the shell by way of the index, not the fallback.
+    assert!(get(address, "/").await.contains("shell"));
+}
+
+#[tokio::test]
+async fn without_a_fallback_a_missing_file_is_still_a_404() {
+    let gateway = Gateway::new("files-no-fallback");
+    let port = free_port();
+    let root = gateway.directory.join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("index.html"), "<html>home</html>").unwrap();
+
+    gateway
+        .apply(&format!(
+            "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ file-server root=\"{}\" }} }}\n",
+            root.display().to_string().replace('\\', "/")
+        ))
+        .await;
+
+    let response = get(gateway.address(), "/users/42").await;
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+}

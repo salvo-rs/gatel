@@ -19,14 +19,27 @@ fn registry() -> Registry {
         .unwrap()
 }
 
+/// A directory no other call to this function can be using.
+///
+/// It used to be named after the current nanosecond, which is not a unique
+/// number: the clock is coarser than that, and these tests run in parallel. A
+/// collision meant one test writing its configuration over another's and then
+/// deleting the directory underneath it — so a test compiled somebody else's
+/// input and failed on an assertion about its own, once every few hundred
+/// runs. A counter cannot collide.
+fn scratch() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "gatel-stability-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 fn plan(text: &str) -> Arc<Plan> {
-    let directory = std::env::temp_dir().join(format!(
-        "gatel-stability-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let directory = scratch();
+    let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("gatel.kdl");
     std::fs::write(&path, text).unwrap();

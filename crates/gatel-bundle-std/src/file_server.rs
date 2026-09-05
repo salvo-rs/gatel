@@ -33,6 +33,9 @@ struct Fields {
     /// the compressed file is already on disk.
     #[gatel(prop, default = false)]
     precompressed: bool,
+    /// What to serve when nothing matched. Empty disables it.
+    #[gatel(prop, default = String::new())]
+    fallback: String,
 }
 
 #[derive(Debug)]
@@ -41,6 +44,7 @@ pub struct Config {
     index: Option<String>,
     browse: bool,
     precompressed: bool,
+    fallback: Option<String>,
 }
 
 impl DirectiveConfig for Config {
@@ -49,6 +53,7 @@ impl DirectiveConfig for Config {
         hasher.update_opt_str(self.index.as_deref());
         hasher.update_bool(self.browse);
         hasher.update_bool(self.precompressed);
+        hasher.update_opt_str(self.fallback.as_deref());
     }
 
     fn build(&self, cx: gatel_plan::BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
@@ -67,6 +72,7 @@ impl DirectiveConfig for Config {
             index: self.index.clone(),
             browse: self.browse,
             precompressed: self.precompressed,
+            fallback: self.fallback.clone(),
         }))
     }
 
@@ -76,7 +82,11 @@ impl DirectiveConfig for Config {
             self.root.display(),
             if self.browse { " browsable" } else { "" },
             if self.precompressed { " precompressed" } else { "" }
-        )
+        ) + &self
+            .fallback
+            .as_deref()
+            .map(|fallback| format!(" falling back to {fallback}"))
+            .unwrap_or_default()
     }
 }
 
@@ -101,11 +111,24 @@ impl Directive for FileServerDirective {
             );
             return None;
         }
+        let fallback = fields.fallback.trim().to_string();
+        if !fallback.is_empty() && !fallback.starts_with('/') {
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::InvalidValue,
+                    node.origin.clone(),
+                    format!("`fallback` must be a path inside the root, not `{fallback}`"),
+                )
+                .with_help("write `fallback=\"/index.html\"`"),
+            );
+            return None;
+        }
         Some(Arc::new(Config {
             root: PathBuf::from(fields.root),
             index: (!fields.index.is_empty()).then_some(fields.index),
             browse: fields.browse,
             precompressed: fields.precompressed,
+            fallback: (!fallback.is_empty()).then_some(fallback),
         }))
     }
 }
@@ -115,6 +138,7 @@ struct FileServer {
     index: Option<String>,
     browse: bool,
     precompressed: bool,
+    fallback: Option<String>,
 }
 
 /// What a request resolved to.
@@ -131,6 +155,35 @@ enum Target {
 }
 
 impl FileServer {
+    /// What to serve for this request, including the fallback.
+    ///
+    /// The fallback is what makes a single-page application work: its router
+    /// owns `/users/42`, no such file exists, and the answer is the
+    /// application shell with a 200 — not a 404. It is `try_files $uri $uri/
+    /// /index.html` in nginx and `try_files {path} /index.html` in Caddy, and
+    /// the first two of those three are what `resolve` already does.
+    ///
+    /// It applies to any miss, which is what both of those do and therefore
+    /// what people expect. That has a sharp edge worth knowing: a request for
+    /// a script that is genuinely missing gets HTML with a 200, and the
+    /// browser reports a MIME error rather than a 404. Serving assets under a
+    /// path prefix with its own route avoids it.
+    fn serve(&self, request_path: &str) -> Target {
+        let target = self.resolve(request_path);
+        let Target::NotFound = target else {
+            return target;
+        };
+        let Some(fallback) = &self.fallback else {
+            return target;
+        };
+        // Resolved through the same containment checks as any other path, and
+        // once: a fallback that is itself missing is a miss, not a loop.
+        match self.resolve(fallback) {
+            file @ Target::File { .. } => file,
+            _ => Target::NotFound,
+        }
+    }
+
     /// Turn a request path into a file, refusing anything that leaves the root.
     fn resolve(&self, request_path: &str) -> Target {
         let Some(relative) = safe_relative(request_path) else {
@@ -219,7 +272,7 @@ impl Handler for FileServer {
         _ctrl: &mut FlowCtrl,
     ) {
         let path = request.uri().path().to_string();
-        let (file, metadata) = match self.resolve(&path) {
+        let (file, metadata) = match self.serve(&path) {
             Target::File { path, metadata } => (path, metadata),
             Target::Redirect(location) => {
                 response.status_code(StatusCode::MOVED_PERMANENTLY);
@@ -572,6 +625,14 @@ mod tests {
                 index: Some("index.html".to_string()),
                 browse,
                 precompressed: false,
+                fallback: None,
+            }
+        }
+
+        fn server_with_fallback(&self, fallback: &str) -> FileServer {
+            FileServer {
+                fallback: Some(fallback.to_string()),
+                ..self.server(false)
             }
         }
     }
@@ -646,6 +707,78 @@ mod tests {
         tree.write("sub/other.txt", "hi");
         assert!(matches!(tree.server(false).resolve("/sub/"), Target::NotFound));
         assert!(matches!(tree.server(true).resolve("/sub/"), Target::Listing(_)));
+    }
+
+    #[test]
+    fn a_single_page_application_gets_its_shell_for_a_route_it_owns() {
+        // The whole reason this exists. `/users/42` is the application's
+        // route, not a file, and the answer is the shell with a 200 rather
+        // than a 404 — `try_files $uri $uri/ /index.html` in nginx.
+        let tree = Tree::new("spa");
+        tree.write("index.html", "<html>app</html>");
+        tree.write("assets/app.js", "console.log(1)");
+        let server = tree.server_with_fallback("/index.html");
+
+        assert_eq!(describe(&server.serve("/users/42")), "file");
+        assert_eq!(describe(&server.serve("/deep/nested/route")), "file");
+        // A real file still wins over the fallback.
+        match server.serve("/assets/app.js") {
+            Target::File { path, .. } => assert!(path.ends_with("app.js")),
+            other => panic!("{}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn without_a_fallback_a_miss_is_still_a_miss() {
+        let tree = Tree::new("no-fallback");
+        tree.write("index.html", "<html>app</html>");
+        assert_eq!(describe(&tree.server(false).serve("/users/42")), "not found");
+    }
+
+    #[test]
+    fn a_fallback_that_is_not_there_is_a_miss_rather_than_a_loop() {
+        let tree = Tree::new("fallback-missing");
+        tree.write("real.txt", "hi");
+        let server = tree.server_with_fallback("/index.html");
+        assert_eq!(describe(&server.serve("/anything")), "not found");
+        // And the fallback path itself must not recurse into itself.
+        assert_eq!(describe(&server.serve("/index.html")), "not found");
+    }
+
+    #[test]
+    fn a_fallback_cannot_be_used_to_leave_the_root() {
+        // It goes through the same containment check as any other path, so a
+        // fallback is not a way around the thing this file exists to enforce.
+        let tree = Tree::new("fallback-escape");
+        tree.write("index.html", "<html>app</html>");
+        let server = tree.server_with_fallback("/../../etc/passwd");
+        assert_eq!(describe(&server.serve("/anything")), "not found");
+    }
+
+    #[test]
+    fn a_directory_redirect_is_not_replaced_by_the_fallback() {
+        // `/sub` must still become `/sub/`, or relative links inside it
+        // resolve one level too high. A fallback answering it would hide that.
+        let tree = Tree::new("fallback-redirect");
+        tree.write("index.html", "<html>app</html>");
+        tree.write("sub/index.html", "<html>sub</html>");
+        let server = tree.server_with_fallback("/index.html");
+        assert_eq!(describe(&server.serve("/sub")), "redirect");
+    }
+
+    #[test]
+    fn a_fallback_must_be_a_path() {
+        let node = Node::new("file-server", origin())
+            .with_prop("root", Value::string(".", origin()))
+            .with_prop("fallback", Value::string("index.html", origin()));
+        let (config, diagnostics) = decode(node);
+        assert!(config.is_none());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("must be a path inside the root")),
+            "{diagnostics}"
+        );
     }
 
     fn describe(target: &Target) -> &'static str {

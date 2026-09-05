@@ -1,0 +1,55 @@
+// A single-page application with an API behind the same host.
+//
+// The shape every React, Vue or Svelte deployment has. The part that makes it
+// work is `fallback`: the application's router owns `/users/42`, no such file
+// exists, and the answer has to be the shell with a 200 rather than a 404.
+//
+// This is `try_files $uri $uri/ /index.html` in nginx, and `try_files {path}
+// /index.html` in Caddy. The first two of those three are what a file server
+// does anyway — the file, then the directory's index — so only the last one
+// needs saying.
+global {
+    http ":8080"
+    limits body="8MiB"
+}
+
+site "*" {
+    access-log format="json"
+    request-id
+
+    // The API is a more specific path, so it wins regardless of where it is
+    // written, and never reaches the fallback below.
+    route "/api/*" {
+        proxy "127.0.0.1:9000"
+    }
+
+    // Built assets carry a content hash in their names, so they can be cached
+    // for a year. Their own route, which matters for more than caching: a
+    // missing asset here is a 404, not the shell.
+    //
+    // That is worth being deliberate about. `fallback` applies to any miss, so
+    // a script that is genuinely absent would otherwise come back as HTML with
+    // a 200 — and the browser reports a MIME error instead of a missing file.
+    // Keeping assets on their own route is what avoids it.
+    route "/assets/*" {
+        headers {
+            response {
+                set "cache-control" "public, max-age=31536000, immutable"
+            }
+        }
+        file-server root="dist" precompressed=#true
+    }
+
+    // Everything else is the application. The shell must not be cached, or a
+    // deploy leaves browsers holding a page that asks for assets which are no
+    // longer there.
+    route "/*" {
+        headers {
+            response {
+                set "cache-control" "no-cache"
+            }
+        }
+        encode
+        file-server root="dist" fallback="/index.html"
+    }
+}
