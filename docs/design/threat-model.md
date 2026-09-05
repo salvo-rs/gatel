@@ -36,6 +36,7 @@ matters more often than the first two.
 | A secret leaking into a log or a diagnostic | A compiled plan holds the reference, never the material; material exists only inside a built handler, which nothing renders; an error raised while holding it does not quote it | `gatel-http/tests/secrets.rs` (verified to fail when a leak is introduced) |
 | A world-readable key file | Size and permission checks when resolving a `file:` secret | `gatel-model/src/secret.rs` |
 | A bad edit taking the gateway down | The transaction: rejected, prepare-failed and stale all leave the running generation untouched | `gatel-http/tests/reload.rs` |
+| A deeply nested file exhausting the stack | Depth is bounded before the parser sees the text. A stack overflow is not a panic — nothing catches it, and the process dies, so the check has to come first | `gatel-kdl/src/lower.rs`, `gatel-http/tests/robustness.rs` |
 
 ### Request handling
 
@@ -46,6 +47,8 @@ matters more often than the first two.
 | A head large enough to exhaust memory | `header` bounds hyper's read buffer and the HTTP/2 header list | `gatel-http/tests/limits.rs` |
 | A body large enough to exhaust memory or disk | `body` refuses a declared length before reading, and cuts off an undeclared one mid-stream | `gatel-http/tests/limits.rs`, `body_limit.rs` |
 | A large file exhausting memory as it is served | Anything past a small threshold is streamed off disk | `gatel-bundle-std/src/ranges.rs` |
+| A range that reads past the end of a file | Every branch either lands inside the file or refuses; checked over mutated input for five file sizes | `gatel-bundle-std/src/ranges.rs`, `gatel-http/tests/robustness.rs` |
+| A resumed download splicing two different files together | A present-but-unreadable `If-Range` counts as not matching, not as absent | `gatel-bundle-std/src/ranges.rs` |
 | Connection exhaustion | `connections` is a permit taken before `accept`, so excess stays in the backlog | `gatel-http/tests/limits.rs` |
 | A forgotten WebSocket holding a slot for ever | Idle and total-lifetime watchdogs on every tunnel | `gatel-http/src/upgrade.rs` |
 | Spoofing a client address to defeat an IP rule | A forwarding header is believed only from a configured `trusted-proxy`; the canonical address is decided once, where that policy lives | `gatel-http/tests/proxy.rs` |
@@ -83,12 +86,16 @@ marketing.
   They drive real material through prepare and through everything a plan can
   print. A new rendering added somewhere else would not automatically be
   covered.
-- **No fuzzing.** The KDL frontend, the header parsers and the range parser all
-  take adversarial input and none of them is fuzzed.
-- **No dependency audit in CI.** `cargo deny` and `cargo udeps` are planned and
-  not wired up, so a dependency with a known advisory would not fail the build.
-- **No soak test.** Nothing proves memory, tasks and file descriptors are flat
-  over a day of traffic.
+- **Fuzzing is shallow.** Four targets run for three minutes each on every
+  push, which finds regressions rather than deep bugs. What finds deep bugs is
+  a long run against a corpus that grows, and nobody has left one going.
+- **`cargo udeps` is not wired up.** `cargo deny` is, and gates advisories,
+  licences, banned crates and sources — but a dependency that is declared and
+  never used still ships.
+- **The soak test measures what the gateway can count**, not resident memory:
+  state slots, metric series, parked connections, log sinks and live tasks. An
+  allocation that nothing tracks would not show up in it. Half an hour
+  nightly, which is not a day.
 - **`decode` is not implemented**, so a compressed request body is passed
   through rather than inspected — which also means a decompression bomb is the
   backend's problem rather than the gateway's. That is a deliberate position,
@@ -109,3 +116,8 @@ None of these exists yet. Listed so the shape is agreed before the work:
 - a certificate authority that answers with 500s, with malformed JSON, and very
   slowly;
 - a configuration file that is truncated while being read.
+
+The parsers, at least, are no longer on this list: `fuzz/` covers the
+configuration frontend, the whole compile path, the range parser and the
+matchers, and `gatel-http/tests/robustness.rs` keeps the same invariants under
+mutated input on every run.

@@ -137,11 +137,14 @@ carries; it is the same list, generated rather than written down.
 | File length ceilings enforced | yes | done | `cargo run -p xtask` |
 | Every example validated | yes | done | `gatel-http/tests/examples.rs` compiles every one, and refuses a secret written in place |
 | Three-platform CI | yes | done | `.github/workflows/ci.yml`: Linux, macOS and Windows, plus an MSRV check |
-| Fuzzing of the KDL frontend and the matchers | yes | **not started** | — |
-| A soak test | yes | **not started** | — |
-| Interoperability suite against curl, browsers and other proxies | yes | partial | tests speak raw HTTP on the wire; there is no external-client suite |
+| Fuzzing of the frontend, the compile path, the range parser and the matchers | yes | done | `fuzz/`, four targets, run in CI on every push; found three bugs on its first run |
+| The same inputs checked on a stable toolchain, everywhere, every time | yes | done | `gatel-http/tests/robustness.rs`, where a fuzzer's finding becomes a permanent test |
+| A soak test | yes | done | `gatel-http/tests/soak.rs`: traffic and reloads in a loop, asserting state slots, metric series, parked connections, log sinks and live tasks are flat. Two minutes per push, half an hour nightly |
+| Interoperability suite against curl, browsers and other proxies | yes | partial | tests speak raw HTTP on the wire, and CI runs the container image and talks to it with curl; there is no browser or CDN suite |
 | Every event name written down and checked | yes | done | `docs/EVENTS.md`, `cargo run -p xtask` |
-| Release matrix and signed artefacts | yes | **not started** | — |
+| Release matrix and signed artefacts | yes | done | `.github/workflows/release.yml`: eight targets, SBOM, checksums, cosign keyless. Every step of it except pushing and signing also runs on each push, so a tag does not discover it broken |
+| A dependency audit that fails the build | yes | done | `deny.toml` and CI: advisories, licences, banned crates and sources |
+| A container image | yes | done | `Dockerfile`, `scratch` over a static musl binary; CI builds it and serves a request through it |
 | `gatel upgrade` | no | not started | — |
 
 ## What must land before 2.0 can be called done
@@ -149,12 +152,17 @@ carries; it is the same list, generated rather than written down.
 In order of what a deployment would miss first:
 
 1. **ACME against a real certificate authority.** The protocol is `certon`'s
-   and the integration is covered end to end, but nothing here has met Let's
-   Encrypt's staging environment. That is the next thing to do, and it needs a
-   real domain rather than a test.
-2. **Release engineering** — the matrix, signed artefacts, a soak test, fuzzing.
-3. **Interoperability against real clients** — the tests speak raw HTTP, which
-   is not the same as having been through a browser and a CDN.
+   and the integration is covered end to end against a test authority that
+   really fetches the challenge, but nothing here has met Let's Encrypt's
+   staging environment. It needs a real domain, which is why it is the one
+   remaining item that cannot be closed by writing code.
+2. **Interoperability against real clients.** The tests speak raw HTTP and CI
+   drives the container image with curl, which is not the same as having been
+   through a browser, an HTTP/2 client that multiplexes aggressively, and a
+   CDN.
+3. **The release workflow has never produced a release.** Every step runs on
+   every push except the two that need a tag — pushing artefacts and signing
+   them — so the first tag is a smaller risk than it was, but it is not zero.
 
 Everything marked 2.1 is deliberate: `cache`, `forward-auth`, `circuit-breaker`,
 the other ACME challenge types and the Admin API are each large enough to want
