@@ -139,7 +139,7 @@ carries; it is the same list, generated rather than written down.
 | Layering enforced rather than documented | yes | done | `cargo run -p xtask` |
 | File length ceilings enforced | yes | done | `cargo run -p xtask` |
 | Every example validated | yes | done | `gatel-http/tests/examples.rs` compiles every one, and refuses a secret written in place |
-| Three-platform CI | yes | done | `.github/workflows/ci.yml`: Linux, macOS and Windows, plus an MSRV check |
+| Three-platform CI | yes | **configured, never run** | `.github/workflows/ci.yml` covers Linux, macOS and Windows — but this branch has never been pushed, so none of it has executed. The suite has been run by hand on Linux in a container, and on Windows; macOS has not been tried at all |
 | Fuzzing of the frontend, the compile path, the range parser and the matchers | yes | done | `fuzz/`, four targets, run in CI on every push; found three bugs on its first run |
 | The same inputs checked on a stable toolchain, everywhere, every time | yes | done | `gatel-http/tests/robustness.rs`, where a fuzzer's finding becomes a permanent test |
 | A soak test | yes | done | `gatel-http/tests/soak.rs`: traffic and reloads in a loop, asserting state slots, metric series, parked connections, log sinks and live tasks are flat. Two minutes per push, half an hour nightly |
@@ -163,9 +163,21 @@ In order of what a deployment would miss first:
    drives the container image with curl, which is not the same as having been
    through a browser, an HTTP/2 client that multiplexes aggressively, and a
    CDN.
-3. **The release workflow has never produced a release.** Every step runs on
-   every push except the two that need a tag — pushing artefacts and signing
-   them — so the first tag is a smaller risk than it was, but it is not zero.
+3. **The release workflow has never produced a release.** Every step is
+   arranged to run on every push except the two that need a tag — pushing
+   artefacts and signing them — so the first tag is a smaller risk than it
+   was, but it is not zero.
+4. **Nothing has been run by CI.** The branch has never been pushed, so every
+   workflow in `.github/workflows/` is configuration that has not executed:
+   the three-platform matrix, the fuzzing, the soak, the supply-chain check
+   and the packaging job. Pushing it is the cheapest remaining thing that
+   would tell us something.
+
+   That is not theoretical. Running the suite on Linux by hand, once, found
+   that manual TLS certificates did not work there at all — a certificate
+   chain was being refused for being world-readable, which it is supposed to
+   be. Everything passed on Windows, where that check is a deliberate no-op.
+   macOS is still untried, and is the platform nothing here has ever touched.
 
 ## Measured against nginx and Caddy
 
