@@ -432,7 +432,9 @@ impl ProxyTerminal {
                 );
             }
 
-            self.write_response(response, upstream_response, in_flight);
+            // The lease goes with the response: the body is still being read
+            // off that connection, so it is not free until the body is done.
+            self.write_response(response, upstream_response, in_flight, lease);
             return Ok(attempt);
         }
 

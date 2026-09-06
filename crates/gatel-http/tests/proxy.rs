@@ -341,3 +341,90 @@ site "*" id="all" {{ route "/*" id="any" {{ proxy upstream="api" }} }}
     assert!(response.starts_with("HTTP/1.1 50"), "{response}");
     assert!(!response.contains("the backend spoke tls"), "{response}");
 }
+
+/// A backend that answers, then takes its time finishing the body.
+///
+/// The gap between the head and the last byte is where the bug lived: for that
+/// whole window the connection looks free to anything that only watched for the
+/// head.
+async fn dawdles_over_the_body(gap: std::time::Duration) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(b"first").await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(gap).await;
+                    if stream.write_all(b"last!").await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+#[tokio::test]
+async fn a_connection_still_delivering_a_body_is_not_handed_to_the_next_request() {
+    // The pool used to take a connection back as soon as the response *head*
+    // had arrived, because that is when the proxy stopped holding it. The body
+    // was still coming down that socket. The next request to check the same
+    // connection out was written into the middle of somebody else's answer, and
+    // hyper cancelled one of the two — which reached the client as a 502.
+    //
+    // Nothing in the rest of this suite could see it: every other test makes
+    // one request at a time, and the window only exists while a body is in
+    // flight. Under load it was half of all requests.
+    let gateway = Gateway::new("proxy-pool-race");
+    let port = free_port();
+    let slow = dawdles_over_the_body(std::time::Duration::from_millis(300)).await;
+
+    // One connection, so the second request can only be served by the one the
+    // first is using — either by waiting for it, which is correct, or by being
+    // handed it early, which was the bug.
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}" }}
+upstream "slow" {{
+    endpoint "{slow}"
+    pool max-per-endpoint=1 max-idle-per-endpoint=1
+    timeouts connect="2s" queue="10s" response-head="5s" overall="30s"
+}}
+site "*" id="all" {{ route "/*" id="any" {{ proxy upstream="slow" }} }}
+"#
+        ))
+        .await;
+
+    let address = gateway.address();
+    let answers =
+        futures_util::future::join_all((0..6).map(|_| async move { get(address, "/thing").await })).await;
+
+    for answer in &answers {
+        assert!(
+            answer.starts_with("HTTP/1.1 200"),
+            "every request should be answered, not cancelled: {answer}"
+        );
+        // And answered completely: a truncated body would mean the connection
+        // was taken away mid-sentence rather than mid-request.
+        assert!(answer.ends_with("firstlast!"), "the body was cut short: {answer}");
+    }
+}

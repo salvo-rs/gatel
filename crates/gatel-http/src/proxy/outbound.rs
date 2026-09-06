@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use gatel_state::{Body, BoxError, InFlight};
+use gatel_state::{Body, BoxError, InFlight, Lease};
 use http_body_util::{BodyExt, Full};
 use salvo_core::http::{Request, Response};
 
@@ -104,11 +104,18 @@ impl ProxyTerminal {
             .map_err(|error| ProxyError::Upstream(error.to_string()))
     }
 
+    /// Hand the backend's answer to the client.
+    ///
+    /// `lease` is consumed rather than dropped by the caller, and that is the
+    /// whole point: the body below is still being read off that connection,
+    /// so the connection is not idle and must not go back into the pool until
+    /// the body says it is finished.
     pub(super) fn write_response(
         &self,
         response: &mut Response,
         upstream: http::Response<hyper::body::Incoming>,
         in_flight: InFlight,
+        lease: Lease,
     ) {
         let (parts, body) = upstream.into_parts();
         response.status_code(parts.status);
@@ -126,14 +133,16 @@ impl ProxyTerminal {
             }
             response.headers_mut().append(name.clone(), value.clone());
         }
-        // The guard rides along with the body so the in-flight count falls when
-        // the response finishes or is dropped, not when this function returns.
+        // Both guards ride along with the body, so they are released when the
+        // response finishes or is dropped rather than when this function
+        // returns: the in-flight count, and the connection itself.
         let gap = self.upstream.spec.timeouts.body_idle;
         let guarded = GuardedBody {
             inner: body,
             idle: tokio::time::sleep(gap),
             gap,
             _guard: in_flight,
+            _lease: lease,
         };
         response.replace_body(salvo_core::http::ResBody::Boxed(Box::pin(guarded)));
     }
@@ -190,6 +199,9 @@ pin_project_lite::pin_project! {
     /// then stalled held a connection, a pool slot and an in-flight count for
     /// as long as it liked — bounded only by `overall`, which is measured in
     /// minutes because it has to cover a legitimately long download.
+    ///
+    /// It also owns the lease, which is what keeps the connection out of the
+    /// pool while the body is still coming down it.
     struct GuardedBody {
         #[pin]
         inner: hyper::body::Incoming,
@@ -199,6 +211,11 @@ pin_project_lite::pin_project! {
         // rather than on the length of the body.
         gap: Duration,
         _guard: InFlight,
+        // The connection this body is arriving on. Held until the body is
+        // done, because a connection that is still delivering a response is
+        // not idle — parking it here let the next request be handed a socket
+        // that was mid-answer, and hyper cancelled one of the two.
+        _lease: Lease,
     }
 }
 
