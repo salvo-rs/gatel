@@ -169,6 +169,13 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          # The binaries laid out above, rather than a second build of the same
+          # commit: the image then ships exactly what was built, smoke-tested
+          # and checksummed by the `build` job. Without this the arm64 image
+          # would be compiled under QEMU for no reason, and would not be the
+          # artefact anyone tested.
+          build-args: |
+            SOURCE=prebuilt
           platforms: linux/amd64,linux/arm64
           push: ${{ github.ref_type == 'tag' }}
           tags: ${{ steps.meta.outputs.tags }}

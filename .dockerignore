@@ -9,3 +9,8 @@ docs/
 !README.md
 .gitignore
 .dockerignore
+
+# The benchmark's own containers, and the files it generates for them. The
+# gateway image is built from this context, so the payloads would otherwise be
+# uploaded to the daemon on every benchmark run.
+benchmarks/

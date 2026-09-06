@@ -1,0 +1,17 @@
+// A scratch copy of `gatel-proxy.kdl`, for reproducing something against a
+// changed setting without touching what the benchmark measures. Edit freely;
+// it is brought up on its own by `docker compose --profile debug up gatel-scratch`.
+global {
+    http ":8080"
+    log level="info" format="json"
+}
+
+upstream "backend" {
+    endpoint "backend:8080"
+}
+
+site "*" {
+    route "/*" {
+        proxy upstream="backend"
+    }
+}

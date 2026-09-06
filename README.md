@@ -94,7 +94,10 @@ family. What is done, what is missing and what proves each is in
 [docs/EVENTS.md](docs/EVENTS.md). Where the code came from and what may be
 taken from elsewhere is [docs/design/provenance.md](docs/design/provenance.md);
 what an attacker can reach is
-[docs/design/threat-model.md](docs/design/threat-model.md).
+[docs/design/threat-model.md](docs/design/threat-model.md). No performance
+number is claimed anywhere — [benchmarks/http-servers](benchmarks/http-servers)
+runs gatel, nginx and Caddy side by side on your machine, which is the only
+place a number means anything.
 
 ## Building
 

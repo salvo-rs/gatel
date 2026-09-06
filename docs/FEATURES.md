@@ -151,6 +151,7 @@ carries; it is the same list, generated rather than written down.
 | Release matrix and signed artefacts | yes | done | `.github/workflows/release.yml`: eight targets, SBOM, checksums, cosign keyless. Every step of it except pushing and signing also runs on each push, so a tag does not discover it broken |
 | A dependency audit that fails the build | yes | done | `deny.toml` and CI: advisories, licences, banned crates and sources |
 | A container image | yes | done | `Dockerfile`, `scratch` over a static musl binary; CI builds it and serves a request through it |
+| A performance comparison that can be repeated | yes | done | `benchmarks/http-servers/`: gatel, nginx and Caddy in containers under `wrk`, five scenarios, report and raw output per run. It builds the same image the release ships, which is how it found that the image did not build at all |
 | `gatel upgrade` | no | not started | — |
 
 ## What must land before 2.0 can be called done
@@ -183,6 +184,11 @@ In order of what a deployment would miss first:
    macOS is still untried, and is the platform nothing here has ever touched.
 
 ## Measured against nginx and Caddy
+
+This is a comparison of **features**. For performance there is
+`benchmarks/http-servers/`, which runs all three in containers under `wrk` and
+writes a report; no number from it is quoted here, because a number from one
+machine belongs with the machine it came from.
 
 What both of them have and this does not, in the order a deployment would miss
 it:

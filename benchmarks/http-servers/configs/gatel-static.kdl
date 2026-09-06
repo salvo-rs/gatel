@@ -1,0 +1,15 @@
+// Static file serving, with nothing on that the others do not also have.
+//
+// No access log, no compression, no cache: every server here is configured to
+// do the same work, so the comparison is about doing it rather than about who
+// was asked to do less.
+global {
+    http ":8080"
+    log level="error" format="json"
+}
+
+site "*" {
+    route "/*" {
+        file-server root="/srv/www"
+    }
+}

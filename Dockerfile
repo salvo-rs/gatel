@@ -16,7 +16,10 @@
 # its own resolver rather than through NSS, which is what lets a static build
 # reach a backend by name at all.
 
-ARG SOURCE=build
+# `source` and `prebuilt` are the two stage suffixes below. The default has to
+# be one of them: `build` was neither, so `docker build .` resolved to a stage
+# called `build-build` and failed before it compiled anything.
+ARG SOURCE=source
 
 # ---------------------------------------------------------------- from source
 FROM rust:1-alpine AS build-source
