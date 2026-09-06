@@ -19,6 +19,20 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 /// and one buffer.
 const INLINE_LIMIT: u64 = 64 * 1024;
 
+/// How much is read from disk at a time once a file is streamed.
+///
+/// `ReaderStream`'s own default is 4 KiB, which turns a 10 MiB file into two
+/// and a half thousand frames — a read, an allocation and a write apiece. The
+/// cost of that is not subtle: it was the difference between finishing a large
+/// download and not finishing one at all while other clients waited.
+///
+/// 64 KiB rather than something larger because this is per in-flight response,
+/// and a gateway serving a thousand of them should not be holding sixty
+/// megabytes of read buffer. It is deliberately the same number as
+/// [`INLINE_LIMIT`]: below that a file is read whole, above it the file is read
+/// in pieces of exactly that size.
+const CHUNK: usize = INLINE_LIMIT as usize;
+
 /// How much of a file the client asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wanted {
@@ -156,7 +170,7 @@ pub async fn deliver(
     }
 
     // Streamed: the memory this costs is one buffer, whatever the file weighs.
-    let stream = tokio_util::io::ReaderStream::new(file.take(length));
+    let stream = tokio_util::io::ReaderStream::with_capacity(file.take(length), CHUNK);
     let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
         Ok(bytes) => Ok(http_body::Frame::data(bytes)),
         Err(error) => Err(Box::new(error) as salvo_core::BoxedError),
