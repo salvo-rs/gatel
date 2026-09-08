@@ -13,12 +13,14 @@
 //! of series is a property of the configuration rather than of the traffic.
 
 pub mod access;
+pub mod blocking;
 pub mod health;
 pub mod instrument;
 pub mod metrics;
 pub mod render;
 pub mod series;
 pub mod sink;
+pub mod workers;
 
 use std::sync::Arc;
 
@@ -37,6 +39,7 @@ pub use sink::{Rotate, Sink, Sinks};
 /// changes what readiness says.
 #[derive(Debug, Default)]
 pub struct Telemetry {
+    pub workers: workers::Workers,
     pub metrics: Metrics,
     pub health: Health,
     /// Open log destinations, shared across generations the way sockets are.

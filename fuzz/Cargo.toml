@@ -15,6 +15,16 @@ license = "Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd", "zlib"] }
+bytes = "1"
+futures-util = "0.3"
+http-body = "1"
+http-body-util = "0.1"
+gatel-plugin-runtime = { path = "../crates/gatel-plugin-runtime" }
+tokio = { version = "1", features = ["rt", "time", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+gatel-password = { path = "../crates/gatel-password", features = ["argon2"] }
+gatel-cgi-protocol = { path = "../crates/gatel-cgi-protocol" }
 libfuzzer-sys = "0.4"
 gatel-kdl = { path = "../crates/gatel-kdl" }
 gatel-model = { path = "../crates/gatel-model" }
@@ -22,6 +32,13 @@ gatel-plan = { path = "../crates/gatel-plan" }
 gatel-bundle-std = { path = "../crates/gatel-bundle-std" }
 salvo_core = { version = "0.96", default-features = false }
 http = "1"
+
+[[bin]]
+name = "request_decode"
+path = "fuzz_targets/request_decode.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "kdl_frontend"
@@ -53,3 +70,24 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "snapshot_codec"
+path = "fuzz_targets/snapshot_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cgi_protocol"
+path = "fuzz_targets/cgi_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "password_policy"
+path = "fuzz_targets/password_policy.rs"
+test = false
+doc = false
+bench = false

@@ -1,8 +1,19 @@
 [workspace]
 resolver = "3"
 members = [
+    "plugins/decode",
+    "crates/gatel-password",
+    "crates/gatel-process-windows",
+    "plugins/cgi",
+    "crates/gatel-cgi-http",
+    "plugins/scgi",
+    "plugins/fastcgi",
+    "crates/gatel-cgi-protocol",
+    "plugins/maintenance",
     "crates/gatel",
     "crates/gatel-model",
+    "crates/gatel-plugin-api",
+    "crates/gatel-plugin-runtime",
     "crates/gatel-macros",
     "crates/gatel-kdl",
     "crates/gatel-plan",
@@ -26,6 +37,11 @@ homepage = "https://github.com/salvo-rs/gatel"
 readme = "README.md"
 
 [workspace.dependencies]
+gatel-password = { version = "2.0.0-alpha.1", path = "crates/gatel-password" }
+gatel-cgi-http = { version = "2.0.0-alpha.1", path = "crates/gatel-cgi-http" }
+gatel-cgi-protocol = { version = "2.0.0-alpha.1", path = "crates/gatel-cgi-protocol" }
+gatel-plugin-runtime = { version = "2.0.0-alpha.1", path = "crates/gatel-plugin-runtime" }
+gatel-plugin-api = { version = "2.0.0-alpha.1", path = "crates/gatel-plugin-api" }
 gatel-model = { version = "2.0.0-alpha.1", path = "crates/gatel-model" }
 gatel-macros = { version = "2.0.0-alpha.1", path = "crates/gatel-macros" }
 gatel-kdl = { version = "2.0.0-alpha.1", path = "crates/gatel-kdl" }
@@ -37,14 +53,18 @@ gatel-tls = { version = "2.0.0-alpha.1", path = "crates/gatel-tls" }
 gatel-bundle-std = { version = "2.0.0-alpha.1", path = "crates/gatel-bundle-std" }
 
 async-trait = "0.1"
-async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd", "deflate"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd", "zlib"] }
 bcrypt = { version = "0.17", default-features = false, features = ["std"] }
-certon = { version = "0.2.3", default-features = false, features = ["ring"] }
+certon = { version = "0.3.0", default-features = false, features = ["ring"] }
 blake3 = "1.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
 futures-util = "0.3"
 http = "1"
+httpdate = "1.0.3"
+url = "2.5.8"
 http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }

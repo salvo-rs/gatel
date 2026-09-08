@@ -1,7 +1,8 @@
 //! The resource graph: what the operator asked for, with every frontend
 //! detail already gone.
 //!
-//! A `Spec` is immutable and source-agnostic. Its fingerprint answers exactly
+//! A `Spec` is immutable and frontend-format-agnostic, but retains ownership.
+//! Its fingerprint answers exactly
 //! one question — "did the operator ask for something different?" — which is
 //! what lets an unchanged reload stop before doing any work.
 
@@ -283,6 +284,7 @@ impl Default for Log {
 /// Process-wide settings that are not themselves resources.
 #[derive(Debug, Clone)]
 pub struct Global {
+    pub blocking: Option<crate::blocking::Limits>,
     pub grace_period: Duration,
     pub limits: Limits,
     /// Peers whose forwarding headers are believed.
@@ -297,6 +299,7 @@ impl Default for Global {
     fn default() -> Self {
         Self {
             grace_period: Duration::from_secs(30),
+            blocking: None,
             limits: Limits::default(),
             trusted_proxies: Vec::new(),
             acme: None,
@@ -307,6 +310,13 @@ impl Default for Global {
 
 impl Global {
     pub fn hash_into(&self, hasher: &mut Hasher) {
+        if let Some(limits) = self.blocking {
+            hasher.update_str("blocking-v1");
+            hasher.update_u64(limits.jobs as u64);
+            hasher.update_u64(limits.memory_bytes);
+        } else {
+            hasher.update_none();
+        }
         hasher.update_duration(self.grace_period);
         self.limits.hash_into(hasher);
         // Logging does not change what a request receives, but it does change
@@ -378,11 +388,23 @@ impl Spec {
     /// by construction, so a cosmetic edit produces the same value.
     pub fn fingerprint(&self) -> Fingerprint {
         let mut hasher = Hasher::new();
-        hasher.update_str("gatel.spec.v1");
+        hasher.update_str("gatel.spec.v2");
         self.global.hash_into(&mut hasher);
-        hasher.update_unordered(&self.listeners, |listener, hasher| listener.hash_into(hasher));
-        hasher.update_unordered(&self.sites, |site, hasher| site.hash_into(hasher));
-        hasher.update_unordered(&self.upstreams, |upstream, hasher| upstream.hash_into(hasher));
+        // Ownership is published metadata, not cosmetic file layout. Keep it
+        // out of transport/state compatibility hashes so this publishes a new
+        // graph without needlessly discarding otherwise compatible state.
+        hasher.update_unordered(&self.listeners, |listener, hasher| {
+            hasher.update_str(&listener.owner.to_string());
+            listener.hash_into(hasher);
+        });
+        hasher.update_unordered(&self.sites, |site, hasher| {
+            hasher.update_str(&site.owner.to_string());
+            site.hash_into(hasher);
+        });
+        hasher.update_unordered(&self.upstreams, |upstream, hasher| {
+            hasher.update_str(&upstream.owner.to_string());
+            upstream.hash_into(hasher);
+        });
         hasher.finish()
     }
 

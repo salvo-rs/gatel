@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use gatel_plan::{Committed, GenerationStore};
 use gatel_tls::TlsAcceptor;
+use hyper::service::Service as _;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -32,9 +33,13 @@ struct AcceptTask {
 
 /// Owns the accept loops and keeps them in step with the current generation.
 pub struct Server {
+    blocking: gatel_plan::blocking::Executor,
+    closed: std::sync::atomic::AtomicBool,
+    plugin_retirements: Arc<crate::plugin_retirement::Retirements>,
     store: Arc<Store>,
     binds: Arc<BindTable>,
     tasks: tokio::sync::Mutex<BTreeMap<SocketAddr, AcceptTask>>,
+    retiring: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The process-wide connection cap. One count across every listener,
     /// because file descriptors and memory are the process's, not an address's.
     slots: Arc<Semaphore>,
@@ -43,13 +48,34 @@ pub struct Server {
 
 impl Server {
     pub fn new(store: Arc<Store>, binds: Arc<BindTable>) -> Self {
+        Self::with_blocking_executor(store, binds, gatel_plan::blocking::Executor::process_default())
+    }
+
+    /// Embedded hosts own the controller and must reuse its executor on reload.
+    pub fn with_blocking_executor(
+        store: Arc<Store>,
+        binds: Arc<BindTable>,
+        blocking: gatel_plan::blocking::Executor,
+    ) -> Self {
         Self {
+            blocking,
+            closed: std::sync::atomic::AtomicBool::new(false),
+            plugin_retirements: Arc::new(crate::plugin_retirement::Retirements::default()),
             store,
             binds,
             tasks: tokio::sync::Mutex::new(BTreeMap::new()),
+            retiring: tokio::sync::Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(0)),
             granted: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    pub fn plugin_retirements(&self) -> &Arc<crate::plugin_retirement::Retirements> {
+        &self.plugin_retirements
+    }
+
+    pub fn blocking_executor(&self) -> &gatel_plan::blocking::Executor {
+        &self.blocking
     }
 
     /// Move the connection cap to what the committed generation asks for.
@@ -87,9 +113,12 @@ impl Server {
             return;
         };
         let wanted = committed.runtime.addresses();
-        self.set_capacity(committed.runtime.limits.max_connections);
-
         let mut tasks = self.tasks.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        committed.runtime.plugin_tasks.activate();
+        self.set_capacity(committed.runtime.limits.max_connections);
         for address in &wanted {
             if tasks.contains_key(address) {
                 continue;
@@ -114,7 +143,9 @@ impl Server {
         for address in obsolete {
             if let Some(task) = tasks.remove(&address) {
                 let _ = task.stop.send(true);
-                task.handle.abort();
+                let mut retiring = self.retiring.lock().await;
+                retiring.retain(|handle| !handle.is_finished());
+                retiring.push(task.handle);
                 tracing::info!(target: "gatel::listener", event = "listener_stopped", %address);
             }
         }
@@ -126,15 +157,40 @@ impl Server {
     /// Stop accepting and wait for in-flight requests, up to the grace period.
     pub async fn shutdown(&self) {
         let mut tasks = self.tasks.lock().await;
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+        // Acquire both containers before moving ownership: cancellation while
+        // acquiring a lock must never drop a live listener's join handle.
+        let mut retiring = self.retiring.lock().await;
         for (address, task) in std::mem::take(&mut *tasks) {
             let _ = task.stop.send(true);
-            task.handle.abort();
+            retiring.push(task.handle);
             tracing::debug!(target: "gatel::listener", event = "listener_stopped", %address);
         }
+        // Each accept loop owns its connections and enforces the configured
+        // deadline. Signal every loop before awaiting any one of them.
+        while let Some(handle) = retiring.last_mut() {
+            let _ = handle.await;
+            retiring.pop();
+        }
+        drop(retiring);
+        self.plugin_retirements.shutdown().await;
     }
 
     pub async fn active_addresses(&self) -> Vec<SocketAddr> {
         self.tasks.lock().await.keys().copied().collect()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Emergency fallback. Explicit shutdown is the only graceful path.
+        for task in self.tasks.get_mut().values() {
+            let _ = task.stop.send(true);
+            task.handle.abort();
+        }
+        for handle in self.retiring.get_mut().iter() {
+            handle.abort();
+        }
     }
 }
 
@@ -146,13 +202,16 @@ async fn accept_loop(
     mut stop: watch::Receiver<bool>,
 ) {
     let graceful = GracefulShutdown::new();
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         // The slot is taken before accepting rather than after. A connection
         // accepted and then closed has already cost a handshake and told the
         // client it was welcome; leaving it in the backlog costs nothing and
         // lets a load balancer notice.
         let slot = tokio::select! {
+            biased;
             _ = stop.changed() => break,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
             slot = Arc::clone(&slots).acquire_owned() => match slot {
                 Ok(slot) => slot,
                 // The semaphore is only closed when the process is going down.
@@ -160,7 +219,9 @@ async fn accept_loop(
             },
         };
         let accepted = tokio::select! {
+            biased;
             _ = stop.changed() => break,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
             accepted = listener.accept() => accepted,
         };
         let (stream, peer) = match accepted {
@@ -179,6 +240,9 @@ async fn accept_loop(
         let Some(committed) = store.current() else {
             continue;
         };
+        // Existing accept loops can see a new commit before Server::sync.
+        // Activation is idempotent and must precede its first request too.
+        committed.runtime.plugin_tasks.activate();
         let Some(runtime) = committed.runtime.listeners.get(&address).cloned() else {
             // The address is no longer served by the current generation.
             continue;
@@ -186,16 +250,23 @@ async fn accept_loop(
 
         let _ = stream.set_nodelay(true);
         let watcher = graceful.watcher();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             serve_connection(stream, peer, address, runtime, committed, watcher, slot).await;
         });
     }
 
-    // Give connections that are already open a chance to finish.
-    tokio::select! {
-        _ = graceful.shutdown() => {}
-        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-    }
+    // Include TLS/PROXY handshakes, not only Hyper's watched HTTP futures.
+    let grace = store
+        .current()
+        .map(|current| current.runtime.grace_period)
+        .unwrap_or(std::time::Duration::from_secs(30));
+    let drain = async {
+        graceful.shutdown().await;
+        while connections.join_next().await.is_some() {}
+    };
+    let _ = tokio::time::timeout(grace, drain).await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
 }
 
 async fn serve_connection(
@@ -212,6 +283,7 @@ async fn serve_connection(
     let metrics = Arc::clone(&runtime.metrics);
     metrics.connections_total.increment();
     metrics.connections_active.increment();
+    let _open = Open(Arc::clone(&metrics));
 
     // Before TLS and before HTTP, because that is where the bytes are.
     //
@@ -249,7 +321,6 @@ async fn serve_connection(
     // A guard rather than a decrement at the end: this function returns from
     // four places, and one of them being forgotten would make the gauge climb
     // forever.
-    let _open = Open(Arc::clone(&metrics));
     let scheme = if runtime.is_tls() {
         Scheme::HTTPS
     } else {
@@ -259,6 +330,14 @@ async fn serve_connection(
         runtime
             .service
             .hyper_handler(local.into(), peer.into(), scheme, None, ConnCtrl::new(), None);
+    let work = crate::connection_work::ConnectionWork::default();
+    let request_work = work.clone();
+    let handler = Arc::new(handler);
+    let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
+        request.extensions_mut().insert(request_work.clone());
+        let handler = handler.clone();
+        async move { handler.call(request).await }
+    });
     let mut builder = auto::Builder::new(TokioExecutor::new());
     // What the head may cost, and how long a connection may go without one
     // arriving. The second covers a keep-alive connection waiting for its next
@@ -319,6 +398,9 @@ async fn serve_connection(
         }
     };
 
+    if result.is_ok() {
+        work.finish().await;
+    }
     if let Err(error) = result {
         tracing::debug!(target: "gatel::connection", event = "connection_closed", %peer, %error);
     }

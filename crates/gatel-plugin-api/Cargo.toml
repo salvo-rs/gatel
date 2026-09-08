@@ -1,0 +1,10 @@
+[package]
+name = "gatel-plugin-api"
+description = "Pure metadata contracts for source-linked Gatel plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gatel-model.workspace = true

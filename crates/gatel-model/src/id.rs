@@ -90,8 +90,9 @@ pub struct SourceRev(pub u64);
 impl SourceRev {
     pub const ZERO: Self = Self(0);
 
-    pub fn next(self) -> Self {
-        Self(self.0 + 1)
+    /// Exhaustion must be rejected, never wrapped into an older revision.
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
     }
 }
 
@@ -175,13 +176,26 @@ impl ResourceId {
         self.kind
     }
 
+    /// Derive a resource identity inside its source's namespace. File sources
+    /// retain root identities; runtime/controller sources never escape theirs.
+    pub fn derived_owned(kind: ResourceKind, owner: &SourceId, parts: &[&str]) -> Self {
+        let derived = Self::derived(kind, parts);
+        match owner.namespace() {
+            Some(prefix) => Self::new(kind, format!("{prefix}{}", derived.name())),
+            None => derived,
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Whether the name was derived rather than written by the operator.
     pub fn is_derived(&self) -> bool {
-        self.name.starts_with('@')
+        self.name
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with('@'))
     }
 
     pub fn hash_into(&self, hasher: &mut Hasher) {
@@ -202,16 +216,39 @@ impl fmt::Display for ResourceId {
 pub struct BootId(Fingerprint);
 
 impl BootId {
+    /// Include the full process identity, not the abbreviated log display.
+    pub fn hash_into(&self, hasher: &mut Hasher) {
+        hasher.update_fingerprint(&self.0);
+    }
+
     pub fn generate() -> Self {
-        let mut hasher = Hasher::new();
-        hasher.update_u64(std::process::id() as u64);
-        hasher.update_u64(
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .expect("boot identity sequence exhausted");
+        Self::from_components(
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
                 .unwrap_or_default(),
-        );
-        hasher.update_u64(std::time::Instant::now().elapsed().as_nanos() as u64);
+            sequence,
+        )
+    }
+
+    fn from_components(process: u32, timestamp: std::time::Duration, sequence: u64) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update_str("gatel.boot.v2");
+        hasher.update_u64(process as u64);
+        hasher.update_u64(timestamp.as_secs());
+        hasher.update_u64(timestamp.subsec_nanos() as u64);
+        // Equal/backwards clocks cannot duplicate another store's identity
+        // within this process. Elapsed time immediately after Instant::now()
+        // is not a uniqueness source, even on a high-resolution clock.
+        hasher.update_u64(sequence);
         Self(hasher.finish())
     }
 }
@@ -250,6 +287,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rapidly_created_boot_identities_do_not_repeat() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100_000 {
+            assert!(
+                seen.insert(BootId::generate()),
+                "boot identity repeated in one process"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_identity_sequence_distinguishes_frozen_clock_and_full_timestamp() {
+        let time = std::time::Duration::from_secs(123);
+        assert_ne!(
+            BootId::from_components(7, time, 0),
+            BootId::from_components(7, time, 1)
+        );
+        assert_ne!(
+            BootId::from_components(7, time, 0),
+            BootId::from_components(8, time, 0)
+        );
+        // Duration nanoseconds truncated to u64 would alias these timestamps.
+        let rollover = std::time::Duration::new(u64::MAX / 1_000_000_000, (u64::MAX % 1_000_000_000) as u32)
+            + std::time::Duration::from_nanos(1);
+        assert_ne!(
+            BootId::from_components(7, time, 0),
+            BootId::from_components(7, time + rollover, 0)
+        );
+    }
+
+    #[test]
     fn namespaces_gate_ownership() {
         let file = SourceId::file("main");
         let admin = SourceId::admin();
@@ -270,6 +338,28 @@ mod tests {
         assert_ne!(a, c);
         assert!(a.is_derived());
         assert!(!ResourceId::new(ResourceKind::Route, "api").is_derived());
+    }
+
+    #[test]
+    fn generated_names_stay_inside_their_source_namespace() {
+        let parts = ["same content"];
+        let root = ResourceId::derived(ResourceKind::Site, &parts);
+        let mut ids = std::collections::BTreeSet::new();
+        for owner in [
+            SourceId::file("main"),
+            SourceId::admin(),
+            SourceId::kubernetes("a"),
+            SourceId::kubernetes("b"),
+        ] {
+            let id = ResourceId::derived_owned(ResourceKind::Site, &owner, &parts);
+            assert!(owner.owns(id.name()));
+            assert!(id.is_derived());
+            if owner.kind() == SourceKind::File {
+                assert_eq!(id, root);
+            }
+            assert!(ids.insert(id));
+        }
+        assert!(!ResourceId::new(ResourceKind::Site, "runtime/site").is_derived());
     }
 
     #[test]

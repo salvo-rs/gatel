@@ -24,6 +24,7 @@ impl std::fmt::Display for StateKey {
     }
 }
 
+#[derive(Clone)]
 struct Slot {
     compatibility: Fingerprint,
     value: Arc<dyn Any + Send + Sync>,
@@ -41,9 +42,54 @@ pub enum Resolution {
 }
 
 /// Typed, owner-scoped mutable state that outlives generations.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StateRegistry {
-    slots: Mutex<BTreeMap<StateKey, Slot>>,
+    slots: Arc<Mutex<BTreeMap<StateKey, Slot>>>,
+}
+
+/// Prepared registration changes. Old entries are retained outside the commit
+/// guard so plugin-owned values are not destroyed under the generation lock.
+pub struct StateUpdate {
+    target: StateRegistry,
+    pending: Mutex<Option<BTreeMap<StateKey, Slot>>>,
+    retired: Mutex<Option<BTreeMap<StateKey, Slot>>>,
+}
+
+impl std::fmt::Debug for StateUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateUpdate").finish_non_exhaustive()
+    }
+}
+
+pub struct StatePublication<'a> {
+    slots: std::sync::MutexGuard<'a, BTreeMap<StateKey, Slot>>,
+    pending: std::sync::MutexGuard<'a, Option<BTreeMap<StateKey, Slot>>>,
+    retired: std::sync::MutexGuard<'a, Option<BTreeMap<StateKey, Slot>>>,
+}
+
+impl StateUpdate {
+    /// Release publication's previous values after all host publication guards
+    /// have been released. Plugin destructors may run here, never under a lock.
+    pub fn finish(&self) {
+        let retired = self.retired.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(retired);
+    }
+
+    pub fn begin(&self) -> StatePublication<'_> {
+        StatePublication {
+            slots: self.target.slots.lock().unwrap_or_else(|p| p.into_inner()),
+            pending: self.pending.lock().unwrap_or_else(|p| p.into_inner()),
+            retired: self.retired.lock().unwrap_or_else(|p| p.into_inner()),
+        }
+    }
+}
+
+impl StatePublication<'_> {
+    pub fn publish(mut self) {
+        if let Some(next) = self.pending.take() {
+            *self.retired = Some(std::mem::replace(&mut *self.slots, next));
+        }
+    }
 }
 
 impl std::fmt::Debug for StateRegistry {
@@ -56,6 +102,27 @@ impl std::fmt::Debug for StateRegistry {
 }
 
 impl StateRegistry {
+    /// Independent registrations with shared compatible values. Candidate
+    /// factories must not mutate reused values during preparation.
+    pub fn stage(&self) -> Self {
+        Self {
+            slots: Arc::new(Mutex::new(
+                self.slots.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            )),
+        }
+    }
+
+    /// Seal the staged registrations for publication after host stale checks.
+    /// The host must fence competing generations; this is not its own CAS.
+    pub fn update_from(&self, staged: &Self) -> StateUpdate {
+        StateUpdate {
+            target: self.clone(),
+            pending: Mutex::new(Some(
+                staged.slots.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            )),
+            retired: Mutex::new(None),
+        }
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -216,6 +283,156 @@ mod tests {
             compatibility: fingerprint(tag),
             policy,
         }
+    }
+
+    #[test]
+    fn staged_replacement_is_invisible_until_publication() {
+        let registry = StateRegistry::new();
+        let original = binding(StateKind::Pool, "original", ResetPolicy::Preserve);
+        let (first, _) = registry.bind(&original, || 1usize);
+        let staged = registry.stage();
+        let (reused, resolution) = staged.bind(&original, || 99usize);
+        assert_eq!(resolution, Resolution::Reused);
+        assert!(Arc::ptr_eq(&first, &reused));
+        let changed = binding(StateKind::Pool, "changed", ResetPolicy::Preserve);
+        let (next, _) = staged.bind(&changed, || 2usize);
+        let update = registry.update_from(&staged);
+        drop(update.begin());
+        assert!(Arc::ptr_eq(
+            &first,
+            &registry.get::<usize>(&original.owner, original.kind).unwrap()
+        ));
+        update.begin().publish();
+        assert!(Arc::ptr_eq(
+            &next,
+            &registry.get::<usize>(&original.owner, original.kind).unwrap()
+        ));
+        // Publication is one-shot, including when accidentally called again.
+        update.begin().publish();
+        assert_eq!(*registry.get::<usize>(&original.owner, original.kind).unwrap(), 2);
+    }
+
+    #[test]
+    fn finishing_publication_drops_retired_values_outside_registry_locks() {
+        struct Reenter {
+            registry: StateRegistry,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                assert!(
+                    self.registry.slots.try_lock().is_ok(),
+                    "registry lock held during destructor"
+                );
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let registry = StateRegistry::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (value, _) = registry.bind(&binding(StateKind::Pool, "old", ResetPolicy::Preserve), || {
+            Reenter {
+                registry: registry.clone(),
+                drops: drops.clone(),
+            }
+        });
+        let weak = Arc::downgrade(&value);
+        drop(value);
+        let update = registry.update_from(&StateRegistry::new());
+        update.begin().publish();
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "publish only transfers ownership"
+        );
+        update.finish();
+        assert_eq!(weak.strong_count(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        update.finish();
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "finish is idempotent");
+    }
+
+    #[test]
+    fn late_finish_only_releases_its_own_retired_values() {
+        let registry = StateRegistry::new();
+        let old_binding = binding(StateKind::Pool, "old", ResetPolicy::Preserve);
+        let (old, _) = registry.bind(&old_binding, || 1usize);
+        let old_weak = Arc::downgrade(&old);
+        drop(old);
+        let middle = registry.stage();
+        let (middle_value, _) = middle
+            .bind(&binding(StateKind::Pool, "middle", ResetPolicy::Preserve), || {
+                2usize
+            });
+        let middle_weak = Arc::downgrade(&middle_value);
+        drop(middle_value);
+        let first = registry.update_from(&middle);
+        drop(middle);
+        first.begin().publish();
+        let newest = registry.stage();
+        let (value, _) = newest.bind(&binding(StateKind::Pool, "newest", ResetPolicy::Preserve), || {
+            3usize
+        });
+        let second = registry.update_from(&newest);
+        drop(newest);
+        second.begin().publish();
+        second.finish();
+        assert_eq!(middle_weak.strong_count(), 0);
+        assert_eq!(old_weak.strong_count(), 1);
+        first.finish();
+        assert_eq!(old_weak.strong_count(), 0);
+        assert!(Arc::ptr_eq(
+            &value,
+            &registry
+                .get::<usize>(&old_binding.owner, old_binding.kind)
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn discarded_candidate_does_not_replace_registrations() {
+        let registry = StateRegistry::new();
+        let original = binding(StateKind::Pool, "original", ResetPolicy::Preserve);
+        let (first, _) = registry.bind(&original, || 1usize);
+        let staged = registry.stage();
+        staged.bind(
+            &binding(StateKind::Pool, "changed", ResetPolicy::Preserve),
+            || 2usize,
+        );
+        staged.bind(
+            &binding(StateKind::Selector, "new", ResetPolicy::Preserve),
+            || 3usize,
+        );
+        drop(registry.update_from(&staged));
+        drop(staged);
+        assert_eq!(registry.len(), 1);
+        assert!(Arc::ptr_eq(
+            &first,
+            &registry.get::<usize>(&original.owner, original.kind).unwrap()
+        ));
+    }
+
+    #[test]
+    fn publication_does_not_destroy_displaced_plugin_values() {
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let registry = StateRegistry::new();
+        let original = binding(StateKind::Pool, "original", ResetPolicy::Preserve);
+        registry.bind(&original, || Dropped(drops.clone()));
+        let staged = registry.stage();
+        staged.bind(
+            &binding(StateKind::Pool, "changed", ResetPolicy::Preserve),
+            || 2usize,
+        );
+        let update = registry.update_from(&staged);
+        update.begin().publish();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(update);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

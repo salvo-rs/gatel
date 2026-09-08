@@ -96,7 +96,7 @@ pub fn write_key(path: &std::path::Path, pem: &str) {
 
 /// Certificates are small. A file far larger than one is a mistake, or an
 /// attempt to make the gateway read something it should not.
-const MAX_PEM_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_PEM_BYTES: u64 = 256 * 1024;
 
 /// Whether a file is something only this process should be able to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +109,26 @@ pub(crate) enum Secrecy {
 }
 
 fn read_bounded(path: &Path, secrecy: Secrecy) -> Result<Vec<u8>, String> {
-    let metadata =
-        std::fs::metadata(path).map_err(|error| format!("cannot read `{}`: {error}", describe(path)))?;
+    read_optional(path, secrecy)?.ok_or_else(|| format!("cannot read `{}`: file not found", describe(path)))
+}
+
+pub(crate) fn read_optional(path: &Path, secrecy: Secrecy) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let failure = |error| format!("cannot read `{}`: {error}", describe(path));
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failure(error)),
+    };
+    if !metadata.is_file() {
+        return Err(format!("`{}` is not a regular file", describe(path)));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failure(error)),
+    };
+    let metadata = file.metadata().map_err(failure)?;
     if !metadata.is_file() {
         return Err(format!("`{}` is not a regular file", describe(path)));
     }
@@ -123,7 +141,14 @@ fn read_bounded(path: &Path, secrecy: Secrecy) -> Result<Vec<u8>, String> {
     if secrecy == Secrecy::Private {
         check_permissions(path, &metadata)?;
     }
-    std::fs::read(path).map_err(|error| format!("cannot read `{}`: {error}", describe(path)))
+    let mut bytes = Vec::new();
+    file.take(MAX_PEM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(failure)?;
+    if bytes.len() as u64 > MAX_PEM_BYTES {
+        return Err("certificate material exceeds the size limit".into());
+    }
+    Ok(Some(bytes))
 }
 
 /// A private key readable by everyone on the machine is a finding, not a

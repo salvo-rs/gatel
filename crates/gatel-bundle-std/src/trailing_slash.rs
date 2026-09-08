@@ -13,7 +13,6 @@ use std::sync::Arc;
 use gatel_macros::FromNode;
 use gatel_model::{Code, Diagnostic, Diagnostics, FromNode as _, Hasher, Node};
 use gatel_plan::{BuildContext, Directive, DirectiveConfig, DirectiveMeta, Phase, Scopes};
-use http::header::HeaderValue;
 use salvo_core::http::{Request, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 
@@ -95,7 +94,8 @@ impl Directive for TrailingSlash {
     fn meta(&self) -> &DirectiveMeta {
         // A guard, because it answers instead of the route rather than changing
         // what the route sees.
-        static META: DirectiveMeta = DirectiveMeta::middleware("trailing-slash", Phase::Guard, Scopes::BOTH);
+        static META: DirectiveMeta =
+            DirectiveMeta::middleware("trailing-slash", Phase::Guard, Scopes::BOTH).with_version("2");
         &META
     }
 
@@ -140,11 +140,7 @@ impl Handler for TrailingSlashHandler {
             ctrl.call_next(request, depot, response).await;
             return;
         };
-        let target = match request.uri().query() {
-            Some(query) => format!("{canonical}?{query}"),
-            None => canonical,
-        };
-        let Ok(location) = HeaderValue::from_str(&target) else {
+        let Some(location) = crate::local_redirect::location(&canonical, request.uri().query()) else {
             ctrl.call_next(request, depot, response).await;
             return;
         };
@@ -224,6 +220,8 @@ mod tests {
         let handler = config
             .unwrap()
             .build(BuildContext {
+                secrets: Default::default(),
+                blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),

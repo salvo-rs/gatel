@@ -76,6 +76,120 @@ fn request() -> http::Request<Body> {
 }
 
 #[tokio::test]
+async fn draining_an_unused_pool_refuses_its_first_endpoint() {
+    let (set, pool) = set("127.0.0.1:9".parse().unwrap(), Default::default());
+    pool.drain();
+    assert!(matches!(
+        pool.checkout(&set.all()[0], &Timeouts::default()).await,
+        Err(CheckoutError::Draining)
+    ));
+    assert!(pool.stats().is_empty());
+}
+
+#[tokio::test]
+async fn returning_a_live_lease_after_drain_does_not_park_it() {
+    let (set, pool) = set(backend().await, Default::default());
+    let lease = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    pool.drain();
+    drop(lease);
+    assert_eq!(pool.stats()[0].idle, 0);
+    assert_eq!(pool.stats()[0].in_use, 0);
+}
+
+#[tokio::test]
+async fn withdrawing_all_addresses_prevents_a_live_lease_from_returning() {
+    let (set, pool) = set(backend().await, Default::default());
+    let lease = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    pool.retire("a", &[]);
+    drop(lease);
+    assert_eq!(pool.stats()[0].idle, 0);
+}
+
+#[tokio::test]
+async fn dialling_requests_are_not_counted_as_queue_waiters() {
+    let (set, pool) = set(backend().await, Default::default());
+    let lease = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    assert_eq!(pool.stats()[0].waiting, 0);
+    assert_eq!(pool.stats()[0].in_use, 1);
+    drop(lease);
+}
+
+#[tokio::test]
+async fn lowering_capacity_does_not_underreport_live_leases() {
+    let config = gatel_plan::Pool {
+        max_per_endpoint: 2,
+        ..Default::default()
+    };
+    let (set, pool) = set(backend().await, config);
+    let first = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    let second = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    pool.adopt(
+        gatel_plan::Pool {
+            max_per_endpoint: 1,
+            ..config
+        },
+        Default::default(),
+    );
+    assert_eq!(pool.stats()[0].in_use, 2);
+    drop((first, second));
+    assert_eq!(pool.stats()[0].in_use, 0);
+}
+
+#[tokio::test]
+async fn stalled_tls_checkout_releases_capacity_for_the_next_attempt() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = gatel_plan::Pool {
+        max_per_endpoint: 1,
+        ..Default::default()
+    };
+    let (endpoints, _) = set(address, config);
+    let tls = gatel_tls::ClientTls::new(
+        &gatel_plan::UpstreamTls {
+            server_name: "localhost".into(),
+            ca: None,
+            client_cert: None,
+            client_key: None,
+        },
+        UpstreamProtocol::Http1,
+        std::path::Path::new("."),
+    )
+    .unwrap();
+    let pool = ConnectionPool::new(
+        config,
+        UpstreamProtocol::Http1,
+        Default::default(),
+        Some(Arc::new(tls)),
+    );
+    let endpoint = Arc::clone(&endpoints.all()[0]);
+    let timeouts = Timeouts {
+        connect: Duration::from_millis(50),
+        ..Default::default()
+    };
+    // Consume each ClientHello without answering; read EOF when cancellation
+    // drops the socket. A second connection proves the sole permit is returned.
+    let peer = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello = Vec::new();
+            stream.read_to_end(&mut hello).await.unwrap();
+            assert!(!hello.is_empty());
+        }
+    });
+    for _ in 0..2 {
+        let result = tokio::time::timeout(Duration::from_secs(2), pool.checkout(&endpoint, &timeouts))
+            .await
+            .expect("connect must terminate before the outer test deadline");
+        assert!(matches!(result, Err(CheckoutError::ConnectTimeout(_))));
+        assert_eq!(pool.stats()[0].idle, 0);
+    }
+    tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn a_connection_is_reused_rather_than_reopened() {
     let address = backend().await;
     let (set, pool) = set(address, gatel_plan::Pool::default());

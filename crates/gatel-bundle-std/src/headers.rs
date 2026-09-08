@@ -253,6 +253,7 @@ fn decode_operations(node: &Node, into: &mut Vec<Operation>, diagnostics: &mut D
     }
 }
 
+#[derive(Clone)]
 enum Compiled {
     Set(http::HeaderName, http::HeaderValue),
     Add(http::HeaderName, http::HeaderValue),
@@ -303,6 +304,18 @@ struct HeadersHandler {
     response: Vec<Compiled>,
 }
 
+const FILE_PREVIEW: &str = "gatel.file.response-header-operations";
+
+/// Replay the configured response operations in unwind order, without changing
+/// the real response. Local files need final policy before selecting their body.
+pub(crate) fn file_preview(depot: &Depot, headers: &mut http::HeaderMap) {
+    if let Ok(layers) = depot.get::<Vec<Vec<Compiled>>>(FILE_PREVIEW) {
+        for operations in layers.iter().rev() {
+            apply(operations, headers);
+        }
+    }
+}
+
 #[async_trait]
 impl Handler for HeadersHandler {
     async fn handle(
@@ -313,7 +326,15 @@ impl Handler for HeadersHandler {
         ctrl: &mut FlowCtrl,
     ) {
         apply(&self.request, request.headers_mut());
+        let previous = depot
+            .get::<Vec<Vec<Compiled>>>(FILE_PREVIEW)
+            .cloned()
+            .unwrap_or_default();
+        let mut layers = previous.clone();
+        layers.push(self.response.clone());
+        depot.insert(FILE_PREVIEW, layers);
         ctrl.call_next(request, depot, response).await;
+        depot.insert(FILE_PREVIEW, previous);
         apply(&self.response, response.headers_mut());
     }
 }

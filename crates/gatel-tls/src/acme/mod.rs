@@ -14,10 +14,20 @@
 //! - Renewal is a background task reconciled after a commit, like a health check, so a candidate that fails
 //!   to prepare starts nothing.
 
+mod account_lock;
+mod account_pair;
+mod account_storage;
+mod cert_store;
 pub mod challenge;
+mod identity_file;
 pub mod issuer;
 pub mod manager;
+pub(crate) mod order;
+mod registration_intent;
 
+pub use cert_store::AtomicCertStore;
+pub use certon::CertStore;
+pub use certon::storage::CertificateResource;
 pub use challenge::{Challenges, RouteSolver};
 pub use issuer::{Issued, Issuer};
 pub use manager::{Acme, Wanted};

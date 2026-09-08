@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use gatel_model::SecretRef;
+use gatel_model::{Fingerprint, Hasher, SecretRef};
 use gatel_plan::{UpstreamProtocol, UpstreamTls};
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -25,6 +25,7 @@ use tokio_rustls::client::TlsStream;
 
 /// How to reach one upstream over TLS.
 pub struct ClientTls {
+    identity: Fingerprint,
     connector: TlsConnector,
     /// The name presented in SNI and checked against the certificate. Written
     /// in the configuration rather than taken from the address, because a
@@ -48,11 +49,15 @@ impl ClientTls {
     /// `root` is the directory `file:` references resolve against, so a
     /// relative path means the same thing wherever the process was started.
     pub fn new(spec: &UpstreamTls, protocol: UpstreamProtocol, root: &Path) -> Result<Self, String> {
+        let mut material = Hasher::new();
+        material.update_str("prepared-upstream-tls-v1");
+        spec.hash_into(&mut material);
+        material.update_u64(protocol as u64);
         let server_name = ServerName::try_from(spec.server_name.clone())
             .map_err(|_| format!("`{}` is not a name a certificate can carry", spec.server_name))?;
 
         let roots = match &spec.ca {
-            Some(ca) => private_roots(ca, root)?,
+            Some(ca) => private_roots(ca, root, &mut material)?,
             // The platform's public authorities, compiled in rather than read
             // from the machine: a gateway should reach the same verdict on a
             // container with no trust store as on a workstation.
@@ -65,6 +70,11 @@ impl ClientTls {
         let mut config = match (&spec.client_cert, &spec.client_key) {
             (Some(cert), Some(key)) => {
                 let (chain, key) = identity(cert, key, root)?;
+                material.update_str("client-chain");
+                material.update_u64(chain.len() as u64);
+                for certificate in &chain {
+                    material.update_bytes(certificate.as_ref());
+                }
                 builder
                     .with_client_auth_cert(chain, key)
                     .map_err(|error| format!("the client identity is not usable: {error}"))?
@@ -81,6 +91,7 @@ impl ClientTls {
         };
 
         Ok(Self {
+            identity: material.finish(),
             connector: TlsConnector::from(Arc::new(config)),
             server_name,
             described: describe(spec),
@@ -101,6 +112,12 @@ impl ClientTls {
     pub fn server_name(&self) -> String {
         self.described.clone()
     }
+
+    /// Runtime compatibility of the validated public trust and identity
+    /// material, not a fingerprint of paths alone. Private keys are not hashed.
+    pub fn identity(&self) -> Fingerprint {
+        self.identity
+    }
 }
 
 fn describe(spec: &UpstreamTls) -> String {
@@ -118,12 +135,15 @@ fn describe(spec: &UpstreamTls) -> String {
 ///
 /// Adding would mean a backend could be certified by anybody, which is not what
 /// naming one authority asks for.
-fn private_roots(ca: &SecretRef, root: &Path) -> Result<RootCertStore, String> {
+fn private_roots(ca: &SecretRef, root: &Path, material: &mut Hasher) -> Result<RootCertStore, String> {
     let path = ca.resolve_path(root)?;
     let bytes = std::fs::read(&path).map_err(|error| format!("cannot read the upstream CA: {error}"))?;
     let certificates = crate::certificate::read_chain(&bytes, "upstream CA")?;
+    material.update_str("private-roots");
+    material.update_u64(certificates.len() as u64);
     let mut roots = RootCertStore::empty();
     for certificate in certificates {
+        material.update_bytes(certificate.as_ref());
         roots
             .add(certificate)
             .map_err(|error| format!("the upstream CA is not usable: {error}"))?;

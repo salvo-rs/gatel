@@ -1,0 +1,10 @@
+[package]
+name = "gatel-cgi-protocol"
+description = "Bounded CGI and FastCGI wire contracts without runtime or process dependencies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+http.workspace = true

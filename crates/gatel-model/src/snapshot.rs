@@ -4,12 +4,9 @@
 //! point in time. Sources are merged by union only: a name claimed by two
 //! sources is an error, never a silent overwrite.
 //!
-//! Today a running process has exactly one source — the configuration file,
-//! with any `import` already spliced into it — so the merge is exercised by
-//! this module's own tests rather than by the binary. It is kept because the
-//! second source is the reason the type exists: a control plane that could add
-//! sites at runtime has to arrive as another source with its own revision, not
-//! as a mutation of the file somebody else is editing.
+//! The file host can register several named roots, with each root's imports
+//! already spliced into its source. A control-plane frontend must likewise
+//! arrive as its own source and revision, not mutate a file source's intent.
 
 use std::collections::BTreeMap;
 
@@ -31,6 +28,30 @@ pub struct SourceSnapshot {
 }
 
 impl SourceSnapshot {
+    /// Assign a revision from a trusted frontend's complete content identity.
+    /// Callers must serialize observation and retaining the result per source.
+    /// Reusing an identity requires the exact same node tree, including origins
+    /// and float bits; otherwise reject without assigning or retaining a revision.
+    pub fn observe(
+        source: SourceId,
+        content: Fingerprint,
+        nodes: Vec<Node>,
+        previous: Option<&Self>,
+    ) -> Result<Self, ObservationError> {
+        let rev = match previous {
+            Some(previous) if previous.source != source => return Err(ObservationError::WrongSource),
+            Some(previous) if previous.content == content => {
+                if !crate::value_identity::same_nodes(&previous.nodes, &nodes) {
+                    return Err(ObservationError::ContentMismatch);
+                }
+                previous.rev
+            }
+            Some(previous) => previous.rev.next().ok_or(ObservationError::RevisionExhausted)?,
+            None => SourceRev(1),
+        };
+        Ok(Self::new(source, rev, content, nodes))
+    }
+
     pub fn new(source: SourceId, rev: SourceRev, content: Fingerprint, nodes: Vec<Node>) -> Self {
         Self {
             source,
@@ -41,7 +62,26 @@ impl SourceSnapshot {
     }
 }
 
-/// Every source, at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationError {
+    WrongSource,
+    RevisionExhausted,
+    ContentMismatch,
+}
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WrongSource => "previous observation belongs to another source",
+            Self::RevisionExhausted => "source revision counter exhausted",
+            Self::ContentMismatch => "source nodes changed without changing their content identity",
+        })
+    }
+}
+impl std::error::Error for ObservationError {}
+
+/// Every source, at one moment, not a partial source update. A running store
+/// retains observed source revisions: remove a source's contributions with an
+/// empty SourceSnapshot at a newer revision, not by omitting the source.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     sources: BTreeMap<SourceId, SourceSnapshot>,
@@ -59,6 +99,33 @@ impl Snapshot {
 
     pub fn insert(&mut self, snapshot: SourceSnapshot) {
         self.sources.insert(snapshot.source.clone(), snapshot);
+    }
+
+    /// Compose one trusted frontend observation without overwriting other sources.
+    /// `None` expects an unseen source, not an unconditional update. An empty
+    /// node list is a retained tombstone, not removal of the source's revision.
+    ///
+    /// The host must serialize access to this snapshot and authorize the source
+    /// before calling. Independent clones do not share a CAS: publishing still
+    /// requires the generation store's whole-version check. Content identity must
+    /// cover every semantic input, as required by `SourceSnapshot::observe`.
+    pub fn observe_if(
+        &mut self,
+        source: SourceId,
+        expected: Option<SourceRev>,
+        content: Fingerprint,
+        nodes: Vec<Node>,
+    ) -> Result<SourceRev, SourceUpdateError> {
+        let previous = self.get(&source);
+        let actual = previous.map(|previous| previous.rev);
+        if actual != expected {
+            return Err(SourceUpdateError::Conflict { expected, actual });
+        }
+        let observed = SourceSnapshot::observe(source, content, nodes, previous)
+            .map_err(SourceUpdateError::Observation)?;
+        let revision = observed.rev;
+        self.insert(observed);
+        Ok(revision)
     }
 
     pub fn get(&self, source: &SourceId) -> Option<&SourceSnapshot> {
@@ -92,6 +159,29 @@ impl Snapshot {
         )
     }
 }
+
+/// A rejected local composition; the snapshot was not changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceUpdateError {
+    Conflict {
+        expected: Option<SourceRev>,
+        actual: Option<SourceRev>,
+    },
+    Observation(ObservationError),
+}
+
+impl std::fmt::Display for SourceUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict { expected, actual } => write!(
+                f,
+                "source revision conflict: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::Observation(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for SourceUpdateError {}
 
 /// The revision of every source at the moment a candidate started.
 ///
@@ -150,6 +240,78 @@ mod tests {
     use crate::hash::Hasher;
     use crate::origin::Origin;
 
+    #[test]
+    fn conditional_composition_preserves_other_sources_and_tombstone_versions() {
+        let file = snapshot_for(SourceId::file("main"), 4, &["file"]);
+        let admin = snapshot_for(SourceId::admin(), 99, &["admin"]);
+        let mut inputs = Snapshot::new().with(file.clone());
+        assert_eq!(
+            inputs.observe_if(admin.source.clone(), None, admin.content, admin.nodes.clone()),
+            Ok(SourceRev(1))
+        );
+        assert_eq!(inputs.get(&file.source).unwrap().rev, file.rev);
+        assert_eq!(inputs.get(&file.source).unwrap().content, file.content);
+        let before = inputs.revs();
+        assert!(matches!(
+            inputs.observe_if(admin.source.clone(), None, admin.content, vec![]),
+            Err(SourceUpdateError::Conflict { .. })
+        ));
+        assert_eq!(inputs.revs(), before);
+        assert_eq!(inputs.get(&admin.source).unwrap().nodes.len(), 1);
+        assert_eq!(
+            inputs.observe_if(
+                admin.source.clone(),
+                Some(SourceRev(1)),
+                admin.content,
+                admin.nodes
+            ),
+            Ok(SourceRev(1))
+        );
+        let empty = snapshot_for(admin.source.clone(), 0, &[]);
+        assert_eq!(
+            inputs.observe_if(admin.source.clone(), Some(SourceRev(1)), empty.content, vec![]),
+            Ok(SourceRev(2))
+        );
+        assert!(inputs.get(&admin.source).unwrap().nodes.is_empty());
+        assert!(matches!(
+            inputs.observe_if(admin.source, None, empty.content, vec![]),
+            Err(SourceUpdateError::Conflict {
+                actual: Some(SourceRev(2)),
+                ..
+            })
+        ));
+        assert_eq!(inputs.get(&file.source).unwrap().nodes[0].name, "file");
+    }
+
+    #[test]
+    fn conditional_composition_exhaustion_is_atomic_and_no_op_still_works() {
+        let original = snapshot_for(SourceId::admin(), u64::MAX, &["original"]);
+        let changed = snapshot_for(SourceId::admin(), 1, &["changed"]);
+        let mut inputs = Snapshot::new().with(original.clone());
+        assert_eq!(
+            inputs.observe_if(
+                original.source.clone(),
+                Some(original.rev),
+                changed.content,
+                changed.nodes
+            ),
+            Err(SourceUpdateError::Observation(
+                ObservationError::RevisionExhausted
+            ))
+        );
+        assert_eq!(inputs.get(&original.source).unwrap().content, original.content);
+        assert_eq!(inputs.get(&original.source).unwrap().nodes[0].name, "original");
+        assert_eq!(
+            inputs.observe_if(
+                original.source,
+                Some(original.rev),
+                original.content,
+                original.nodes
+            ),
+            Ok(SourceRev(u64::MAX))
+        );
+    }
+
     fn snapshot_for(source: SourceId, rev: u64, names: &[&str]) -> SourceSnapshot {
         let mut hasher = Hasher::new();
         for name in names {
@@ -164,6 +326,28 @@ mod tests {
                 .map(|name| Node::new(*name, Origin::synthetic("test")))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn observation_checks_identity_and_revision_exhaustion() {
+        let source = SourceId::file("main");
+        let first = snapshot_for(source.clone(), u64::MAX, &["a"]);
+        let changed = snapshot_for(source.clone(), 1, &["b"]);
+        assert_eq!(SourceRev(u64::MAX).next(), None);
+        assert_eq!(SourceRev::ZERO.next(), Some(SourceRev(1)));
+        let unchanged =
+            SourceSnapshot::observe(source.clone(), first.content, first.nodes.clone(), Some(&first))
+                .unwrap();
+        assert_eq!(unchanged.rev, SourceRev(u64::MAX));
+        assert!(matches!(
+            SourceSnapshot::observe(source, changed.content, changed.nodes, Some(&first)),
+            Err(ObservationError::RevisionExhausted)
+        ));
+        assert!(matches!(
+            SourceSnapshot::observe(SourceId::admin(), first.content, vec![], Some(&first)),
+            Err(ObservationError::WrongSource)
+        ));
+        assert_eq!(first.rev, SourceRev(u64::MAX));
     }
 
     #[test]

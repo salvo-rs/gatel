@@ -243,7 +243,8 @@ fn compile_site(site: &Site) -> SitePlan {
             // here once rather than consulted per request.
             let mut chain = site.directives.clone();
             chain.extend(route.directives.iter().cloned());
-            chain.sort_by_key(DirectiveInstance::sort_key);
+            let chain =
+                crate::ordering::order_route(chain, &route.terminal).expect("normalized plugin composition");
             RoutePlan {
                 id: route.id.clone(),
                 path: route.path.clone(),
@@ -255,7 +256,7 @@ fn compile_site(site: &Site) -> SitePlan {
         })
         .collect();
     let mut fallback = site.directives.clone();
-    fallback.sort_by_key(DirectiveInstance::sort_key);
+    fallback = crate::ordering::order_chain(fallback).expect("normalized fallback composition");
     SitePlan {
         id: site.id.clone(),
         host: site.host.clone(),
@@ -527,6 +528,24 @@ mod tests {
         assert!(
             !kinds.contains(&StateKind::Health),
             "health is only bound when configured"
+        );
+    }
+
+    #[test]
+    fn ownership_transfer_changes_publication_but_not_transport_compatibility() {
+        let registry = registry();
+        let mut resource = upstream("api", &["127.0.0.1:1"], Default::default());
+        let before = compile(spec_with(vec![resource.clone()]), &registry);
+        resource.owner = SourceId::file("replacement");
+        let after = compile(spec_with(vec![resource]), &registry);
+        assert_ne!(before.spec_hash(), after.spec_hash());
+        assert_ne!(before.plan_hash(), after.plan_hash());
+        let changes = diff_bindings(&before.bindings, &after.bindings);
+        assert!(!changes.is_empty());
+        assert!(
+            changes
+                .iter()
+                .all(|change| matches!(change, BindingChange::Reuse(_)))
         );
     }
 

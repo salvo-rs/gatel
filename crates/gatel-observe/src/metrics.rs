@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::instrument::{Counter, Gauge, Histogram};
+use crate::instrument::{Counter, Gauge, HighWaterMark, Histogram};
 use crate::series::{Labels, Series};
 
 /// The class of a response status.
@@ -158,7 +158,8 @@ impl Condition {
 /// Counters and gauges that belong to the process rather than to any resource.
 #[derive(Debug, Default)]
 pub struct Process {
-    pub generation: Gauge,
+    /// One store/boot per Process: do not reuse this watermark for a new store.
+    pub generation: HighWaterMark,
     reloads: [Counter; Reload::ALL.len()],
     /// Unix seconds. Zero until a configuration has been accepted, which is how
     /// an alert tells "never started" from "has not reloaded lately".

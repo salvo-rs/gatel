@@ -1,11 +1,22 @@
 //! Lowering KDL syntax into the format-neutral node tree.
 //!
-//! This is the only place in Gatel that knows KDL exists. Everything after it
+//! This frontend is the only layer in Gatel that knows KDL exists. Everything after it
 //! sees [`gatel_model::Node`], which is why the Admin API and a future
 //! Kubernetes frontend reuse every decoder unchanged.
 
 use gatel_model::{Code, Diagnostic, Diagnostics, Node, Origin, Property, Scalar, Span, Value};
 use kdl::{KdlDocument, KdlNode, KdlValue};
+
+/// KDL v2's eight newline sequences. CRLF is a single line ending.
+fn newline_len(bytes: &[u8]) -> usize {
+    match bytes {
+        [b'\r', b'\n', ..] => 2,
+        [b'\r' | b'\n' | 0x0b | 0x0c, ..] => 1,
+        [0xc2, 0x85, ..] => 2,
+        [0xe2, 0x80, 0xa8 | 0xa9, ..] => 3,
+        _ => 0,
+    }
+}
 
 /// Maps byte offsets to line and column, computed once per file.
 pub struct LineIndex {
@@ -15,7 +26,16 @@ pub struct LineIndex {
 impl LineIndex {
     pub fn new(text: &str) -> Self {
         let mut starts = vec![0];
-        starts.extend(text.match_indices('\n').map(|(index, _)| index + 1));
+        let mut at = 0;
+        while at < text.len() {
+            let length = newline_len(&text.as_bytes()[at..]);
+            if length == 0 {
+                at += 1;
+            } else {
+                at += length;
+                starts.push(at);
+            }
+        }
         Self { starts }
     }
 
@@ -32,6 +52,17 @@ impl LineIndex {
 /// diagnostic raised twelve layers later still knows the line and column.
 pub fn lower(text: &str, file: &str) -> Result<Vec<Node>, Diagnostics> {
     let index = LineIndex::new(text);
+    let document = parse(text, file)?;
+    Ok(document
+        .nodes()
+        .iter()
+        .map(|node| lower_node(node, file, &index))
+        .collect())
+}
+
+/// Shared guarded syntax entry point for lowering and formatting.
+pub(crate) fn parse(text: &str, file: &str) -> Result<KdlDocument, Diagnostics> {
+    let index = LineIndex::new(text);
 
     // Checked before parsing, not after. The KDL parser is recursive, and a
     // file nested deep enough exhausts the stack — which aborts the process
@@ -45,9 +76,9 @@ pub fn lower(text: &str, file: &str) -> Result<Vec<Node>, Diagnostics> {
             Diagnostic::error(
                 Code::SyntaxError,
                 Origin::file(file.to_string(), index.span(offset, 1)),
-                format!("nesting is deeper than {MAX_NESTING} levels"),
+                format!("nesting is deeper than {MAX_NESTING} levels (nodes or disable markers) or a block comment exceeds {MAX_COMMENT_STEPS} parser steps"),
             )
-            .with_help("a real configuration nests about five deep; this is usually an unclosed `{`"),
+            .with_help("reduce nesting or split complex block comments into line comments"),
         );
         return Err(diagnostics);
     }
@@ -79,11 +110,7 @@ pub fn lower(text: &str, file: &str) -> Result<Vec<Node>, Diagnostics> {
             return Err(diagnostics);
         }
     };
-    Ok(document
-        .nodes()
-        .iter()
-        .map(|node| lower_node(node, file, &index))
-        .collect())
+    Ok(document)
 }
 
 fn lower_node(node: &KdlNode, file: &str, index: &LineIndex) -> Node {
@@ -140,22 +167,30 @@ fn lower_value(value: &KdlValue) -> Scalar {
 /// it is a guard on the machine, not a limit on expression.
 pub const MAX_NESTING: usize = 16;
 
-/// The offset of the brace that goes past [`MAX_NESTING`], if there is one.
+// The dependency also recursively parses successive fragments inside one
+// block comment, not just nested comments. Bound total fragments conservatively.
+const MAX_COMMENT_STEPS: usize = 64;
+
+/// The offset at which a known recursive syntax budget is exceeded.
 ///
-/// A scanner rather than a parser: it only has to know where a `{` is *not* a
-/// brace, which means strings and comments. Anything it gets wrong it gets
-/// wrong by counting too much, so it can refuse a file the parser would have
-/// survived — never the reverse.
+/// This is a conservative pre-parser guard, not a complete KDL grammar. Keep
+/// its string/comment/newline rules aligned with the locked parser dependency;
+/// tests cover known recursive paths, not a proof that no other path exists.
 fn too_deep(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut at = 0;
     let mut depth = 0usize;
+    let mut disable_markers = 0usize;
 
     while at < bytes.len() {
         match bytes[at] {
-            b'"' => at = skip_string(bytes, at, 0),
+            b'"' => {
+                disable_markers = 0;
+                at = skip_string(bytes, at, 0);
+            }
             // `#"…"#` raw strings, and `#true` / `#null`, which are not.
             b'#' => {
+                disable_markers = 0;
                 let mut hashes = 0;
                 while at + hashes < bytes.len() && bytes[at + hashes] == b'#' {
                     hashes += 1;
@@ -168,12 +203,25 @@ fn too_deep(text: &str) -> Option<usize> {
             }
             b'/' if bytes.get(at + 1) == Some(&b'/') => {
                 at += 2;
-                while at < bytes.len() && bytes[at] != b'\n' {
+                while at < bytes.len() && newline_len(&bytes[at..]) == 0 {
                     at += 1;
                 }
             }
-            b'/' if bytes.get(at + 1) == Some(&b'*') => at = skip_block_comment(bytes, at),
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at = match skip_block_comment(bytes, at) {
+                    Ok(end) => end,
+                    Err(offset) => return Some(offset),
+                };
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'-') => {
+                disable_markers += 1;
+                if depth + disable_markers > MAX_NESTING {
+                    return Some(at);
+                }
+                at += 2;
+            }
             b'{' => {
+                disable_markers = 0;
                 depth += 1;
                 if depth > MAX_NESTING {
                     return Some(at);
@@ -181,10 +229,19 @@ fn too_deep(text: &str) -> Option<usize> {
                 at += 1;
             }
             b'}' => {
+                disable_markers = 0;
                 depth = depth.saturating_sub(1);
                 at += 1;
             }
-            _ => at += 1,
+            _ => {
+                // Whitespace, comments and escaped newlines may separate /-
+                // prefixes without unwinding the dependency's entry parser.
+                let ch = text[at..].chars().next().unwrap();
+                if !ch.is_whitespace() && !matches!(ch, '\\' | '\u{feff}') {
+                    disable_markers = 0;
+                }
+                at += ch.len_utf8();
+            }
         }
     }
     None
@@ -213,12 +270,12 @@ fn skip_string(bytes: &[u8], at: usize, hashes: usize) -> usize {
         if bytes[at] == b'"' && bytes[at..].len() >= quotes {
             let after = at + quotes;
             if bytes[at..after].iter().all(|byte| *byte == b'"')
+                // Fail on the first mismatch. Counting hashes across the
+                // entire suffix made every embedded quote scan `hashes`
+                // bytes, even when the first following byte was not '#'.
                 && bytes[after..]
-                    .iter()
-                    .take(hashes)
-                    .filter(|byte| **byte == b'#')
-                    .count()
-                    == hashes
+                    .get(..hashes)
+                    .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
             {
                 return after + hashes;
             }
@@ -229,26 +286,145 @@ fn skip_string(bytes: &[u8], at: usize, hashes: usize) -> usize {
 }
 
 /// Move past a block comment, which KDL allows to nest.
-fn skip_block_comment(bytes: &[u8], at: usize) -> usize {
+fn skip_block_comment(bytes: &[u8], at: usize) -> Result<usize, usize> {
     let mut at = at + 2;
     let mut open = 1usize;
+    let mut steps = 0;
     while at < bytes.len() && open > 0 {
+        steps += 1;
+        if steps > MAX_COMMENT_STEPS {
+            return Err(at);
+        }
         if bytes[at..].starts_with(b"/*") {
             open += 1;
+            if open > MAX_NESTING {
+                return Err(at);
+            }
             at += 2;
         } else if bytes[at..].starts_with(b"*/") {
             open -= 1;
             at += 2;
-        } else {
+        } else if matches!(bytes[at], b'/' | b'*') {
             at += 1;
+        } else {
+            // The parser consumes a run of non-delimiter bytes in one step.
+            while at < bytes.len() && !matches!(bytes[at], b'/' | b'*') {
+                at += 1;
+            }
         }
     }
-    at
+    Ok(at)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_raw_delimiters_and_many_false_endings_keep_the_real_boundary() {
+        let hashes = "#".repeat(2048);
+        let source = format!("node {hashes}\"x{}\"{hashes}\n", "\"x".repeat(16_384));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            skip_string(source.as_bytes(), 5 + hashes.len(), hashes.len()),
+            source.len() - 1
+        );
+        eprintln!("raw delimiter scanner fixture: {:?}", start.elapsed());
+        let deep = format!(
+            "{source}{}{}",
+            "node {".repeat(MAX_NESTING + 1),
+            "}".repeat(MAX_NESTING + 1)
+        );
+        assert_eq!(too_deep(&deep), Some(source.len() + 6 * MAX_NESTING + 5));
+    }
+
+    #[test]
+    fn incomplete_raw_suffix_cannot_close_a_string() {
+        for text in ["\"x\"##", "\"x\"#x#"] {
+            assert_eq!(skip_string(text.as_bytes(), 0, 3), text.len());
+        }
+        let text = "\"x\"#x#\"###suffix";
+        assert_eq!(skip_string(text.as_bytes(), 0, 3), text.len() - "suffix".len());
+    }
+
+    #[test]
+    fn nested_disable_markers_are_rejected_before_recursive_parsing() {
+        for separator in [" ", "\n", "\r", "\u{2003}", "/* note */", "// note\n", "\\\n"] {
+            let source = format!("node {}1\n", format!("/-{separator}").repeat(MAX_NESTING + 1));
+            assert!(too_deep(&source).is_some(), "separator {separator:?}");
+            assert!(lower(&source, "disabled.kdl").is_err());
+        }
+    }
+
+    #[test]
+    fn independent_disabled_entries_and_marker_text_are_not_recursive_prefixes() {
+        let source = format!("node {}\"active\"\n", "/- 1 ".repeat(100));
+        assert!(lower(&source, "independent.kdl").is_ok());
+        for source in [
+            format!("node \"{}\"\n", "/- ".repeat(100)),
+            format!("node #\"{}\"#\n", "/- ".repeat(100)),
+            format!("// {}\nnode\n", "/- ".repeat(100)),
+        ] {
+            assert!(lower(&source, "text.kdl").is_ok());
+        }
+    }
+
+    #[test]
+    fn every_kdl_line_ending_stops_line_comments_before_depth_scanning() {
+        for newline in [
+            "\n", "\r\n", "\r", "\u{000b}", "\u{000c}", "\u{0085}", "\u{2028}", "\u{2029}",
+        ] {
+            let prefix = format!("// comment{newline}");
+            let source = format!(
+                "{prefix}{}{}",
+                "node {".repeat(MAX_NESTING + 1),
+                "}".repeat(MAX_NESTING + 1)
+            );
+            assert_eq!(
+                too_deep(&source),
+                Some(prefix.len() + 6 * MAX_NESTING + 5),
+                "newline {newline:?}"
+            );
+            assert!(lower(&source, "deep.kdl").is_err());
+            let valid = format!("{prefix}node \"value\"{newline}");
+            let nodes = lower(&valid, "valid.kdl").unwrap();
+            assert_eq!(nodes.len(), 1);
+            let span = nodes[0].origin.span().unwrap();
+            assert_eq!((span.line, span.column), (2, 1), "newline {newline:?}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_comments_are_rejected_by_the_preparse_guard() {
+        let text = format!(
+            "{}x{}\n",
+            "/*".repeat(MAX_NESTING + 1),
+            "*/".repeat(MAX_NESTING + 1)
+        );
+        // Exercise only the scanner before the fix: sending arbitrary depths
+        // to the recursive dependency parser could abort the test process.
+        assert_eq!(too_deep(&text), Some(2 * MAX_NESTING));
+        assert!(lower(&text, "nested-comments.kdl").is_err());
+    }
+
+    #[test]
+    fn flat_comment_fragments_are_bounded_but_long_plain_comments_are_allowed() {
+        for fragment in ["*", "/", "a*b/"] {
+            let text = format!("/* {} */\nnode\n", fragment.repeat(MAX_COMMENT_STEPS + 1));
+            assert!(too_deep(&text).is_some());
+            assert!(lower(&text, "comment.kdl").is_err());
+        }
+        for text in [
+            format!("/* {} */\nnode\n", "ordinary text ".repeat(10_000)),
+            format!(
+                "{}x{}\nnode\n",
+                "/*".repeat(MAX_NESTING),
+                "*/".repeat(MAX_NESTING)
+            ),
+        ] {
+            assert!(lower(&text, "comment.kdl").is_ok());
+        }
+    }
 
     #[test]
     fn positions_are_one_based_lines_and_columns() {

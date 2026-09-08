@@ -6,16 +6,16 @@
 //! reported rather than guessed at.
 
 use gatel_model::{
-    Code, Diagnostic, Diagnostics, Node, Origin, ResourceId, ResourceKind, Snapshot, SourceId, Value,
-    did_you_mean,
+    Code, Diagnostic, Diagnostics, Node, Origin, ResourceId, ResourceKind, Snapshot, SourceId, did_you_mean,
 };
 
 use crate::directive::{Registry, Scope};
 use crate::matcher::{HostMatch, MethodMatch, PathMatch, parse_match_node};
 use crate::spec::{Global, Listener, Route, Site, Spec, Terminal};
-use crate::upstream::{Upstream, anonymous_upstream_id, decode_upstream_body};
+use crate::upstream::Upstream;
 
 mod global;
+mod proxy;
 mod tls;
 mod validate;
 
@@ -38,6 +38,16 @@ pub fn normalize(snapshot: &Snapshot, registry: &Registry) -> Result<Spec, Diagn
     let mut upstreams: Vec<Upstream> = Vec::new();
 
     for (owner, node) in snapshot.nodes() {
+        // Namespaced runtime sources may contribute resources, not replace
+        // process-wide listeners, limits, logging or certificate authority.
+        if node.name == "global" && owner.kind() != gatel_model::SourceKind::File {
+            context.diagnostics.error(
+                Code::OwnershipConflict,
+                node.origin.clone(),
+                "only file sources may declare global host configuration",
+            );
+            continue;
+        }
         match node.name.as_str() {
             "global" => match &global {
                 Some((_, _, first)) => context.diagnostics.push(
@@ -110,6 +120,22 @@ pub fn normalize(snapshot: &Snapshot, registry: &Registry) -> Result<Spec, Diagn
     check_uniqueness(&spec, &mut diagnostics);
     check_references(&spec, &mut diagnostics);
     sort_routes(&mut spec);
+    for site in &spec.sites {
+        if let Err(errors) = crate::ordering::order_chain(site.directives.clone()) {
+            for error in errors.iter() {
+                diagnostics.push(error.clone());
+            }
+        }
+        for route in &site.routes {
+            let mut chain = site.directives.clone();
+            chain.extend(route.directives.iter().cloned());
+            if let Err(errors) = crate::ordering::order_route(chain, &route.terminal) {
+                for error in errors.iter() {
+                    diagnostics.push(error.clone());
+                }
+            }
+        }
+    }
 
     if diagnostics.has_errors() {
         Err(diagnostics.sorted())
@@ -201,7 +227,7 @@ impl Context<'_> {
                 let mut parts = vec![host.describe()];
                 parts.extend(listeners.iter().cloned());
                 let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-                ResourceId::derived(ResourceKind::Site, &refs)
+                ResourceId::derived_owned(ResourceKind::Site, owner, &refs)
             }
         };
 
@@ -373,7 +399,7 @@ impl Context<'_> {
             }
         }
 
-        let terminal = match terminals.len() {
+        let mut terminal = match terminals.len() {
             1 => terminals.pop().map(|(terminal, _)| terminal)?,
             // A terminal that failed to decode already said why, and saying
             // there is none on top of that buries the reason.
@@ -415,21 +441,32 @@ impl Context<'_> {
                 }
                 ResourceId::new(ResourceKind::Route, name)
             }
-            None => ResourceId::derived(
-                ResourceKind::Route,
-                &[
-                    site.name(),
-                    &host.describe(),
-                    &methods.describe(),
-                    &path.describe(),
-                ],
-            ),
+            None => {
+                let mut parts = vec![
+                    site.name().to_string(),
+                    host.describe(),
+                    methods.describe(),
+                    path.describe(),
+                ];
+                if !matchers.is_empty() {
+                    let mut hash = gatel_model::Hasher::new();
+                    hash.update_str("route-matchers-v1");
+                    hash.update_unordered(&matchers, |matcher, hash| matcher.hash_into(hash));
+                    parts.push(hash.finish().to_string());
+                }
+                let refs: Vec<_> = parts.iter().map(String::as_str).collect();
+                ResourceId::derived_owned(ResourceKind::Route, owner, &refs)
+            }
         };
 
         reject_duplicate_directives(&directives, self.diagnostics);
         directives.sort_by_key(crate::directive::DirectiveInstance::sort_key);
         for directive in &mut directives {
             directive.own(&id);
+        }
+
+        if let Terminal::Directive(instance) = &mut terminal {
+            instance.own(&id);
         }
 
         if self.diagnostics.error_count() > errors_before {
@@ -444,112 +481,5 @@ impl Context<'_> {
             terminal,
             origin: node.origin.clone(),
         })
-    }
-
-    /// `proxy` in its three forms: an address, a named upstream, or an inline
-    /// upstream body. All three end up as an `Upstream` resource, so there is
-    /// only one code path downstream.
-    fn proxy(
-        &mut self,
-        node: &Node,
-        site: &ResourceId,
-        owner: &SourceId,
-        upstreams: &mut Vec<Upstream>,
-    ) -> Option<Terminal> {
-        let named = node.prop("upstream");
-        let inline_address = node.args.first();
-
-        if named.is_some() && inline_address.is_some() {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    Code::InvalidValue,
-                    node.origin.clone(),
-                    "`proxy` takes either an address or `upstream=`, not both",
-                )
-                .with_help(
-                    "an inline address defines a private upstream; `upstream=` refers to a shared one",
-                ),
-            );
-            return None;
-        }
-
-        if let Some(property) = named {
-            let Some(name) = property.value.as_str() else {
-                self.error(Code::InvalidValue, &property.origin, "`upstream` must be a name");
-                return None;
-            };
-            if !node.children.is_empty() {
-                self.error(
-                    Code::UnknownNode,
-                    &node.children[0].origin,
-                    "`proxy upstream=` refers to an upstream declared elsewhere; it takes no body",
-                );
-                return None;
-            }
-            return Some(Terminal::Proxy {
-                upstream: ResourceId::new(ResourceKind::Upstream, name),
-            });
-        }
-
-        // An inline address is shorthand for a one-endpoint body, so the two
-        // forms share their entire decoder.
-        let body = match inline_address {
-            Some(value) => {
-                let Some(address) = value.as_str() else {
-                    self.error(
-                        Code::InvalidValue,
-                        &value.origin,
-                        "`proxy` takes an address string",
-                    );
-                    return None;
-                };
-                if !node.children.is_empty() {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            Code::InvalidValue,
-                            node.children[0].origin.clone(),
-                            "`proxy` takes either an inline address or a body",
-                        )
-                        .with_help("move the address into an `endpoint` node inside the body"),
-                    );
-                    return None;
-                }
-                let mut synthetic = Node::new("proxy", node.origin.clone());
-                synthetic.children.push(
-                    Node::new("endpoint", value.origin.clone())
-                        .with_arg(Value::string(address, value.origin.clone())),
-                );
-                synthetic
-            }
-            None => {
-                if node.children.is_empty() {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            Code::ArgumentCount,
-                            node.origin.clone(),
-                            "`proxy` needs an address, `upstream=`, or a body",
-                        )
-                        .with_help("`proxy \"127.0.0.1:9000\"` is the short form"),
-                    );
-                    return None;
-                }
-                node.clone()
-            }
-        };
-
-        let addresses: Vec<String> = body
-            .children_named("endpoint")
-            .filter_map(|child| child.args.first().and_then(|value| value.as_str()))
-            .map(str::to_string)
-            .collect();
-        let id = anonymous_upstream_id(site, &addresses);
-        let upstream = decode_upstream_body(&body, id.clone(), owner.clone(), self.diagnostics)?;
-
-        // Two routes proxying to the same address share one upstream, and so
-        // share its pool and health state instead of competing.
-        if !upstreams.iter().any(|existing| existing.id == id) {
-            upstreams.push(upstream);
-        }
-        Some(Terminal::Proxy { upstream: id })
     }
 }

@@ -27,6 +27,13 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+socket2 = "0.6"
+gatel-decode = { path = "../../plugins/decode" }
+async-compression.workspace = true
+gatel-cgi-http.workspace = true
+gatel-cgi = { path = "../../plugins/cgi" }
+gatel-scgi = { path = "../../plugins/scgi" }
+gatel-fastcgi = { path = "../../plugins/fastcgi" }
 bcrypt.workspace = true
 # `start_paused` lets the watchdog tests run in milliseconds rather than minutes.
 tokio = { workspace = true, features = ["test-util"] }
@@ -40,3 +47,8 @@ tokio-rustls.workspace = true
 # A certificate authority small enough to run in a test needs to read JWS.
 base64 = "0.23"
 serde_json.workspace = true
+
+[[test]]
+name = "cgi_process"
+path = "tests/cgi_process.rs"
+harness = false

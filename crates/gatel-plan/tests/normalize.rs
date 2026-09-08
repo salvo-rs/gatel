@@ -12,6 +12,18 @@ use gatel_plan::{
 };
 use salvo_core::Handler;
 
+#[path = "support/source_permissions.rs"]
+mod source_permissions;
+
+#[path = "support/inline_policy.rs"]
+mod inline_policy;
+
+#[path = "support/route_matching.rs"]
+mod route_matching;
+
+#[path = "support/upstream_shape.rs"]
+mod upstream_shape;
+
 // A stand-in for the standard bundle: enough directives to exercise scopes,
 // phases and terminals without depending on their real implementations.
 struct Stub(DirectiveMeta);
@@ -285,40 +297,6 @@ site "*" {
         .map(|route| route.path.describe())
         .collect();
     assert_eq!(paths, ["/api/v1/users", "/api/*", "/*"]);
-}
-
-#[test]
-fn two_routes_matching_the_same_requests_are_rejected() {
-    let diagnostics = errors(
-        r#"
-global { http ":8080" }
-site "*" {
-    route "/api/*" { respond "a" }
-    route "/api/*" { respond "b" }
-}
-"#,
-    );
-    let diagnostic = diagnostics.iter().find(|d| d.code == Code::Duplicate).unwrap();
-    assert!(diagnostic.message.contains("exactly the same requests"));
-}
-
-#[test]
-fn a_match_condition_makes_two_routes_distinguishable() {
-    let spec = spec(
-        r#"
-global { http ":8080" }
-site "*" {
-    route "/api/*" {
-        match header="x-canary=1"
-        respond "canary"
-    }
-    route "/api/*" { respond "stable" }
-}
-"#,
-    );
-    assert_eq!(spec.sites[0].routes.len(), 2);
-    // The one with an extra condition is tried first.
-    assert_eq!(spec.sites[0].routes[0].matchers.len(), 1);
 }
 
 #[test]
@@ -658,6 +636,9 @@ site "*" {
     assert!(diagnostics.error_count() >= 2, "got {}", diagnostics);
 }
 
+#[path = "support/blocking_normalize.rs"]
+mod blocking_tests;
+
 #[test]
 fn global_limits_are_configuration_not_constants() {
     let spec = spec(
@@ -666,6 +647,7 @@ global {
     http ":8080"
     limits header="8KiB" body="1MiB" handshake-timeout="5s" idle="30s" connections=500
 }
+
 site "*" { route "/" { respond "hi" } }
 "#,
     );

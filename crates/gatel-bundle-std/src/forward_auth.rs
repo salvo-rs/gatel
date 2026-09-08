@@ -27,7 +27,7 @@ use std::sync::Arc;
 use gatel_macros::FromNode;
 use gatel_model::{Code, Diagnostics, FromNode as _, Hasher, Node, ResourceId, ResourceKind};
 use gatel_plan::{
-    Answer, Ask, BuildContext, Directive, DirectiveConfig, DirectiveMeta, Phase, Scopes, SharedUpstreams,
+    Answer, Ask, BuildContext, Directive, DirectiveConfig, DirectiveMeta, Phase, Scopes, UpstreamHandle,
 };
 use salvo_core::http::{HeaderMap, Request, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
@@ -110,7 +110,6 @@ impl DirectiveConfig for Config {
             // request could find a different one than the generation it belongs
             // to was compiled against.
             upstreams: cx.upstream(&self.upstream)?,
-            upstream: self.upstream.clone(),
             path: self.path.clone(),
             forward: self.forward.clone(),
             copy: self.copy.clone(),
@@ -128,8 +127,9 @@ impl Directive for ForwardAuth {
     fn meta(&self) -> &DirectiveMeta {
         // A guard, and a late one: rate limits and address filters are cheaper
         // than a round trip to another service, so they get to refuse first.
-        static META: DirectiveMeta =
-            DirectiveMeta::middleware("forward-auth", Phase::Guard, Scopes::BOTH).with_order(50);
+        static META: DirectiveMeta = DirectiveMeta::middleware("forward-auth", Phase::Guard, Scopes::BOTH)
+            .with_order(50)
+            .with_effects(&[gatel_plan::Effect::CallUpstream]);
         &META
     }
 
@@ -160,8 +160,7 @@ impl Directive for ForwardAuth {
 }
 
 struct ForwardAuthHandler {
-    upstreams: SharedUpstreams,
-    upstream: ResourceId,
+    upstreams: UpstreamHandle,
     path: String,
     forward: Vec<String>,
     copy: Vec<String>,
@@ -257,7 +256,7 @@ impl Handler for ForwardAuthHandler {
         ctrl: &mut FlowCtrl,
     ) {
         let ask = self.question(request, depot);
-        let answer = match self.upstreams.ask(&self.upstream, ask).await {
+        let answer = match self.upstreams.ask(ask).await {
             Ok(answer) => answer,
             Err(error) => {
                 // An authoriser that cannot be reached is a refusal, not a
@@ -266,7 +265,7 @@ impl Handler for ForwardAuthHandler {
                 tracing::warn!(
                     target: "gatel::directive",
                     event = "forward_auth_unreachable",
-                    upstream = self.upstream.name(),
+                    upstream = self.upstreams.id().name(),
                     detail = %error,
                 );
                 crate::generated(depot);
@@ -350,8 +349,7 @@ mod tests {
 
     fn handler(config: &Config) -> ForwardAuthHandler {
         ForwardAuthHandler {
-            upstreams: Arc::new(NoUpstreams),
-            upstream: config.upstream.clone(),
+            upstreams: UpstreamHandle::new(Arc::new(NoUpstreams), config.upstream.clone()),
             path: config.path.clone(),
             forward: config.forward.clone(),
             copy: config.copy.clone(),

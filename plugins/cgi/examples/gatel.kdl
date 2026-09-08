@@ -1,0 +1,9 @@
+// Windows, built with --features cgi. Supply a real CGI .exe in this directory.
+global {
+    http "127.0.0.1:8080"
+}
+site "*" {
+    route "/*" {
+        cgi "app.exe" root="." script="app.exe" script-name="/app" concurrency=16 process-limit=64 timeout=30
+    }
+}

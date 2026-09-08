@@ -417,6 +417,10 @@ impl ProxyTerminal {
                     client_upgrade,
                     in_flight,
                     &endpoint.id,
+                    request
+                        .extensions()
+                        .get::<crate::connection_work::ConnectionWork>()
+                        .cloned(),
                 );
                 return Ok(attempt);
             }

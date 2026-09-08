@@ -37,6 +37,32 @@ pub(super) fn reject_duplicate_directives(
 }
 
 pub(super) fn check_uniqueness(spec: &Spec, diagnostics: &mut Diagnostics) {
+    let mut site_ids = BTreeMap::new();
+    let mut route_ids = BTreeMap::new();
+    for site in &spec.sites {
+        if let Some(first) = site_ids.insert(&site.id, &site.origin) {
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::Duplicate,
+                    site.origin.clone(),
+                    "site resource ID is declared more than once",
+                )
+                .with_related("first declared here", first.clone()),
+            );
+        }
+        for route in &site.routes {
+            if let Some(first) = route_ids.insert(&route.id, &route.origin) {
+                diagnostics.push(
+                    Diagnostic::error(
+                        Code::Duplicate,
+                        route.origin.clone(),
+                        "route resource ID is declared more than once across the configuration",
+                    )
+                    .with_related("first declared here", first.clone()),
+                );
+            }
+        }
+    }
     let mut listener_names: BTreeMap<&str, &Origin> = BTreeMap::new();
     let mut binds: BTreeMap<SocketAddr, &Origin> = BTreeMap::new();
     for listener in &spec.listeners {

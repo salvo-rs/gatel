@@ -38,6 +38,57 @@ fn basic(name: &str, password: &str) -> String {
 }
 
 #[tokio::test]
+async fn malformed_or_expensive_hashes_reject_prepare_and_preserve_authentication() {
+    let gateway = Gateway::new("auth-cost-bound");
+    let port = free_port();
+    let good = write_hash(&gateway, "good", "fixture");
+    let config = |reference: &str| {
+        format!(
+            r#"
+global {{ http "127.0.0.1:{port}"; }}
+site "*" {{ route "/*" {{
+ basic-auth {{ user "admin" hash="{reference}"; }}
+ respond "protected";
+}} }}"#
+        )
+    };
+    assert!(matches!(
+        gateway.apply(&config(&good)).await,
+        gatel_plan::Outcome::Started { .. }
+    ));
+    let hash = bcrypt::hash("fixture", 4).unwrap();
+    for (index, invalid) in [
+        hash.replacen("$04$", "$31$", 1),
+        hash.replacen("$04$", "$03$", 1),
+        format!("$2b$04$!{}", &hash[8..]),
+        format!(" {hash}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let filename = format!("invalid-{index}.hash");
+        write_key(&gateway.directory.join(&filename), &invalid);
+        let outcome = gateway.apply(&config(&filename)).await;
+        assert!(
+            matches!(outcome, gatel_plan::Outcome::PrepareFailed(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(gateway.store.status().generation.number(), 1);
+        let response = request(
+            gateway.address(),
+            &format!(
+                "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {}\r\nConnection: close\r\n\r\n",
+                basic("admin", "fixture")
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("protected"));
+    }
+    gateway.stop().await;
+}
+
+#[tokio::test]
 async fn a_protected_route_challenges_and_then_admits() {
     let gateway = Gateway::new("auth");
     let port = free_port();

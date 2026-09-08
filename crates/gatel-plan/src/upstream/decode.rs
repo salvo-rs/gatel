@@ -20,6 +20,9 @@ pub fn decode_upstream_body(
     diagnostics: &mut Diagnostics,
 ) -> Option<Upstream> {
     let errors_before = diagnostics.error_count();
+    if !super::shape::validate(node, diagnostics) {
+        return None;
+    }
     let mut endpoints: Vec<Endpoint> = Vec::new();
 
     let declared = node.children_named("endpoint").count();
@@ -180,12 +183,26 @@ pub fn decode_upstream_body(
                     "`attempts` must be between 1 and 5",
                 );
             }
+            if decoded.budget_percent > 100 {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "retry budget-percent must be between 0 and 100",
+                );
+            }
+            if decoded.per_try.is_zero() {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "retry per-try must be nonzero",
+                );
+            }
             Some(Retry {
                 mode,
                 attempts: decoded.attempts,
                 per_try: decoded.per_try,
                 buffer: decoded.buffer.unwrap_or_default(),
-                budget_percent: decoded.budget_percent.min(100),
+                budget_percent: decoded.budget_percent,
             })
         }
         None => None,
@@ -194,6 +211,30 @@ pub fn decode_upstream_body(
     let health = match node.child("health") {
         Some(child) => {
             let decoded = HealthNode::from_node(child, diagnostics)?;
+            if decoded.interval.is_zero() || decoded.timeout.is_zero() {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "health interval and timeout must be nonzero",
+                );
+            }
+            if decoded.healthy_threshold == 0 || decoded.unhealthy_threshold == 0 {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "health thresholds must be at least 1",
+                );
+            }
+            if decoded
+                .status
+                .is_some_and(|status| !(100..=599).contains(&status))
+            {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "health status must be between 100 and 599",
+                );
+            }
             let kind = match decoded.kind.as_str() {
                 "tcp" | "tcp-connect" => {
                     for absent in ["path", "status", "host"] {
@@ -252,8 +293,8 @@ pub fn decode_upstream_body(
                 kind,
                 interval: decoded.interval,
                 timeout: decoded.timeout,
-                healthy_threshold: decoded.healthy_threshold.max(1),
-                unhealthy_threshold: decoded.unhealthy_threshold.max(1),
+                healthy_threshold: decoded.healthy_threshold,
+                unhealthy_threshold: decoded.unhealthy_threshold,
                 jitter: decoded.jitter.unwrap_or(decoded.interval / 10),
             })
         }
@@ -263,6 +304,13 @@ pub fn decode_upstream_body(
     let passive_health = match node.child("passive-health") {
         Some(child) => {
             let decoded = PassiveHealthNode::from_node(child, diagnostics)?;
+            if decoded.max_fails == 0 {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "passive-health max-fails must be at least 1",
+                );
+            }
             let unhealthy_status = match decoded.unhealthy_status {
                 Some(raw) => {
                     let mut parsed = Vec::new();
@@ -281,7 +329,7 @@ pub fn decode_upstream_body(
                 None => vec![502, 503, 504],
             };
             Some(PassiveHealth {
-                max_fails: decoded.max_fails.max(1),
+                max_fails: decoded.max_fails,
                 window: decoded.window,
                 cooldown: decoded.cooldown,
                 unhealthy_status,
@@ -488,12 +536,12 @@ fn secret_property(node: &Node, name: &str, diagnostics: &mut Diagnostics) -> Op
 }
 
 /// The identity of an upstream declared inline inside a `proxy` node.
-pub fn anonymous_upstream_id(route: &ResourceId, addresses: &[String]) -> ResourceId {
+pub fn anonymous_upstream_id(site: &ResourceId, owner: &SourceId, addresses: &[String]) -> ResourceId {
     let mut parts: Vec<&str> = addresses.iter().map(String::as_str).collect();
     parts.sort();
-    let mut key = vec![route.name()];
+    let mut key = vec![site.name()];
     key.extend(parts);
-    ResourceId::derived(ResourceKind::Upstream, &key)
+    ResourceId::derived_owned(ResourceKind::Upstream, owner, &key)
 }
 
 /// The one name every backend shares, if they share one.

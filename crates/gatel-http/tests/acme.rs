@@ -8,6 +8,81 @@ use support::*;
 const CHALLENGE: &str = "/.well-known/acme-challenge/";
 
 #[tokio::test]
+async fn lost_registration_response_reuses_the_same_wire_identity_after_restart() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let gateway = Gateway::new("acme-registration-loss");
+    let authority = support::acme_ca::Authority::start("127.0.0.1:1".parse().unwrap()).await;
+    authority.lose_registration_responses();
+    let config = gatel_plan::Acme {
+        directory: authority.directory_url.clone(),
+        email: "ops@example.com".into(),
+        agreed: true,
+        directory_path: None,
+        renew_before: Duration::from_secs(86400),
+    };
+    for _ in 0..2 {
+        let before = authority.registration_keys().len();
+        let issuer = Arc::new(
+            gatel_tls::acme::Issuer::new(&config, &gateway.directory, gatel_tls::acme::Challenges::new())
+                .unwrap(),
+        );
+        let issuing = issuer.clone();
+        let mut attempt = tokio::spawn(async move { issuing.issue("acme.example.com").await });
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            while authority.registration_keys().len() == before {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    result = &mut attempt => {
+                        assert!(authority.registration_keys().len() > before,
+                            "issuance ended before the authority received registration: {result:?}");
+                        // The completed handle must not be polled a second time.
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .expect("authority receives registration before deadline");
+        if !completed {
+            attempt.abort();
+            let _ = attempt.await;
+        }
+        issuer.drain_storage().await;
+    }
+    let keys = authority.registration_keys();
+    assert!(keys.len() >= 2);
+    assert_eq!(keys[0]["kty"], "EC");
+    assert!(
+        keys.iter().all(|key| key == &keys[0]),
+        "restart must reuse the signing identity"
+    );
+}
+
+async fn wait_for_certificate(gateway: &Gateway) {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            if gateway.certificates.len() == 1
+                && gateway.challenges.is_empty()
+                && !gateway
+                    .telemetry
+                    .health
+                    .report()
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.code() == "certificate_pending")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background issuance completes");
+}
+
+#[tokio::test]
 async fn a_challenge_is_answered_by_the_listener_that_is_already_there() {
     let gateway = Gateway::new("acme-challenge");
     let port = free_port();
@@ -168,9 +243,9 @@ site "acme.example.com" id="secure" {{
         "and has nothing to present until the order finishes"
     );
 
-    // What `App::activate` does after a commit. The first sweep runs before it
-    // returns, so by here the order has been driven to the end.
+    // Activation starts an owned background sweep without waiting for the CA.
     gateway.reconcile_acme().await;
+    wait_for_certificate(&gateway).await;
 
     let fetched = authority.fetched();
     assert_eq!(fetched.len(), 1, "the authority asked exactly once: {fetched:?}");
@@ -225,12 +300,17 @@ site "acme.example.com" id="secure" {{
     };
     gateway.apply(&config(http, https)).await;
     gateway.reconcile_acme().await;
+    wait_for_certificate(&gateway).await;
     assert_eq!(gateway.certificates.len(), 1);
 
     // A second process, same directory. It must serve what the first obtained
     // rather than ordering again — a restart loop that reorders is how an
     // account reaches a rate limit.
-    let state = gateway.directory.join("acme-state");
+    let committed = gateway.store.current().unwrap();
+    let state = gatel_tls::Issuer::storage_directory(
+        committed.plan.spec.global.acme.as_ref().unwrap(),
+        &gateway.directory,
+    );
     let listing: Vec<String> = std::fs::read_dir(&state)
         .map(|entries| {
             entries
@@ -240,7 +320,7 @@ site "acme.example.com" id="secure" {{
         })
         .unwrap_or_default();
     assert!(
-        listing.iter().any(|name| name.ends_with(".crt")),
+        listing.iter().any(|name| name.ends_with(".identity")),
         "the certificate was written where a restart will look: {listing:?}"
     );
 

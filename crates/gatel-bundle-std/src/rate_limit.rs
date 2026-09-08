@@ -144,7 +144,8 @@ impl Directive for RateLimit {
     fn meta(&self) -> &DirectiveMeta {
         // A guard: it rejects, so it belongs with the other rejections and
         // ahead of anything that would do work on the request.
-        static META: DirectiveMeta = DirectiveMeta::middleware("rate-limit", Phase::Guard, Scopes::BOTH);
+        static META: DirectiveMeta = DirectiveMeta::middleware("rate-limit", Phase::Guard, Scopes::BOTH)
+            .with_effects(&[gatel_plan::Effect::ConsumeQuota]);
         &META
     }
 
@@ -295,9 +296,11 @@ impl Handler for RateLimitHandler {
 
         match self.buckets.take(&key, self.max, self.window) {
             Ok(remaining) => {
+                // Per-request quota headers must not be stored by a downstream
+                // cache or overwritten when it replays a previous response.
+                ctrl.call_next(request, depot, response).await;
                 add_header(response, "x-ratelimit-limit", &self.max.to_string());
                 add_header(response, "x-ratelimit-remaining", &remaining.to_string());
-                ctrl.call_next(request, depot, response).await;
             }
             Err(wait) => {
                 let seconds = wait.as_secs().max(1);
@@ -330,6 +333,8 @@ mod tests {
     /// A context with nothing in it, for a directive that needs nothing.
     fn empty_context() -> gatel_plan::BuildContext<'static> {
         gatel_plan::BuildContext {
+            secrets: Default::default(),
+            blocking: gatel_plan::blocking::Executor::process_default(),
             telemetry: crate::testing::telemetry(),
             upstreams: crate::testing::no_upstreams(),
             root: std::path::Path::new("."),

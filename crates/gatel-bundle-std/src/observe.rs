@@ -25,6 +25,7 @@ impl DirectiveConfig for MetricsConfig {
     fn build(&self, cx: BuildContext<'_>) -> Result<Arc<dyn Handler>, String> {
         Ok(Arc::new(MetricsHandler {
             telemetry: Arc::clone(cx.telemetry),
+            blocking: cx.blocking,
         }))
     }
 
@@ -37,7 +38,7 @@ pub struct Metrics;
 
 impl Directive for Metrics {
     fn meta(&self) -> &DirectiveMeta {
-        static META: DirectiveMeta = DirectiveMeta::terminal("metrics");
+        static META: DirectiveMeta = DirectiveMeta::terminal("metrics").with_version("2");
         &META
     }
 
@@ -51,6 +52,7 @@ impl Directive for Metrics {
 
 struct MetricsHandler {
     telemetry: Arc<Telemetry>,
+    blocking: gatel_plan::blocking::Executor,
 }
 
 #[async_trait]
@@ -62,7 +64,8 @@ impl Handler for MetricsHandler {
         response: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
-        let body = gatel_observe::prometheus(&self.telemetry);
+        let mut body = gatel_observe::prometheus(&self.telemetry);
+        gatel_observe::blocking::append_blocking(&mut body, self.blocking.metrics());
         response
             .add_header(http::header::CONTENT_TYPE, gatel_observe::CONTENT_TYPE, true)
             .ok();
@@ -240,6 +243,8 @@ mod tests {
     fn built(config: &dyn DirectiveConfig, telemetry: &'static Arc<Telemetry>) -> Arc<dyn Handler> {
         config
             .build(BuildContext {
+                secrets: Default::default(),
+                blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry,

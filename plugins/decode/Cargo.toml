@@ -1,0 +1,23 @@
+[package]
+name = "gatel-decode"
+description = "Optional bounded request decompression for Gatel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gatel-model.workspace = true
+gatel-macros.workspace = true
+gatel-plugin-api.workspace = true
+gatel-plugin-runtime.workspace = true
+salvo_core.workspace = true
+async-compression.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+http-body.workspace = true

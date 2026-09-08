@@ -19,6 +19,8 @@ use crate::store::{CertificateStore, SniResolver};
 /// What a listener needs to terminate TLS.
 pub struct TlsPreparation<'a> {
     pub store: &'a Arc<CertificateStore>,
+    /// Candidate writes. None keeps the direct embedded-host loading API.
+    pub updates: Option<&'a crate::store::CertificateUpdates>,
     /// Created lazily: a configuration that never says `internal` should not
     /// leave a certificate authority on the machine.
     pub internal: &'a dyn Fn() -> Result<Arc<InternalCa>, String>,
@@ -27,6 +29,21 @@ pub struct TlsPreparation<'a> {
     /// Opened only when a site asks for an automatic certificate, and then once
     /// for the process: the account with the authority is not per generation.
     pub acme: &'a dyn Fn(&gatel_plan::Acme) -> Result<Arc<crate::acme::Acme>, String>,
+}
+
+impl TlsPreparation<'_> {
+    fn get(&self, site: &ResourceId) -> Option<Certificate> {
+        match self.updates {
+            Some(updates) => updates.get(site),
+            None => self.store.get(site),
+        }
+    }
+    fn put(&self, site: ResourceId, certificate: Certificate, only_if_missing: bool) -> bool {
+        match self.updates {
+            Some(updates) => updates.put(site, certificate, only_if_missing),
+            None => self.store.put(site, certificate),
+        }
+    }
 }
 
 /// Build the TLS configuration for one listener, loading every certificate it
@@ -115,13 +132,39 @@ fn load_certificate(
     acme_config: Option<&gatel_plan::Acme>,
     preparation: &TlsPreparation<'_>,
 ) -> Result<(), String> {
+    if let Some(updates) = preparation.updates {
+        let identity = match &tls.source {
+            CertificateSource::Acme => crate::store::acme_owner(
+                acme_config.ok_or("ACME configuration is missing")?,
+                &host.describe(),
+            ),
+            _ => {
+                let mut hash = gatel_model::Hasher::new();
+                hash.update_str("certificate-owner-v1");
+                hash.update_str(&host.describe());
+                match &tls.source {
+                    CertificateSource::Manual { cert, key } => {
+                        hash.update_str("manual");
+                        cert.hash_into(&mut hash);
+                        key.hash_into(&mut hash);
+                    }
+                    CertificateSource::Internal => {
+                        hash.update_str("internal");
+                    }
+                    CertificateSource::Acme => unreachable!(),
+                }
+                hash.finish()
+            }
+        };
+        updates.claim(site.clone(), identity);
+    }
     match &tls.source {
         CertificateSource::Manual { cert, key } => {
             let cert_path = cert.resolve_path(preparation.root)?;
             let key_path = key.resolve_path(preparation.root)?;
             let certificate = Certificate::from_pem_files(&cert_path, &key_path)
                 .map_err(|error| format!("site `{}`: {error}", host.describe()))?;
-            if preparation.store.put(site, certificate) {
+            if preparation.put(site, certificate, false) {
                 tracing::info!(
                     target: "gatel::certificate",
                     event = "certificate_loaded",
@@ -145,10 +188,10 @@ fn load_certificate(
             let name = &name;
             // Only issue once per process: a new certificate on every reload
             // would make browsers re-prompt and would defeat session resumption.
-            if preparation.store.get(&site).is_none() {
+            if preparation.get(&site).is_none() {
                 let authority = (preparation.internal)()?;
                 let certificate = authority.issue(name)?;
-                preparation.store.put(site, certificate);
+                preparation.put(site, certificate, true);
                 tracing::info!(
                     target: "gatel::certificate",
                     event = "certificate_issued",
@@ -178,7 +221,17 @@ fn load_certificate(
             // Nothing is ordered here: an order takes seconds when everything
             // works and minutes when it does not, and a reload must not wait
             // for a certificate authority's bad afternoon.
-            if preparation.store.get(&site).is_none() && !acme.adopt(&site, name) {
+            if preparation.get(&site).is_none() {
+                if let Some(certificate) = acme.cached(name) {
+                    preparation.put(site, certificate, true);
+                    tracing::info!(
+                        target: "gatel::certificate",
+                        event = "certificate_loaded",
+                        site = %name,
+                        source = "acme",
+                    );
+                    return Ok(());
+                }
                 // Deliberately not a placeholder certificate. One this process
                 // signed itself would be a certificate that lies, and teaching
                 // people to click through a warning is worse than a handshake
@@ -295,6 +348,7 @@ mod tests {
                 listener,
                 acme_config,
                 &TlsPreparation {
+                    updates: None,
                     store: &self.store,
                     internal: &internal,
                     acme: &acme,
@@ -487,8 +541,9 @@ mod tests {
         let config = acme_config();
         // What a previous run would have left behind.
         let generated = rcgen::generate_simple_self_signed(vec!["api.example.com".to_string()]).unwrap();
-        let state = fixture.directory.join("acme");
-        std::fs::create_dir_all(&state).unwrap();
+        let issuer =
+            crate::acme::Issuer::new(&config, &fixture.directory, crate::acme::Challenges::new()).unwrap();
+        let state = issuer.directory();
         std::fs::write(state.join("api.example.com.crt"), generated.cert.pem()).unwrap();
         crate::certificate::write_key(
             &state.join("api.example.com.key"),

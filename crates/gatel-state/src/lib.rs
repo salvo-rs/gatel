@@ -19,6 +19,7 @@ pub mod retry;
 pub mod selector;
 pub mod supervisor;
 pub mod upstream;
+mod worker;
 
 pub use ask::ask_upstream;
 pub use endpoint::{Endpoint, EndpointSet, Health, InFlight, probe_delay};

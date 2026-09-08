@@ -16,6 +16,12 @@ their own destination — see `access-log` in `README.md`.
 | `shutdown_started` | A signal arrived. In-flight requests are being finished. |
 | `shutdown_complete` | Everything drained, or the grace period ran out. |
 
+## `gatel::admin`
+
+| Event | When |
+|---|---|
+| `admin_serving` | Explicit CLI opt-in starts the loopback management listener (memory-only or checkpoint mode); includes its actual address, never the token. |
+
 ## `gatel::config`
 
 The configuration transaction. Exactly one of the first four follows every
@@ -24,11 +30,14 @@ attempt.
 | Event | When |
 |---|---|
 | `config_committed` | A generation was published. Carries the generation, `spec_hash` and `plan_hash`. |
+| `checkpoint_bootstrap` | Warns that startup uses a read-only checkpoint; subsequent reloads are not persisted. No configuration body or checkpoint path. |
+| `checkpoint_mode` | Explicit checkpoint-only run mode starts; warns that a crash before save can retain the previous checkpoint and no idempotent receipts are provided. |
+| `checkpoint_reload_failed` | A checkpoint-session watcher stops after a non-CAS submission error; the host must inspect before retrying. Does not imply the configuration was unapplied; no input body or storage path. |
 | `config_rejected` | The configuration is invalid. The previous generation still serves. |
 | `prepare_failed` | Valid but unbuildable — a port in use, a certificate that will not load. No generation was consumed. |
 | `candidate_stale` | A source moved while this candidate compiled. Something newer will report for itself. |
-| `watching` | The set of files being watched, after a successful load. |
-| `watch_failed` | The file watcher reported an error; the polling fallback carries on. |
+| `watch_updated` | A directory subscription was added or removed successfully (`directory`, `add`). |
+| `watch_update_failed` | Adding/removing a directory subscription failed (`directory`, `add`, `error`); later reconciliation retries and polling carries on. |
 | `watch_unavailable` | No watcher could be started at all. Reloads depend on polling and signals. |
 
 ## `gatel::listener`
@@ -76,6 +85,7 @@ attempt.
 | `upstream_state_resolved` | A commit resolved an upstream's state, and something was not reused. |
 | `endpoint_health_changed` | A probe changed an endpoint's verdict. Only a change, never a round. |
 | `probe_started` | A health check worker started for an upstream. |
+| `worker_restart_scheduled` | A probe, resolver or census service exited unexpectedly; `service`, `upstream`, `panicked`, and `delay_ms` describe its bounded recovery delay. `upstream` is empty for the process-wide census. Panic payloads are not included. |
 | `probe_stopped` | A worker stopped, because a reload no longer asks for it. |
 | `endpoint_resolved` | A named backend now resolves to a different set of addresses. Carries the new set and how many idle connections were dropped because their address is gone. |
 | `endpoint_resolve_failed` | A name could not be looked up. Only the first failure since the last success, so a name that is down does not log every round. The addresses already held are kept. |
@@ -108,3 +118,12 @@ attempt.
 | Event | When |
 |---|---|
 | `read_failed` | `file-server` could not read a file it had already found. |
+
+## `gatel::precompress`
+
+Debug-only offline CLI diagnostics. No asset path or body is included.
+
+| Event | When |
+|---|---|
+| `precompress_phase_started` | Entering a sequential stage: `scan`, `read`, `staging`, `encode_write`, `publish`, or `stdout`. |
+| `precompress_phase_finished` | Leaving the stage scope, with `stage` and `elapsed_ms`. Also emitted on error returns; it does not assert success or durability. A killed/hung process may have only a start event. |

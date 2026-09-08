@@ -43,6 +43,7 @@ matters more often than the first two.
 | Threat | What stops it | Tested by |
 |---|---|---|
 | Path traversal out of a served directory | Containment is checked on the *resolved* path, after symlinks are followed — a check on the request text is defeated by a link inside the root | `gatel-bundle-std/src/file_server.rs` |
+| Public symlink aliases exposing hidden files within the root | The public-component policy is also checked on the resolved path below the configured root, for direct files, listings, indexes and compressed variants. Links to public internal files remain allowed. This is not protection against concurrent filesystem mutation or hard-link aliases | `gatel-bundle-std/src/file_path.rs`, `gatel-http/tests/file_listing.rs` |
 | Slowloris | `idle` bounds a connection with no complete head, whether it is dribbling one or sitting between requests | `gatel-http/tests/limits.rs` |
 | A head large enough to exhaust memory | `header` bounds hyper's read buffer and the HTTP/2 header list | `gatel-http/tests/limits.rs` |
 | A body large enough to exhaust memory or disk | `body` refuses a declared length before reading, and cuts off an undeclared one mid-stream | `gatel-http/tests/limits.rs`, `body_limit.rs` |

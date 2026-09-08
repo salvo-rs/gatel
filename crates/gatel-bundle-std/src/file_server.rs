@@ -7,6 +7,7 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::SystemTime;
 
 use gatel_macros::FromNode;
@@ -14,6 +15,8 @@ use gatel_model::{Code, Diagnostic, Diagnostics, FromNode as _, Hasher, Node};
 use gatel_plan::{Directive, DirectiveConfig, DirectiveMeta};
 use salvo_core::http::{Request, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
+
+use crate::file_metadata::{etag, http_date};
 
 #[derive(Debug, FromNode)]
 struct Fields {
@@ -94,7 +97,7 @@ pub struct FileServerDirective;
 
 impl Directive for FileServerDirective {
     fn meta(&self) -> &DirectiveMeta {
-        static META: DirectiveMeta = DirectiveMeta::terminal("file-server");
+        static META: DirectiveMeta = DirectiveMeta::terminal("file-server").with_version("11");
         &META
     }
 
@@ -145,7 +148,6 @@ struct FileServer {
 enum Target {
     File {
         path: PathBuf,
-        metadata: std::fs::Metadata,
     },
     Listing(PathBuf),
     /// A directory reached without a trailing slash: relative links inside it
@@ -155,6 +157,17 @@ enum Target {
 }
 
 impl FileServer {
+    /// Auxiliary files (index and encoded siblings) obey the same resolved
+    /// containment boundary as a directly requested file.
+    fn contained_file(&self, candidate: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
+        let resolved = std::fs::canonicalize(candidate).ok()?;
+        if !crate::file_path::public_resolved(&self.root, &resolved) {
+            return None;
+        }
+        let metadata = std::fs::metadata(&resolved).ok()?;
+        metadata.is_file().then_some((resolved, metadata))
+    }
+
     /// What to serve for this request, including the fallback.
     ///
     /// The fallback is what makes a single-page application work: its router
@@ -197,7 +210,7 @@ impl FileServer {
         let Ok(resolved) = std::fs::canonicalize(&candidate) else {
             return Target::NotFound;
         };
-        if !resolved.starts_with(&self.root) {
+        if !crate::file_path::public_resolved(&self.root, &resolved) {
             return Target::NotFound;
         }
         let Ok(metadata) = std::fs::metadata(&resolved) else {
@@ -205,10 +218,7 @@ impl FileServer {
         };
 
         if metadata.is_file() {
-            return Target::File {
-                path: resolved,
-                metadata,
-            };
+            return Target::File { path: resolved };
         }
         if !metadata.is_dir() {
             // A device or a socket is not something to serve.
@@ -220,13 +230,8 @@ impl FileServer {
         }
         if let Some(index) = &self.index {
             let candidate = resolved.join(index);
-            if let Ok(metadata) = std::fs::metadata(&candidate)
-                && metadata.is_file()
-            {
-                return Target::File {
-                    path: candidate,
-                    metadata,
-                };
+            if let Some((path, _)) = self.contained_file(&candidate) {
+                return Target::File { path };
             }
         }
         if self.browse {
@@ -237,28 +242,32 @@ impl FileServer {
     }
 
     /// Prefer an already-compressed file when the client accepts that encoding.
-    fn precompressed_variant(&self, path: &Path, request: &Request) -> Option<(PathBuf, &'static str)> {
+    fn precompressed_variants(
+        &self,
+        path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Vec<(PathBuf, &'static str)> {
         if !self.precompressed {
-            return None;
+            return Vec::new();
         }
-        let accepted = request
-            .headers()
-            .get(http::header::ACCEPT_ENCODING)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
+        // A leftover build artifact must not hide a newer source. Unknown
+        // timestamps fail closed to identity. Equal times remain valid for
+        // coarse-resolution filesystems and reproducible deployment archives.
+        // This is a freshness heuristic, not a cross-file snapshot guarantee.
+        let Ok(modified) = metadata.modified() else {
+            return Vec::new();
+        };
+        let mut available = Vec::new();
         for (suffix, encoding) in [("br", "br"), ("zst", "zstd"), ("gz", "gzip")] {
-            if !accepted
-                .split(',')
-                .any(|entry| entry.trim().starts_with(encoding))
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(format!(".{suffix}"));
+            if let Some((resolved, metadata)) = self.contained_file(Path::new(&candidate))
+                && metadata.modified().is_ok_and(|time| time >= modified)
             {
-                continue;
-            }
-            let candidate = PathBuf::from(format!("{}.{suffix}", path.display()));
-            if candidate.is_file() {
-                return Some((candidate, encoding));
+                available.push((resolved, encoding));
             }
         }
-        None
+        available
     }
 }
 
@@ -271,18 +280,35 @@ impl Handler for FileServer {
         response: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
+        if !matches!(*request.method(), http::Method::GET | http::Method::HEAD) {
+            crate::generated(depot);
+            response.status_code(StatusCode::METHOD_NOT_ALLOWED);
+            response
+                .headers_mut()
+                .insert(http::header::ALLOW, http::HeaderValue::from_static("GET, HEAD"));
+            response.headers_mut().insert(
+                http::header::CACHE_CONTROL,
+                http::HeaderValue::from_static("no-store"),
+            );
+            response.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            let _ = response.write_body("405 file-server only supports GET and HEAD\n");
+            return;
+        }
         let path = request.uri().path().to_string();
-        let (file, metadata) = match self.serve(&path) {
-            Target::File { path, metadata } => (path, metadata),
+        let file = match self.serve(&path) {
+            Target::File { path, .. } => path,
             Target::Redirect(location) => {
                 response.status_code(StatusCode::MOVED_PERMANENTLY);
-                if let Ok(value) = http::HeaderValue::from_str(&location) {
+                if let Some(value) = crate::local_redirect::location(&location, request.uri().query()) {
                     response.headers_mut().insert(http::header::LOCATION, value);
                 }
                 return;
             }
             Target::Listing(directory) => {
-                write_listing(response, &directory, &path);
+                crate::file_listing::write(response, depot, &self.root, &directory, &path).await;
                 return;
             }
             // One answer for "no such file", "outside the root" and "not a
@@ -295,7 +321,46 @@ impl Handler for FileServer {
             }
         };
 
-        let tag = etag(&metadata);
+        let mut opened = match crate::ranges::OpenedFile::open(&file).await {
+            Ok(opened) => opened,
+            Err(error) => return unreadable(&file, &error, depot, response),
+        };
+        let variants = self.precompressed_variants(&file, opened.metadata());
+        let dynamic =
+            crate::file_encoding::available(depot, request, opened.metadata().len(), content_type(&file));
+        let selection = crate::encoding_accept::select(
+            request.headers(),
+            variants
+                .iter()
+                .map(|(_, coding)| *coding)
+                .chain(dynamic.iter().map(|coding| coding.token())),
+        );
+        crate::file_encoding::selected(depot);
+        // Even an identity-only file can now reject an Accept-Encoding value.
+        crate::vary::append(response.headers_mut(), "accept-encoding");
+        if selection == crate::encoding_accept::Selection::NotAcceptable {
+            return crate::file_encoding::reject(depot, response);
+        }
+        let encoding = selection.coding();
+        let mut source = file.clone();
+        let mut transform = None;
+        if let Some(coding) = encoding {
+            if let Some((variant, _)) = variants.into_iter().find(|(_, token)| *token == coding) {
+                source = variant;
+                opened = match crate::ranges::OpenedFile::open(&source).await {
+                    Ok(opened) => opened,
+                    Err(error) => return unreadable(&source, &error, depot, response),
+                };
+            } else {
+                transform = dynamic.into_iter().find(|offer| offer.token() == coding);
+            }
+        }
+        let metadata = opened.metadata();
+        let tag = match (encoding, transform) {
+            (_, Some(_)) => format!("W/{}", etag(metadata)),
+            (Some(coding), None) => format!("\"{coding}-{}\"", etag(metadata).trim_matches('"')),
+            (None, None) => etag(metadata),
+        };
         if let Ok(value) = http::HeaderValue::from_str(&tag) {
             response.headers_mut().insert(http::header::ETAG, value);
         }
@@ -305,46 +370,59 @@ impl Handler for FileServer {
             response.headers_mut().insert(http::header::LAST_MODIFIED, value);
         }
 
-        // A client that already has this version gets told so, and no bytes.
-        if matches(request, &tag) {
-            response.status_code(StatusCode::NOT_MODIFIED);
-            return;
-        }
-
-        let (source, encoding) = match self.precompressed_variant(&file, request) {
-            Some((variant, encoding)) => (variant, Some(encoding)),
-            None => (file.clone(), None),
-        };
-
         if let Some(encoding) = encoding {
             response.headers_mut().insert(
                 http::header::CONTENT_ENCODING,
                 http::HeaderValue::from_static(encoding),
-            );
-            // The response varies by what the client said it accepts, so a
-            // shared cache must not serve one client's copy to another.
-            response.headers_mut().insert(
-                http::header::VARY,
-                http::HeaderValue::from_static("accept-encoding"),
             );
         }
         if let Ok(value) = http::HeaderValue::from_str(content_type(&file)) {
             response.headers_mut().insert(http::header::CONTENT_TYPE, value);
         }
 
+        // Preconditions describe the selected representation, not its identity
+        // sibling. Vary and validators must also be present on the 304 path.
+        if let Some(status) =
+            crate::preconditions::evaluate(request.method(), request.headers(), response.headers())
+        {
+            response.status_code(status);
+            if status != StatusCode::NOT_MODIFIED {
+                crate::generated(depot);
+                response.headers_mut().remove(http::header::CONTENT_ENCODING);
+                response.headers_mut().remove(http::header::ETAG);
+                response.headers_mut().remove(http::header::LAST_MODIFIED);
+                response.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
+                response.headers_mut().insert(
+                    http::header::CACHE_CONTROL,
+                    http::HeaderValue::from_static("no-store"),
+                );
+                let _ = response.write_body(format!("{} file precondition rejected\n", status.as_u16()));
+            }
+            return;
+        }
+
+        let size = metadata.len();
         if request.method() == http::Method::HEAD {
             response.status_code(StatusCode::OK);
+            if transform.is_some() {
+                // Streaming encoded length is unknown; never report the
+                // identity length for the negotiated HEAD representation.
+                return;
+            }
             response.headers_mut().insert(
                 http::header::ACCEPT_RANGES,
                 http::HeaderValue::from_static("bytes"),
             );
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(&size.to_string()).expect("decimal file size"),
+            );
             return;
         }
 
-        let size = match tokio::fs::metadata(&source).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) => return unreadable(&source, &error, depot, response),
-        };
         // A range names bytes of the representation being sent, and a
         // precompressed variant is a different representation with different
         // offsets. Rather than reason about that, the whole thing is sent —
@@ -355,8 +433,12 @@ impl Handler for FileServer {
             crate::ranges::wanted(request, size, &tag)
         };
 
-        if let Err(error) = crate::ranges::deliver(response, &source, size, wanted).await {
+        if let Err(error) = crate::ranges::deliver(response, opened, wanted).await {
             unreadable(&source, &error, depot, response);
+        } else if let Some(encoding) = transform {
+            crate::encode_metadata::transformed(response.headers_mut());
+            let body = std::mem::take(response.body_mut());
+            *response.body_mut() = crate::encode::compress(body, encoding);
         }
     }
 }
@@ -371,6 +453,26 @@ fn unreadable(source: &std::path::Path, error: &std::io::Error, depot: &mut Depo
     );
     crate::generated(depot);
     response.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+    // A failed read is a new error representation, not the selected file.
+    for name in [
+        http::header::CONTENT_LENGTH,
+        http::header::CONTENT_RANGE,
+        http::header::CONTENT_ENCODING,
+        http::header::ETAG,
+        http::header::LAST_MODIFIED,
+        http::header::ACCEPT_RANGES,
+    ] {
+        response.headers_mut().remove(name);
+    }
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    *response.body_mut() = salvo_core::http::ResBody::None;
     let _ = response.write_body("500 could not read the file\n");
 }
 
@@ -391,7 +493,7 @@ fn safe_relative(request_path: &str) -> Option<PathBuf> {
                 let text = part.to_str()?;
                 // A leading dot is not inherently dangerous, but `.git` and
                 // `.env` are the files a directory should least often serve.
-                if text.starts_with('.') {
+                if !crate::file_path::public_component(text) {
                     return None;
                 }
                 relative.push(part);
@@ -420,73 +522,6 @@ fn percent_decode(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// A tag from size and modification time. Weak by nature — two edits within the
-/// same nanosecond that preserve the length would collide — but that is the
-/// same trade every static server makes.
-fn etag(metadata: &std::fs::Metadata) -> String {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|since| since.as_nanos())
-        .unwrap_or(0);
-    format!("\"{:x}-{:x}\"", metadata.len(), modified)
-}
-
-fn matches(request: &Request, tag: &str) -> bool {
-    request
-        .headers()
-        .get(http::header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|entry| entry.trim() == tag || entry.trim() == "*")
-        })
-}
-
-/// Format a time as HTTP expects it. Written out rather than pulled from a
-/// date library, because this is the only place the format is needed.
-fn http_date(time: SystemTime) -> Option<String> {
-    let since = time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
-    let days = (since / 86_400) as i64;
-    let seconds = since % 86_400;
-
-    // 1970-01-01 was a Thursday.
-    const DAY_NAMES: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTH_NAMES: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
-    let weekday = DAY_NAMES[(days % 7) as usize];
-    let (year, month, day) = civil_from_days(days);
-    Some(format!(
-        "{weekday}, {day:02} {} {year} {:02}:{:02}:{:02} GMT",
-        MONTH_NAMES[(month - 1) as usize],
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60,
-    ))
-}
-
-/// Days since the epoch to a calendar date, by Howard Hinnant's algorithm.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
 /// A small table rather than a dependency: these are the types a gateway
 /// actually serves, and an unknown extension is a byte stream.
 fn content_type(path: &Path) -> &'static str {
@@ -494,6 +529,8 @@ fn content_type(path: &Path) -> &'static str {
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
     {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -525,51 +562,6 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-fn write_listing(response: &mut Response, directory: &Path, request_path: &str) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        response.status_code(StatusCode::NOT_FOUND);
-        let _ = response.write_body("404 not found\n");
-        return;
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // A listing must not advertise what the server refuses to serve.
-            if name.starts_with('.') {
-                return None;
-            }
-            let suffix = if entry.path().is_dir() { "/" } else { "" };
-            Some(format!("{name}{suffix}"))
-        })
-        .collect();
-    names.sort();
-
-    let mut body = format!("<!doctype html>\n<title>{}</title>\n<ul>\n", escape(request_path));
-    if request_path != "/" {
-        body.push_str("<li><a href=\"../\">../</a></li>\n");
-    }
-    for name in names {
-        body.push_str(&format!("<li><a href=\"{0}\">{0}</a></li>\n", escape(&name)));
-    }
-    body.push_str("</ul>\n");
-
-    response.status_code(StatusCode::OK);
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    let _ = response.write_body(body);
-}
-
-/// A file name comes from the filesystem, so it is not trusted markup.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 #[cfg(test)]
 mod tests {
     use gatel_model::{Origin, Value};
@@ -579,6 +571,8 @@ mod tests {
     /// A context with nothing in it, for a directive that needs nothing.
     fn empty_context() -> gatel_plan::BuildContext<'static> {
         gatel_plan::BuildContext {
+            secrets: Default::default(),
+            blocking: gatel_plan::blocking::Executor::process_default(),
             telemetry: crate::testing::telemetry(),
             upstreams: crate::testing::no_upstreams(),
             root: std::path::Path::new("."),
@@ -652,6 +646,44 @@ mod tests {
             tree.server(false).resolve("/page.html"),
             Target::File { .. }
         ));
+    }
+
+    #[test]
+    fn directory_index_cannot_escape_root_even_when_configured_as_absolute() {
+        let tree = Tree::new("index-containment");
+        let outside = Tree::new("index-outside");
+        let secret = outside.write("secret.html", "outside secret");
+        let mut server = tree.server(false);
+        server.index = Some(secret.to_string_lossy().into_owned());
+        assert!(matches!(server.resolve("/"), Target::NotFound));
+        assert!(server.contained_file(&secret).is_none());
+        tree.write("safe.html", "safe");
+        server.index = Some("safe.html".into());
+        assert!(matches!(server.resolve("/"), Target::File { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_symlinks_cannot_escape_but_internal_links_still_work() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::new("auxiliary-links");
+        let outside = Tree::new("auxiliary-outside");
+        let secret = outside.write("secret", "outside secret");
+        let source = tree.write("page.txt", "identity");
+        symlink(&secret, tree.0.join("index.html")).unwrap();
+        symlink(&secret, tree.0.join("page.txt.gz")).unwrap();
+        let mut server = tree.server(false);
+        server.precompressed = true;
+        assert!(matches!(server.resolve("/"), Target::NotFound));
+        let metadata = std::fs::metadata(&source).unwrap();
+        assert!(server.precompressed_variants(&source, &metadata).is_empty());
+        let internal = tree.write("safe.br", "inside");
+        symlink(&internal, tree.0.join("page.txt.br")).unwrap();
+        let variants = server.precompressed_variants(&source, &metadata);
+        assert_eq!(variants.len(), 1);
+        let (selected, coding) = &variants[0];
+        assert_eq!(*coding, "br");
+        assert_eq!(*selected, std::fs::canonicalize(internal).unwrap());
     }
 
     #[test]
@@ -814,6 +846,9 @@ mod tests {
 
     #[test]
     fn http_dates_are_formatted_the_way_the_protocol_wants() {
+        assert!(
+            http_date(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(253_402_300_800)).is_none()
+        );
         // 2001-09-09T01:46:40Z, a Sunday.
         let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
         assert_eq!(http_date(time).unwrap(), "Sun, 09 Sep 2001 01:46:40 GMT");
@@ -825,6 +860,7 @@ mod tests {
 
     #[test]
     fn a_listing_escapes_names_from_the_filesystem() {
+        use crate::file_listing::escape;
         assert_eq!(escape("<script>"), "&lt;script&gt;");
         assert_eq!(escape("a&b"), "a&amp;b");
     }
@@ -863,6 +899,8 @@ mod tests {
         assert!(
             config
                 .build(gatel_plan::BuildContext {
+                    secrets: Default::default(),
+                    blocking: gatel_plan::blocking::Executor::process_default(),
                     root: &directory,
                     state: None,
                     telemetry: crate::testing::telemetry(),

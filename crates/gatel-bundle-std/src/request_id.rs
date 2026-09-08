@@ -155,6 +155,8 @@ mod tests {
     /// A context with nothing in it, for a directive that needs nothing.
     fn empty_context() -> gatel_plan::BuildContext<'static> {
         gatel_plan::BuildContext {
+            secrets: Default::default(),
+            blocking: gatel_plan::blocking::Executor::process_default(),
             telemetry: crate::testing::telemetry(),
             upstreams: crate::testing::no_upstreams(),
             root: std::path::Path::new("."),

@@ -10,8 +10,13 @@
 
 pub mod bind;
 pub mod body;
+mod connection_work;
 pub mod dispatch;
+mod execution;
 pub mod measure;
+mod plugin_prepare;
+pub mod plugin_retirement;
+pub mod plugin_tasks;
 pub mod prepare;
 pub mod proxy;
 pub mod proxy_protocol;

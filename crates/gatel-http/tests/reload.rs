@@ -9,6 +9,57 @@ use gatel_plan::Outcome;
 use support::*;
 
 #[tokio::test]
+async fn a_late_old_snapshot_cannot_roll_back_the_serving_route() {
+    let gateway = Gateway::new("late-observation");
+    let port = free_port();
+    let config = |body: &str| {
+        format!(
+            "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/\" {{ respond \"{body}\" }} }}\n"
+        )
+    };
+    assert!(matches!(
+        gateway.apply(&config("old")).await,
+        Outcome::Started { .. }
+    ));
+    let old = gatel_model::Snapshot::new().with(
+        gatel_kdl::snapshot(
+            &gateway.directory.join("gatel.kdl"),
+            gatel_model::SourceId::file("main"),
+            None,
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        gateway.apply(&config("new")).await,
+        Outcome::Reloaded { .. }
+    ));
+    let current = gateway.store.current().unwrap();
+    let outcome = gateway.store.attempt(&old, &gateway.registry, |_| {
+        panic!("late old snapshots must not prepare resources")
+    });
+    assert!(matches!(outcome, Outcome::Stale(_)), "{outcome:?}");
+    assert!(Arc::ptr_eq(&current, &gateway.store.current().unwrap()));
+    // Relabelling obsolete content with the current revision is not a retry.
+    let mut reused = old.sources().next().unwrap().clone();
+    reused.rev = current.revs.get(&reused.source).unwrap();
+    let reused = gatel_model::Snapshot::new().with(reused);
+    let version = gateway.store.status().version();
+    let outcome = gateway
+        .store
+        .attempt_if(&version, &reused, &gateway.registry, |_| {
+            panic!("reused revision must not prepare resources")
+        })
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Stale(_)), "{outcome:?}");
+    assert_eq!(gateway.store.status().version(), version);
+    assert!(Arc::ptr_eq(&current, &gateway.store.current().unwrap()));
+    let response = get(gateway.address(), "/").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("new"), "{response}");
+    gateway.stop().await;
+}
+
+#[tokio::test]
 async fn a_reload_changes_behaviour_without_rebinding_the_socket() {
     let gateway = Gateway::new("reload");
     let port = free_port();

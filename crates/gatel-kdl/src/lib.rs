@@ -5,12 +5,13 @@
 
 #![forbid(unsafe_code)]
 
+mod format;
 pub mod load;
 pub mod lower;
-
 use std::path::Path;
 
-use gatel_model::{Diagnostics, SourceId, SourceRev, SourceSnapshot};
+pub use format::{Formatted, format_file};
+use gatel_model::{Code, Diagnostics, Origin, SourceId, SourceSnapshot};
 pub use load::{Limits, Loaded, load, load_with_limits};
 pub use lower::{LineIndex, lower};
 
@@ -35,16 +36,21 @@ pub fn snapshot_with_limits(
     limits: Limits,
 ) -> Result<SourceSnapshot, Diagnostics> {
     let loaded = load_with_limits(root, limits)?;
-    let rev = match previous {
-        Some(previous) if previous.content == loaded.content => previous.rev,
-        Some(previous) => previous.rev.next(),
-        None => SourceRev(1),
-    };
-    Ok(SourceSnapshot::new(source, rev, loaded.content, loaded.nodes))
+    SourceSnapshot::observe(source, loaded.content, loaded.nodes, previous).map_err(|error| {
+        let mut diagnostics = Diagnostics::new();
+        diagnostics.error(
+            Code::InvalidValue,
+            Origin::synthetic("source observation"),
+            error.to_string(),
+        );
+        diagnostics
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use gatel_model::SourceRev;
+
     use super::*;
 
     fn temp(tag: &str) -> std::path::PathBuf {
@@ -58,6 +64,30 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn wrong_source_and_exhausted_revision_are_diagnostics_not_panics() {
+        let dir = temp("exhausted");
+        let root = dir.join("gatel.kdl");
+        std::fs::write(&root, "site \"a\"\n").unwrap();
+        let mut first = snapshot(&root, SourceId::file("main"), None).unwrap();
+        let error = snapshot(&root, SourceId::admin(), Some(&first)).unwrap_err();
+        assert!(error.iter().any(|d| d.message.contains("another source")));
+        first.rev = SourceRev(u64::MAX);
+        assert_eq!(
+            snapshot(&root, first.source.clone(), Some(&first)).unwrap().rev,
+            first.rev
+        );
+        std::fs::write(&root, "site \"b\"\n").unwrap();
+        let error = snapshot(&root, first.source.clone(), Some(&first)).unwrap_err();
+        assert!(
+            error
+                .iter()
+                .any(|d| d.message == "source revision counter exhausted")
+        );
+        assert_eq!(first.rev, SourceRev(u64::MAX));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -446,6 +446,41 @@ fn dechunk(raw: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn deflate_on_the_wire_is_zlib_wrapped_and_keeps_identity_separate() {
+    let gateway = Gateway::new("encode-deflate-wire");
+    let port = free_port();
+    let original = "HTTP deflate interoperability. ".repeat(100);
+    gateway.apply(&format!(
+        "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ cache default-ttl=\"60s\"; encode \"deflate\"; respond \"{original}\"; }} }}"
+    )).await;
+    let mut encoded = None;
+    for accept in ["identity", "deflate", "identity", "deflate"] {
+        let (head, body) = raw(gateway.address(), "/", accept).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        if accept == "identity" {
+            assert!(!head.to_lowercase().contains("content-encoding:"));
+            assert_eq!(body, original.as_bytes());
+            continue;
+        }
+        assert!(head.to_lowercase().contains("content-encoding: deflate"));
+        assert!(head.to_lowercase().contains("vary: accept-encoding"));
+        assert_eq!(body[0] & 0x0f, 8);
+        assert_eq!(u16::from_be_bytes([body[0], body[1]]) % 31, 0);
+        assert_eq!(body[1] & 0x20, 0);
+        let (mut a, mut b) = (1_u32, 0_u32);
+        for byte in original.bytes() {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        assert_eq!(&body[body.len() - 4..], &((b << 16) | a).to_be_bytes());
+        if let Some(previous) = &encoded {
+            assert_eq!(&body, previous);
+        }
+        encoded = Some(body);
+    }
+}
+
+#[tokio::test]
 async fn a_large_text_response_is_compressed_for_a_client_that_accepts_it() {
     let gateway = Gateway::new("encode");
     let port = free_port();
@@ -513,6 +548,62 @@ async fn a_client_that_does_not_accept_compression_gets_the_original() {
     // would have received a compressed one.
     assert!(head.to_lowercase().contains("vary: accept-encoding"), "{head}");
     assert_eq!(String::from_utf8_lossy(&body), original);
+}
+
+#[tokio::test]
+async fn cached_dynamic_and_precompressed_variants_honor_all_encoding_preferences() {
+    let gateway = Gateway::new("encoding-preferences");
+    let port = free_port();
+    let root = gateway.directory.join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    let original = "negotiated representation. ".repeat(200);
+    std::fs::write(root.join("page.txt"), &original).unwrap();
+    let root_config = root.display().to_string().replace('\\', "/");
+    // Use the real encoder to generate a valid precompressed fixture.
+    gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ encode \"gzip\"; file-server root=\"{root_config}\"; }} }}")).await;
+    let (header, gzip) = raw(gateway.address(), "/page.txt", "gzip").await;
+    assert!(header.to_lowercase().contains("content-encoding: gzip"));
+    assert_eq!(&gzip[..2], &[0x1f, 0x8b]);
+    std::fs::write(root.join("page.txt.gz"), &gzip).unwrap();
+    for precompressed in [false, true] {
+        let encode = if precompressed { "" } else { "encode \"gzip\";" };
+        let outcome = gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ cache default-ttl=\"60s\"; {encode} file-server root=\"{root_config}\" precompressed=#{precompressed}; }} }}")).await;
+        assert!(
+            matches!(outcome, gatel_plan::Outcome::Reloaded { .. }),
+            "{outcome:?}"
+        );
+        // Warm identity first: it must not shadow subsequent encoded variants.
+        for (accept, compressed) in [
+            ("identity", false),
+            ("gzip", true),
+            ("gzip;q=0, *;q=1", false),
+            ("identity\r\nAccept-Encoding: GZIP", true),
+            ("gzip\r\nAccept-Encoding: gzip;q=0", false),
+            ("gzip;q=1.001", false),
+            ("gzip-extra", false),
+            ("gzip;q=0.5, identity;q=1", false),
+            ("*", true),
+        ] {
+            for repeat in 0..2 {
+                let (header, body) = raw(gateway.address(), "/page.txt", accept).await;
+                let header = header.to_lowercase();
+                assert_eq!(
+                    header.contains("content-encoding: gzip"),
+                    compressed,
+                    "{precompressed} {accept}: {header}"
+                );
+                assert!(header.contains("vary: accept-encoding"), "{header}");
+                if repeat == 1 {
+                    assert!(header.contains("hit;"), "{header}");
+                }
+                if compressed {
+                    assert_eq!(body, gzip);
+                } else {
+                    assert_eq!(body, original.as_bytes());
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

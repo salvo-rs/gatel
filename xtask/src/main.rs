@@ -16,115 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// What each crate is allowed to depend on directly.
-///
-/// The point of the low layers is what they *cannot* reach: `gatel-model` has
-/// no async runtime and no I/O, and `gatel-plan` cannot open a socket or
-/// terminate TLS, so neither can accidentally grow a side entrance into the
-/// data plane.
-const ALLOWED: &[(&str, &[&str])] = &[
-    ("gatel-model", &["blake3"]),
-    ("gatel-macros", &["proc-macro2", "quote", "syn", "gatel-model"]),
-    ("gatel-kdl", &["gatel-model", "kdl"]),
-    // Below everything that can open a socket, so the data plane can write to it.
-    ("gatel-observe", &["gatel-model", "time"]),
-    (
-        "gatel-plan",
-        // salvo_core is the project's execution vocabulary; hyper, rustls and
-        // tokio::net are transport and belong below.
-        &[
-            "gatel-model",
-            "gatel-macros",
-            "gatel-kdl",
-            "gatel-observe",
-            "salvo_core",
-        ],
-    ),
-    (
-        "gatel-state",
-        &[
-            "gatel-model",
-            "gatel-plan",
-            "gatel-observe",
-            // The pool dials backends, and some of them speak TLS. The client
-            // side of TLS lives with the server side, not in a second place.
-            "gatel-tls",
-            "gatel-kdl",
-            "bytes",
-            "http",
-            "http-body-util",
-            "hyper",
-            "hyper-util",
-            "salvo_core",
-            "tokio",
-            "tracing",
-        ],
-    ),
-    (
-        "gatel-bundle-std",
-        &[
-            "gatel-model",
-            "gatel-macros",
-            "gatel-plan",
-            "gatel-observe",
-            "async-compression",
-            "bcrypt",
-            "bytes",
-            "futures-util",
-            "http-body-util",
-            "hyper",
-            "tokio-util",
-            "http",
-            "http-body",
-            "pin-project-lite",
-            "salvo_core",
-            "tokio",
-            "tracing",
-        ],
-    ),
-    (
-        "gatel-http",
-        &[
-            "gatel-model",
-            "gatel-plan",
-            "gatel-observe",
-            "gatel-state",
-            "gatel-tls",
-            "gatel-kdl",
-            "gatel-bundle-std",
-            "bytes",
-            "futures-util",
-            "http",
-            "http-body",
-            "http-body-util",
-            "hyper",
-            "hyper-util",
-            "pin-project-lite",
-            "salvo_core",
-            "tokio",
-            "tracing",
-        ],
-    ),
-    (
-        "gatel-tls",
-        &[
-            "gatel-model",
-            "gatel-plan",
-            // The ACME protocol itself. Same organisation, same licence, and
-            // already what v1 uses: one implementation rather than two.
-            "certon",
-            "async-trait",
-            "gatel-observe",
-            "rcgen",
-            "rustls",
-            "time",
-            "tokio",
-            "tokio-rustls",
-            "tracing",
-            "webpki-roots",
-        ],
-    ),
-];
+mod dependencies;
+mod layers;
+use layers::ALLOWED;
 
 const TARGET_LINES: usize = 600;
 const MAX_PRODUCTION_LINES: usize = 800;
@@ -313,54 +207,54 @@ fn repository_root() -> Option<PathBuf> {
     }
 }
 
-/// Read each crate's `[dependencies]` from its manifest and compare against the
-/// whitelist. Reading the manifest rather than `cargo metadata` keeps this
-/// about *declared* dependencies, which is what the rule is about.
+/// Validate every declared production/build dependency, regardless of target or feature.
 fn check_dependencies(root: &Path) -> Vec<String> {
-    let mut failures = Vec::new();
+    let mut failures = layers::validate(ALLOWED);
+    if !failures.is_empty() {
+        return failures;
+    }
+    let packages = match dependencies::read(root) {
+        Ok(packages) => packages,
+        Err(error) => return vec![error],
+    };
     let allowed: BTreeMap<&str, &[&str]> = ALLOWED.iter().copied().collect();
-
+    for manifest in package_manifests(root) {
+        if !packages.values().any(|package| package.manifest == manifest) {
+            failures.push(format!(
+                "manifest {} is not a checked workspace member",
+                manifest.display()
+            ));
+        }
+    }
+    for name in packages.keys() {
+        if !allowed.contains_key(name.as_str()) {
+            failures.push(format!("{name}: missing architecture dependency whitelist"));
+        }
+    }
     for (name, permitted) in &allowed {
-        let manifest = root.join("crates").join(name).join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
-            failures.push(format!("{name}: no manifest at {}", manifest.display()));
+        let Some(package) = packages.get(*name) else {
+            failures.push(format!("{name}: no workspace package"));
             continue;
         };
-        for dependency in declared_dependencies(&text) {
+        for dependency in &package.dependencies {
             if !permitted.contains(&dependency.as_str()) {
-                failures.push(format!(
-                    "{name} depends on `{dependency}`, which its layer does not allow\n           \
-                     if this is deliberate, add it to ALLOWED in xtask and say why"
-                ));
+                failures.push(format!("{name} depends on {dependency}, which its layer does not allow; review xtask/src/layers.rs"));
             }
         }
     }
     failures
 }
 
-/// Parse the `[dependencies]` table only. `[dev-dependencies]` is exempt:
-/// a test may reach anywhere, because it does not ship.
-fn declared_dependencies(manifest: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut inside = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            inside = line == "[dependencies]";
-            continue;
-        }
-        if !inside || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, _)) = line.split_once('=') {
-            // `serde.workspace = true` and `serde = { .. }` name the same
-            // crate; the dotted form is a key path, not a crate name.
-            let name = key.trim().trim_matches('"');
-            let name = name.split_once('.').map(|(head, _)| head).unwrap_or(name);
-            names.push(name.to_string());
-        }
-    }
-    names
+/// Both core crates and independently packaged plugins are architecture layers.
+fn package_manifests(root: &Path) -> Vec<PathBuf> {
+    ["crates", "plugins"]
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(root.join(dir)).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("Cargo.toml"))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn check_file_sizes(root: &Path) -> Vec<String> {
@@ -410,7 +304,7 @@ fn production_lines(text: &str) -> usize {
 
 fn rust_files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut stack = vec![root.join("crates"), root.join("xtask")];
+    let mut stack = vec![root.join("crates"), root.join("plugins"), root.join("xtask")];
     while let Some(directory) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;

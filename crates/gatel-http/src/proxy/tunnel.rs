@@ -20,7 +20,12 @@ impl ProxyTerminal {
         client_upgrade: Option<hyper::upgrade::OnUpgrade>,
         in_flight: gatel_state::InFlight,
         endpoint: &str,
+        work: Option<crate::connection_work::ConnectionWork>,
     ) {
+        let Some(work) = work else {
+            response.status_code(StatusCode::BAD_GATEWAY);
+            return;
+        };
         let (parts, _) = upstream_response.into_parts();
         response.status_code(StatusCode::SWITCHING_PROTOCOLS);
         // A 101 carries only the framing headers that describe the switch.
@@ -59,17 +64,20 @@ impl ProxyTerminal {
         let timeouts = self.upstream.spec.timeouts;
         let upstream = self.upstream.spec.id.name().to_string();
         let endpoint = endpoint.to_string();
-        tokio::spawn(async move {
+        let registered = work.set(async move {
             // Both futures resolve only after the 101 has actually been sent,
             // which is why this waits rather than upgrading in place.
-            let (client, backend) = match tokio::join!(client_upgrade, backend_upgrade) {
-                (Ok(client), Ok(backend)) => (client, backend),
-                (client, backend) => {
+            let (client, backend) = match tokio::time::timeout(timeouts.response_head, async {
+                tokio::try_join!(client_upgrade, backend_upgrade)
+            })
+            .await
+            {
+                Ok(Ok(pair)) => pair,
+                failure => {
                     tracing::debug!(
                         target: "gatel::connection",
                         event = "upgrade_failed",
-                        client_error = client.err().map(|error| error.to_string()),
-                        backend_error = backend.err().map(|error| error.to_string()),
+                        timed_out = failure.is_err(),
                     );
                     return;
                 }
@@ -90,5 +98,8 @@ impl ProxyTerminal {
                 reason = reason.as_str(),
             );
         });
+        if registered.is_err() {
+            response.status_code(StatusCode::BAD_GATEWAY);
+        }
     }
 }

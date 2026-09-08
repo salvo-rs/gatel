@@ -31,8 +31,25 @@ impl Counter {
 }
 
 /// A number that goes both ways.
+///
+/// Use HighWaterMark instead for unordered notifications of a monotonic value.
 #[derive(Debug, Default)]
 pub struct Gauge(AtomicI64);
+
+/// Largest unsigned value observed in this instrument's lifetime. Rendered as a
+/// gauge, not a count of events; late notifications cannot lower the value.
+#[derive(Debug, Default)]
+pub struct HighWaterMark(AtomicU64);
+
+impl HighWaterMark {
+    pub fn observe(&self, value: u64) {
+        self.0.fetch_max(value, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 impl Gauge {
     pub const fn new() -> Self {
@@ -130,6 +147,26 @@ impl Histogram {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn high_water_mark_handles_concurrent_arrivals_and_full_unsigned_range() {
+        let mark = super::HighWaterMark::default();
+        std::thread::scope(|scope| {
+            for start in 0..4 {
+                let mark = &mark;
+                scope.spawn(move || {
+                    for value in (0..100).rev() {
+                        let value = start * 100 + value;
+                        mark.observe(value);
+                        assert!(mark.get() >= value);
+                    }
+                });
+            }
+        });
+        assert_eq!(mark.get(), 399);
+        mark.observe(u64::MAX);
+        mark.observe(1);
+        assert_eq!(mark.get(), u64::MAX);
+    }
     use std::time::Duration;
 
     use super::*;

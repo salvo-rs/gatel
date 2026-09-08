@@ -1,0 +1,24 @@
+[package]
+name = "gatel-cgi-http"
+description = "Shared HTTP lifecycle adapter for optional CGI transports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gatel-model.workspace = true
+gatel-macros.workspace = true
+gatel-plugin-runtime.workspace = true
+gatel-cgi-protocol.workspace = true
+salvo_core.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

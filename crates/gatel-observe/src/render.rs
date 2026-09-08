@@ -21,6 +21,8 @@ pub fn prometheus(telemetry: &Telemetry) -> String {
     let metrics = &telemetry.metrics;
     let mut out = String::with_capacity(4096);
     process(metrics, &mut out);
+    health(telemetry, &mut out);
+    telemetry.workers.append(&mut out);
     listeners(metrics, &mut out);
     routes(metrics, &mut out);
     upstreams(metrics, &mut out);
@@ -29,6 +31,32 @@ pub fn prometheus(telemetry: &Telemetry) -> String {
 }
 
 const SINK: &[&str] = &["sink"];
+
+fn health(telemetry: &Telemetry, out: &mut String) {
+    // Sample once so readiness and its reasons belong to the same report.
+    let report = telemetry.health.report();
+    family(
+        out,
+        "gatel_ready",
+        "Whether this instance is ready to receive traffic, including degraded service.",
+        "gauge",
+    );
+    let _ = writeln!(out, "gatel_ready {}", u8::from(report.state.is_serving()));
+    family(
+        out,
+        "gatel_health_reason",
+        "Presence of a health reason, aggregated without resource identities or diagnostic text.",
+        "gauge",
+    );
+    for code in crate::health::Reason::CODES {
+        let present = report.reasons.iter().any(|reason| reason.code() == code);
+        let _ = writeln!(
+            out,
+            "gatel_health_reason{{reason=\"{code}\"}} {}",
+            u8::from(present)
+        );
+    }
+}
 
 fn sinks(telemetry: &Telemetry, out: &mut String) {
     family(
@@ -61,7 +89,7 @@ fn process(metrics: &Metrics, out: &mut String) {
     family(
         out,
         "gatel_generation",
-        "The configuration generation currently serving. Zero before the first one is accepted.",
+        "Highest accepted generation reported in this process. Zero before the first report.",
         "gauge",
     );
     let _ = writeln!(out, "gatel_generation {}", process.generation.get());
@@ -438,6 +466,31 @@ mod tests {
     }
 
     #[test]
+    fn health_metrics_distinguish_degraded_from_persistence_failure_without_sensitive_labels() {
+        let telemetry = telemetry();
+        let initial = prometheus(&telemetry);
+        assert!(initial.contains("gatel_ready 0\n"));
+        assert!(initial.contains("gatel_health_reason{reason=\"starting\"} 1\n"));
+        telemetry.health.committed(1);
+        telemetry.health.reload_failed("private-config-value");
+        let degraded = prometheus(&telemetry);
+        assert!(degraded.contains("gatel_ready 1\n"));
+        assert!(degraded.contains("gatel_health_reason{reason=\"reload_failing\"} 1\n"));
+        telemetry.health.persistence_unknown();
+        let failed = prometheus(&telemetry);
+        assert!(failed.contains("gatel_ready 0\n"));
+        assert!(failed.contains("gatel_health_reason{reason=\"persistence_unknown\"} 1\n"));
+        assert_eq!(
+            failed
+                .lines()
+                .filter(|line| line.starts_with("gatel_health_reason{"))
+                .count(),
+            7
+        );
+        assert!(!failed.contains("private-config-value"));
+    }
+
+    #[test]
     fn a_counter_carries_its_series_labels_and_its_own() {
         let telemetry = telemetry();
         let metrics = &telemetry.metrics;
@@ -494,7 +547,7 @@ mod tests {
     fn an_unlabelled_metric_has_no_braces() {
         let telemetry = telemetry();
         let metrics = &telemetry.metrics;
-        metrics.process.generation.set(3);
+        metrics.process.generation.observe(3);
         assert!(prometheus(&telemetry).contains("\ngatel_generation 3\n"));
     }
 

@@ -1,0 +1,8 @@
+global { http "127.0.0.1:8080" }
+site "*" {
+    route "/*" {
+        body-limit "8MiB"
+        decode max-encoded="8MiB" max-decoded="8MiB" max-ratio=100 max-inflight=8 timeout-ms=10000
+        respond "request validated"
+    }
+}

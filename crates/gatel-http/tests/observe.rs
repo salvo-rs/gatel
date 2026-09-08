@@ -29,10 +29,24 @@ site "*" id="all" {{
         .await;
 
     let address = gateway.address();
+    gateway
+        .telemetry
+        .workers
+        .get(gatel_observe::workers::WorkerKind::Probe)
+        .starts
+        .increment();
     get(address, "/api/one").await;
     get(address, "/api/two").await;
 
     let scrape = get(address, "/metrics").await;
+    assert_eq!(
+        value(&scrape, r#"gatel_worker_starts_total{service="probe"}"#),
+        Some(1.0)
+    );
+    assert_eq!(
+        value(&scrape, r#"gatel_workers_backoff{service="census"}"#),
+        Some(0.0)
+    );
     assert!(
         scrape.contains("content-type: text/plain; version=0.0.4"),
         "a scrape must announce the exposition format: {scrape}"

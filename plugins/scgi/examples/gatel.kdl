@@ -1,0 +1,6 @@
+global { http "127.0.0.1:8080"; }
+site "*" {
+    route "/*" {
+        scgi "127.0.0.1:4000" root="." script="app.marker" script-name="/app" buffer-unknown=#true
+    }
+}

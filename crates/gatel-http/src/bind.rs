@@ -31,6 +31,31 @@ impl BindTable {
         Self::default()
     }
 
+    /// Transfer a bound TCP listener into process-owned socket storage without
+    /// closing and rebinding it. Its actual local address must appear in the
+    /// configuration; port zero is resolved by the OS before registration.
+    ///
+    /// The caller must enter a Tokio runtime with I/O enabled, as for `ensure`.
+    /// The listener becomes nonblocking. On error the supplied handle is dropped
+    /// and existing entries are unchanged. Duplicate addresses never replace an
+    /// active listener. This is an embedding hook, not an OS activation protocol.
+    pub fn adopt(&self, listener: std::net::TcpListener) -> Result<SocketAddr, String> {
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("cannot inspect listener: {error}"))?;
+        let mut sockets = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+        if sockets.contains_key(&address) {
+            return Err(format!("listener {address} is already registered"));
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("cannot configure listener {address}: {error}"))?;
+        let listener = TcpListener::from_std(listener)
+            .map_err(|error| format!("cannot register listener {address}: {error}"))?;
+        sockets.insert(address, Arc::new(listener));
+        Ok(address)
+    }
+
     /// Bind every address that is not bound yet, and hand back the whole set.
     ///
     /// All or nothing: if the third of four addresses is already in use, the
@@ -108,9 +133,55 @@ fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn adopting_keeps_queued_connections_and_rejects_duplicate_ownership() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let table = BindTable::new();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let duplicate = socket.try_clone().unwrap();
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(b"queued before adoption").await.unwrap();
+        assert_eq!(table.adopt(socket).unwrap(), address);
+        let adopted = table.get(&address).unwrap();
+        assert!(table.adopt(duplicate).unwrap_err().contains("already registered"));
+        assert!(Arc::ptr_eq(
+            &adopted,
+            &table.ensure(&[address]).unwrap()[&address]
+        ));
+        let (mut accepted, _) = tokio::time::timeout(std::time::Duration::from_secs(2), adopted.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 22];
+        tokio::time::timeout(std::time::Duration::from_secs(2), accepted.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"queued before adoption");
+        drop(accepted);
+        drop(client);
+        let weak = Arc::downgrade(&adopted);
+        drop(adopted);
+        assert_eq!(table.retain(&[]), vec![address]);
+        assert!(weak.upgrade().is_none());
+    }
+
     fn free_address() -> SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
+        static USED: std::sync::Mutex<std::collections::BTreeSet<SocketAddr>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let mut used = USED.lock().unwrap();
+        let mut repeated = Vec::new();
+        loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            if used.insert(address) {
+                return address;
+            }
+            // Do not immediately close a repeated allocation: the OS may keep
+            // returning that same port instead of selecting a distinct one.
+            repeated.push(listener);
+        }
     }
 
     #[tokio::test]
@@ -129,11 +200,11 @@ mod tests {
     #[tokio::test]
     async fn a_partly_failing_bind_leaves_nothing_behind() {
         let table = BindTable::new();
-        let good = free_address();
-
         // Hold an address so binding it fails.
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let occupied = taken.local_addr().unwrap();
+        let good = free_address();
+        assert_ne!(good, occupied);
 
         let error = table.ensure(&[good, occupied]).unwrap_err();
         assert!(error.contains("cannot bind"));

@@ -52,6 +52,14 @@ struct LimitsNode {
 }
 
 #[derive(Debug, FromNode)]
+struct BlockingNode {
+    #[gatel(prop)]
+    jobs: Option<u32>,
+    #[gatel(prop)]
+    memory: Option<ByteSize>,
+}
+
+#[derive(Debug, FromNode)]
 struct LogNode {
     #[gatel(prop, default = String::from("info"))]
     level: String,
@@ -82,6 +90,33 @@ impl Context<'_> {
 
         for child in &node.children {
             match child.name.as_str() {
+                "blocking" => {
+                    if global.blocking.is_some() {
+                        self.error(
+                            Code::Duplicate,
+                            &child.origin,
+                            "global blocking is declared twice",
+                        );
+                        continue;
+                    }
+                    if let Some(decoded) = BlockingNode::from_node(child, self.diagnostics) {
+                        let defaults = crate::blocking::Limits::default();
+                        let jobs = decoded.jobs.map(|jobs| jobs as usize).unwrap_or(defaults.jobs);
+                        let memory_bytes = decoded
+                            .memory
+                            .map(|memory| memory.bytes())
+                            .unwrap_or(defaults.memory_bytes);
+                        if !(1..=1024).contains(&jobs) || memory_bytes == 0 {
+                            self.error(
+                                Code::InvalidValue,
+                                &child.origin,
+                                "blocking requires 1..1024 jobs and nonzero memory",
+                            );
+                        } else {
+                            global.blocking = Some(crate::blocking::Limits { jobs, memory_bytes });
+                        }
+                    }
+                }
                 "http" | "https" => {
                     let protocol = if child.name == "http" {
                         ListenerProtocol::Http
@@ -143,7 +178,8 @@ impl Context<'_> {
                     }
                 }
                 other => {
-                    const KNOWN: [&str; 8] = [
+                    const KNOWN: [&str; 9] = [
+                        "blocking",
                         "http",
                         "https",
                         "grace-period",
@@ -351,6 +387,14 @@ impl Context<'_> {
     }
 
     pub(super) fn upstream(&mut self, node: &Node, owner: &SourceId) -> Option<Upstream> {
+        if node.args.len() != 1 {
+            self.error(
+                Code::ArgumentCount,
+                &node.origin,
+                "`upstream` takes exactly one name",
+            );
+            return None;
+        }
         let Some(name) = node.args.first().and_then(|value| value.as_str()) else {
             self.error(Code::ArgumentCount, &node.origin, "`upstream` needs a name");
             return None;

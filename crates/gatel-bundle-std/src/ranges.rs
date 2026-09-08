@@ -33,6 +33,31 @@ const INLINE_LIMIT: u64 = 64 * 1024;
 /// in pieces of exactly that size.
 const CHUNK: usize = INLINE_LIMIT as usize;
 
+/// One opened representation owns both the metadata and the eventual reader.
+/// A path replacement after opening cannot select another file for its body.
+pub struct OpenedFile {
+    file: tokio::fs::File,
+    metadata: std::fs::Metadata,
+}
+
+impl OpenedFile {
+    pub async fn open(path: &Path) -> Result<Self, std::io::Error> {
+        let file = tokio::fs::File::open(path).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(Self { file, metadata })
+    }
+
+    pub fn metadata(&self) -> &std::fs::Metadata {
+        &self.metadata
+    }
+}
+
 /// How much of a file the client asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wanted {
@@ -64,25 +89,28 @@ pub fn wanted(request: &Request, size: u64, etag: &str) -> Wanted {
     // it as absent would be reading "I only want a part if it is still the
     // same file" as "give me a part", which is the one direction that
     // corrupts a download.
-    if let Some(condition) = request.headers().get(http::header::IF_RANGE)
-        && condition.to_str().map(str::trim).ok() != Some(etag)
-    {
-        return Wanted::Whole;
+    if request.headers().contains_key(http::header::IF_RANGE) {
+        let Some(condition) = header_of(request, http::header::IF_RANGE) else {
+            return Wanted::Whole;
+        };
+        if !crate::preconditions::strong_equal(condition.trim().as_bytes(), etag.as_bytes()) {
+            return Wanted::Whole;
+        }
     }
 
-    let Some(spec) = asked.trim().strip_prefix("bytes=") else {
+    let Some((unit, spec)) = asked.trim().split_once('=') else {
         return Wanted::Whole;
     };
-    if spec.contains(',') {
+    if !unit.eq_ignore_ascii_case("bytes") || spec.contains(',') {
         return Wanted::Whole;
     }
-    let Some((from, to)) = spec.trim().split_once('-') else {
+    let Some((from, to)) = spec.split_once('-') else {
         return Wanted::Whole;
     };
 
-    match (from.trim(), to.trim()) {
+    match (from, to) {
         // `bytes=-500`: the last 500 bytes.
-        ("", last) => match last.parse::<u64>() {
+        ("", last) => match decimal(last) {
             // A suffix of an empty file is a request nothing can satisfy.
             // Without this the arithmetic saturates to `0-0`, which is one
             // byte of a file that has none.
@@ -94,12 +122,13 @@ pub fn wanted(request: &Request, size: u64, etag: &str) -> Wanted {
             },
             Err(_) => Wanted::Whole,
         },
-        (first, "") => match first.parse::<u64>() {
+        (first, "") => match decimal(first) {
             Ok(start) if start < size => Wanted::Part { start, end: size - 1 },
             Ok(_) => Wanted::Unsatisfiable,
             Err(_) => Wanted::Whole,
         },
-        (first, last) => match (first.parse::<u64>(), last.parse::<u64>()) {
+        (first, last) => match (decimal(first), decimal(last)) {
+            (Ok(start), Ok(end)) if start > end => Wanted::Whole,
             (Ok(start), Ok(end)) if start < size && start <= end => Wanted::Part {
                 start,
                 // A client may ask past the end; it gets what exists.
@@ -112,7 +141,25 @@ pub fn wanted(request: &Request, size: u64, etag: &str) -> Wanted {
 }
 
 fn header_of(request: &Request, name: http::header::HeaderName) -> Option<&str> {
-    request.headers().get(name).and_then(|value| value.to_str().ok())
+    let mut values = request.headers().get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+// Saturating decimal arithmetic keeps valid arbitrarily large range positions
+// meaningful (large end/suffix clamps, large start is unsatisfiable). Rust's
+// numeric parser additionally accepts '+' and rejects overflow, neither of
+// which is the range grammar/semantics needed here.
+fn decimal(value: &str) -> Result<u64, ()> {
+    if value.is_empty() {
+        return Err(());
+    }
+    value.bytes().try_fold(0u64, |number, digit| {
+        if !digit.is_ascii_digit() {
+            return Err(());
+        }
+        Ok(number.saturating_mul(10).saturating_add(u64::from(digit - b'0')))
+    })
 }
 
 /// Write the file, or the part of it that was asked for.
@@ -121,10 +168,18 @@ fn header_of(request: &Request, name: http::header::HeaderName) -> Option<&str> 
 /// costs less than the machinery to avoid doing so.
 pub async fn deliver(
     response: &mut Response,
-    path: &Path,
-    size: u64,
+    opened: OpenedFile,
     wanted: Wanted,
 ) -> Result<(), std::io::Error> {
+    let size = opened.metadata.len();
+    if let Wanted::Part { start, end } = wanted
+        && (start > end || end >= size)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "range outside selected file",
+        ));
+    }
     response.headers_mut().insert(
         http::header::ACCEPT_RANGES,
         http::HeaderValue::from_static("bytes"),
@@ -157,20 +212,23 @@ pub async fn deliver(
         response.headers_mut().insert(http::header::CONTENT_LENGTH, value);
     }
 
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = opened.file;
     if start > 0 {
         file.seek(std::io::SeekFrom::Start(start)).await?;
     }
 
     if length <= INLINE_LIMIT {
         let mut buffer = Vec::with_capacity(length as usize);
-        file.take(length).read_to_end(&mut buffer).await?;
+        crate::file_body::ExactReader::new(file, length)
+            .read_to_end(&mut buffer)
+            .await?;
         response.body(ResBody::Once(buffer.into()));
         return Ok(());
     }
 
     // Streamed: the memory this costs is one buffer, whatever the file weighs.
-    let stream = tokio_util::io::ReaderStream::with_capacity(file.take(length), CHUNK);
+    let stream =
+        tokio_util::io::ReaderStream::with_capacity(crate::file_body::ExactReader::new(file, length), CHUNK);
     let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
         Ok(bytes) => Ok(http_body::Frame::data(bytes)),
         Err(error) => Err(Box::new(error) as salvo_core::BoxedError),
@@ -184,6 +242,17 @@ mod tests {
     use http::header::HeaderValue;
 
     use super::*;
+
+    async fn deliver(
+        response: &mut Response,
+        path: &Path,
+        size: u64,
+        wanted: Wanted,
+    ) -> Result<(), std::io::Error> {
+        let opened = OpenedFile::open(path).await?;
+        assert_eq!(opened.metadata().len(), size);
+        super::deliver(response, opened, wanted).await
+    }
 
     fn request(headers: &[(&str, &str)]) -> Request {
         let mut request = Request::default();
@@ -260,7 +329,7 @@ mod tests {
     fn a_backwards_range_is_not_one() {
         assert_eq!(
             wanted(&request(&[("range", "bytes=500-100")]), 1000, TAG),
-            Wanted::Unsatisfiable
+            Wanted::Whole
         );
     }
 
@@ -282,6 +351,61 @@ mod tests {
                 "`{spec}` should have been ignored"
             );
         }
+    }
+
+    #[test]
+    fn duplicate_range_fields_and_weak_if_range_do_not_select_a_fragment() {
+        let mut request = request(&[("range", "bytes=0-9"), ("if-range", TAG)]);
+        request
+            .headers_mut()
+            .append(http::header::IF_RANGE, HeaderValue::from_static(TAG));
+        assert_eq!(wanted(&request, 100, TAG), Wanted::Whole);
+        request.headers_mut().remove(http::header::IF_RANGE);
+        request
+            .headers_mut()
+            .append(http::header::RANGE, HeaderValue::from_static("bytes=20-29"));
+        assert_eq!(wanted(&request, 100, TAG), Wanted::Whole);
+        request
+            .headers_mut()
+            .insert(http::header::RANGE, HeaderValue::from_static("bytes=0-9"));
+        request
+            .headers_mut()
+            .insert(http::header::IF_RANGE, HeaderValue::from_static("W/\"abc-123\""));
+        assert_eq!(wanted(&request, 100, "W/\"abc-123\""), Wanted::Whole);
+        assert_eq!(wanted(&request, 100, TAG), Wanted::Whole);
+    }
+
+    #[test]
+    fn decimal_range_grammar_and_large_positions_are_handled_without_overflow() {
+        for spec in [
+            "bytes=+1-3",
+            "bytes=1-+3",
+            "bytes=-+3",
+            "bytes=1 -3",
+            "bytes=1- 3",
+            "bytes= 1-3",
+        ] {
+            assert_eq!(
+                wanted(&request(&[("range", spec)]), 10, TAG),
+                Wanted::Whole,
+                "{spec}"
+            );
+        }
+        for spec in [
+            "bytes=0-184467440737095516160",
+            "bytes=-184467440737095516160",
+            "BYTES=0-9",
+        ] {
+            assert_eq!(
+                wanted(&request(&[("range", spec)]), 10, TAG),
+                Wanted::Part { start: 0, end: 9 },
+                "{spec}"
+            );
+        }
+        assert_eq!(
+            wanted(&request(&[("range", "bytes=184467440737095516160-")]), 10, TAG),
+            Wanted::Unsatisfiable
+        );
     }
 
     #[test]
@@ -307,8 +431,14 @@ mod tests {
     }
 
     async fn write(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join(format!("gatel-ranges-{tag}"));
-        let _ = std::fs::remove_dir_all(&directory);
+        let directory = std::env::temp_dir().join(format!(
+            "gatel-ranges-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("file.bin");
         std::fs::write(&path, bytes).unwrap();
@@ -322,6 +452,77 @@ mod tests {
             ResBody::None => Vec::new(),
             other => other.collect().await.map(|got| got.to_bytes().to_vec()).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn pathname_replacement_cannot_change_an_opened_representation() {
+        for size in [32, INLINE_LIMIT as usize + 4096] {
+            let original = vec![b'a'; size];
+            let path = write("replace-opened", &original).await;
+            let opened = OpenedFile::open(&path).await.unwrap();
+            assert_eq!(opened.metadata().len(), size as u64);
+            // Replacing the name is the usual deployment pattern. The open
+            // reader must keep the old file, including on the streaming path.
+            std::fs::rename(&path, path.with_extension("old")).unwrap();
+            std::fs::write(&path, b"replacement").unwrap();
+            let mut response = Response::new();
+            super::deliver(&mut response, opened, Wanted::Whole)
+                .await
+                .unwrap();
+            assert_eq!(body_of(&mut response).await, original);
+            assert_eq!(response.headers()[http::header::CONTENT_LENGTH], size.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn truncation_is_an_error_for_inline_and_streaming_bodies() {
+        use http_body_util::BodyExt;
+        for size in [32, INLINE_LIMIT as usize + 4096] {
+            let path = write("truncate-opened", &vec![b'a'; size]).await;
+            let opened = OpenedFile::open(&path).await.unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(3)
+                .unwrap();
+            let mut response = Response::new();
+            let result = super::deliver(&mut response, opened, Wanted::Whole).await;
+            if size <= INLINE_LIMIT as usize {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+            } else {
+                result.unwrap();
+                assert!(std::mem::take(response.body_mut()).collect().await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn opened_range_uses_original_handle_and_rejects_invalid_bounds() {
+        let path = write("range-opened", b"0123456789").await;
+        let opened = OpenedFile::open(&path).await.unwrap();
+        std::fs::rename(&path, path.with_extension("old")).unwrap();
+        std::fs::write(&path, b"new").unwrap();
+        let mut response = Response::new();
+        super::deliver(&mut response, opened, Wanted::Part { start: 2, end: 5 })
+            .await
+            .unwrap();
+        assert_eq!(body_of(&mut response).await, b"2345");
+        let opened = OpenedFile::open(&path).await.unwrap();
+        assert_eq!(
+            super::deliver(
+                &mut response,
+                opened,
+                Wanted::Part {
+                    start: 2,
+                    end: u64::MAX
+                }
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[tokio::test]

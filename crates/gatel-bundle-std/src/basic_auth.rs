@@ -1,13 +1,14 @@
 //! `basic-auth`: require a username and password.
 //!
 //! Passwords are referenced, never written into configuration, and are stored
-//! as bcrypt hashes. A configuration file ends up in version control, in a
+//! as bounded password hashes. A configuration file ends up in version control, in a
 //! container image and in a backup; a password in one is a password in all
 //! three.
 
 use std::sync::Arc;
 
-use gatel_model::{Code, Diagnostic, Diagnostics, Hasher, Node, SecretRef, SecretString};
+use gatel_model::{Code, Diagnostic, Diagnostics, Hasher, Node, SecretRef};
+use gatel_password::Credential;
 use gatel_plan::{BuildContext, Directive, DirectiveConfig, DirectiveMeta, Phase, Scopes};
 use salvo_core::http::{Request, Response, StatusCode};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
@@ -26,6 +27,10 @@ pub struct Config {
 
 impl DirectiveConfig for Config {
     fn hash_into(&self, hasher: &mut Hasher) {
+        hasher.update_str("gatel-basic-auth-v4");
+        for algorithm in gatel_password::algorithms() {
+            hasher.update_str(algorithm);
+        }
         hasher.update_str(&self.realm);
         // The reference, not the material: a hash must never reach a
         // fingerprint that appears in a log or an explain output.
@@ -43,18 +48,18 @@ impl DirectiveConfig for Config {
             let hash = cx
                 .secret(&user.hash)
                 .map_err(|error| format!("user `{}`: {error}", user.name))?;
-            if !looks_like_bcrypt(hash.expose()) {
-                return Err(format!(
-                    "user `{}`: `{}` does not contain a bcrypt hash",
-                    user.name, user.hash
-                ));
-            }
-            users.push((user.name.clone(), hash));
+            let credential =
+                Credential::parse(hash.expose()).map_err(|error| format!("user `{}`: {error}", user.name))?;
+            users.push((user.name.clone(), credential));
         }
         let challenge = format!("Basic realm=\"{}\", charset=\"UTF-8\"", self.realm);
         let challenge = http::HeaderValue::from_str(&challenge)
             .map_err(|_| format!("`{}` cannot appear in a realm", self.realm))?;
-        Ok(Arc::new(BasicAuthHandler { users, challenge }))
+        Ok(Arc::new(BasicAuthHandler {
+            users: users.into(),
+            challenge,
+            capacity: cx.blocking,
+        }))
     }
 
     fn describe(&self) -> String {
@@ -72,6 +77,14 @@ impl Directive for BasicAuth {
 
     fn decode(&self, node: &Node, diagnostics: &mut Diagnostics) -> Option<Arc<dyn DirectiveConfig>> {
         let errors_before = diagnostics.error_count();
+        if node.children.len() > 1024 {
+            diagnostics.error(
+                Code::InvalidValue,
+                node.origin.clone(),
+                "basic-auth permits at most 1024 users",
+            );
+            return None;
+        }
 
         let realm = match node.prop("realm") {
             Some(property) => match property.value.as_str() {
@@ -119,6 +132,14 @@ impl Directive for BasicAuth {
                 diagnostics.error(Code::ArgumentCount, child.origin.clone(), "`user` needs a name");
                 continue;
             };
+            if name.is_empty() || name.len() > 256 || name.contains([':', '\r', '\n', '\0']) {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "user name must be 1..256 bytes without colon, CR, LF or NUL",
+                );
+                continue;
+            }
             let Some(raw) = child.prop("hash").and_then(|property| property.value.as_str()) else {
                 diagnostics.push(
                     Diagnostic::error(
@@ -139,7 +160,7 @@ impl Directive for BasicAuth {
             };
             // A password written into the configuration, rather than referenced,
             // is the mistake this directive exists to prevent.
-            if looks_like_bcrypt(raw) {
+            if raw.starts_with('$') || looks_like_bcrypt(raw) {
                 diagnostics.push(
                     Diagnostic::error(
                         Code::InvalidSecret,
@@ -188,41 +209,65 @@ fn looks_like_bcrypt(value: &str) -> bool {
 }
 
 struct BasicAuthHandler {
-    users: Vec<(String, SecretString)>,
+    users: Arc<[(String, Credential)]>,
     challenge: http::HeaderValue,
+    capacity: gatel_plan::blocking::Executor,
 }
 
 impl BasicAuthHandler {
-    fn authenticate(&self, request: &Request) -> bool {
+    async fn authenticate(&self, request: &Request) -> Result<bool, gatel_plan::blocking::Error> {
         let Some((name, password)) = credentials(request) else {
-            return false;
+            return Ok(false);
         };
-        // Every user is checked, and the result is combined at the end, so the
-        // time taken does not reveal whether the username exists.
-        let mut authenticated = false;
-        for (candidate, hash) in &self.users {
-            let matched = constant_time_eq(candidate.as_bytes(), name.as_bytes())
-                && bcrypt::verify(&password, hash.expose()).unwrap_or(false);
-            authenticated |= matched;
-        }
-        authenticated
+        let users = self.users.clone();
+        let selected = users
+            .iter()
+            .position(|(candidate, _)| constant_time_eq(candidate.as_bytes(), name.as_bytes()));
+        let index = selected.unwrap_or(0);
+        let Some((_, credential)) = users.get(index) else {
+            return Ok(false);
+        };
+        self.capacity
+            .run(credential.memory_bytes(), move || {
+                // Unknown users still pay for one verification. Mixed per-user costs
+                // do not promise constant-time identity hiding; no all-user hashing.
+                let verified = users[index].1.verify(password.as_bytes());
+                selected.is_some() && verified
+            })
+            .await
     }
 }
 
 /// Pull the username and password out of an `Authorization: Basic` header.
 fn credentials(request: &Request) -> Option<(String, String)> {
+    if request
+        .headers()
+        .get_all(http::header::AUTHORIZATION)
+        .iter()
+        .count()
+        != 1
+    {
+        return None;
+    }
     let header = request
         .headers()
         .get(http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
-    let encoded = header
-        .strip_prefix("Basic ")
-        .or_else(|| header.strip_prefix("basic "))?;
+    let (scheme, encoded) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    if encoded.len() > 1024 {
+        return None;
+    }
     let decoded = base64_decode(encoded.trim())?;
     let text = String::from_utf8(decoded).ok()?;
     // A password may contain a colon; a username may not.
     let (name, password) = text.split_once(':')?;
+    if name.is_empty() || name.len() > 256 || password.len() > 256 || text.contains(['\r', '\n', '\0']) {
+        return None;
+    }
     Some((name.to_string(), password.to_string()))
 }
 
@@ -238,17 +283,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     difference == 0
 }
 
-/// Decode standard base64. Written out because this is the only place the
-/// project needs it, and it is twenty lines.
+/// Decode canonical padded standard base64, rejecting data after padding.
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    if input.is_empty() || !input.len().is_multiple_of(4) {
+        return None;
+    }
+    let unpadded = input.trim_end_matches('=');
+    let padding = input.len() - unpadded.len();
+    if padding > 2 {
+        return None;
+    }
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     let mut accumulator: u32 = 0;
     let mut bits = 0u32;
-    for byte in input.bytes() {
-        if byte == b'=' {
-            break;
-        }
+    for byte in unpadded.bytes() {
         let value = TABLE.iter().position(|candidate| *candidate == byte)? as u32;
         accumulator = (accumulator << 6) | value;
         bits += 6;
@@ -256,6 +305,9 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
             bits -= 8;
             out.push((accumulator >> bits) as u8);
         }
+    }
+    if bits != (padding * 2) as u32 || accumulator & ((1 << bits) - 1) != 0 {
+        return None;
     }
     Some(out)
 }
@@ -269,7 +321,17 @@ impl Handler for BasicAuthHandler {
         response: &mut Response,
         ctrl: &mut FlowCtrl,
     ) {
-        if self.authenticate(request) {
+        let accepted = match self.authenticate(request).await {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                crate::generated(depot);
+                response.status_code(StatusCode::SERVICE_UNAVAILABLE);
+                let _ = response.write_body("503 authentication capacity unavailable\n");
+                ctrl.skip_rest();
+                return;
+            }
+        };
+        if accepted {
             ctrl.call_next(request, depot, response).await;
             return;
         }
@@ -319,8 +381,14 @@ mod tests {
     fn handler(name: &str, password: &str) -> BasicAuthHandler {
         let hash = bcrypt::hash(password, 4).unwrap();
         BasicAuthHandler {
-            users: vec![(name.to_string(), SecretString::new(hash))],
+            users: vec![(name.to_string(), Credential::parse(&hash).unwrap())].into(),
             challenge: http::HeaderValue::from_static("Basic realm=\"test\""),
+            capacity: gatel_plan::blocking::Budget::new(gatel_plan::blocking::Limits {
+                jobs: 1,
+                memory_bytes: 32768,
+            })
+            .unwrap()
+            .executor(),
         }
     }
 
@@ -345,26 +413,49 @@ mod tests {
         format!("Basic {encoded}")
     }
 
-    #[test]
-    fn correct_credentials_are_accepted_and_wrong_ones_are_not() {
+    #[tokio::test]
+    async fn correct_credentials_are_accepted_and_wrong_ones_are_not() {
         let handler = handler("admin", "hunter2");
-        assert!(handler.authenticate(&request_with(Some(&basic("admin", "hunter2")))));
-        assert!(!handler.authenticate(&request_with(Some(&basic("admin", "wrong")))));
-        assert!(!handler.authenticate(&request_with(Some(&basic("someone", "hunter2")))));
-        assert!(!handler.authenticate(&request_with(None)));
+        assert!(
+            handler
+                .authenticate(&request_with(Some(&basic("admin", "hunter2"))))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handler
+                .authenticate(&request_with(Some(&basic("admin", "wrong"))))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handler
+                .authenticate(&request_with(Some(&basic("someone", "hunter2"))))
+                .await
+                .unwrap()
+        );
+        assert!(!handler.authenticate(&request_with(None)).await.unwrap());
     }
 
-    #[test]
-    fn a_password_may_contain_a_colon() {
+    #[tokio::test]
+    async fn a_password_may_contain_a_colon() {
         let handler = handler("admin", "a:b:c");
-        assert!(handler.authenticate(&request_with(Some(&basic("admin", "a:b:c")))));
+        assert!(
+            handler
+                .authenticate(&request_with(Some(&basic("admin", "a:b:c"))))
+                .await
+                .unwrap()
+        );
     }
 
-    #[test]
-    fn a_malformed_header_is_refused_rather_than_panicking() {
+    #[tokio::test]
+    async fn a_malformed_header_is_refused_rather_than_panicking() {
         let handler = handler("admin", "x");
         for header in ["Basic", "Basic !!!!", "Bearer token", "Basic YWRtaW4"] {
-            assert!(!handler.authenticate(&request_with(Some(header))), "{header}");
+            assert!(
+                !handler.authenticate(&request_with(Some(header))).await.unwrap(),
+                "{header}"
+            );
         }
     }
 
@@ -414,6 +505,19 @@ mod tests {
     }
 
     #[test]
+    fn phc_material_is_not_mistaken_for_a_file_reference() {
+        for material in [
+            "$argon2id$v=19$m=19456,t=2,p=1$private-salt$private-hash",
+            "$scrypt$private",
+        ] {
+            let (config, diagnostics) =
+                decode(Node::new("basic-auth", origin()).with_child(user("admin", material)));
+            assert!(config.is_none());
+            assert!(!diagnostics.to_string().contains(material));
+        }
+    }
+
+    #[test]
     fn a_duplicate_user_is_refused() {
         let node = Node::new("basic-auth", origin())
             .with_child(user("admin", "env:A"))
@@ -428,6 +532,8 @@ mod tests {
         let (config, diagnostics) = decode(node);
         assert!(!diagnostics.has_errors(), "{diagnostics}");
         let error = match config.unwrap().build(BuildContext {
+            secrets: Default::default(),
+            blocking: gatel_plan::blocking::Executor::process_default(),
             telemetry: crate::testing::telemetry(),
             upstreams: crate::testing::no_upstreams(),
             root: std::path::Path::new("."),
@@ -471,5 +577,56 @@ mod tests {
         assert_eq!(base64_decode("YWI=").unwrap(), b"ab");
         assert_eq!(base64_decode("YWJj").unwrap(), b"abc");
         assert!(base64_decode("!!!").is_none());
+        for invalid in ["YQ", "YQ=", "YQ===", "YQ==junk", "YR==", "YWJ=", "===="] {
+            assert!(base64_decode(invalid).is_none(), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_exhaustion_is_503_and_long_passwords_cannot_match_a_prefix() {
+        let handler = handler("admin", &"x".repeat(72));
+        assert!(
+            !handler
+                .authenticate(&request_with(Some(&basic("admin", &"x".repeat(73)))))
+                .await
+                .unwrap()
+        );
+        let capacity = handler.capacity.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let work = tokio::spawn(async move {
+            capacity
+                .run(0, move || {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                })
+                .await
+                .unwrap();
+        });
+        ready.await.unwrap();
+        let mut request = request_with(Some(&basic("admin", "x")));
+        let mut response = Response::default();
+        let mut depot = Depot::new();
+        let mut ctrl = FlowCtrl::new(Vec::new());
+        handler
+            .handle(&mut request, &mut depot, &mut response, &mut ctrl)
+            .await;
+        release.send(()).unwrap();
+        work.await.unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!response.headers().contains_key(http::header::WWW_AUTHENTICATE));
+    }
+
+    #[test]
+    fn credentials_bound_allocation_and_reject_duplicate_headers() {
+        assert!(credentials(&request_with(Some(&basic(&"u".repeat(257), "x")))).is_none());
+        assert!(credentials(&request_with(Some(&basic("user", &"x".repeat(1000))))).is_none());
+        let mut request = request_with(Some("bAsIc dXNlcjp4"));
+        assert_eq!(credentials(&request), Some(("user".into(), "x".into())));
+        request.headers_mut().append(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Basic dXNlcjp4"),
+        );
+        assert!(credentials(&request).is_none());
     }
 }

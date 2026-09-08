@@ -11,6 +11,7 @@ use gatel_model::{ByteSize, Code, Diagnostics, Hasher, Node, Origin, ResourceId,
 
 /// How a request picks among healthy endpoints.
 mod decode;
+mod shape;
 mod target;
 
 pub use decode::{anonymous_upstream_id, decode_upstream_body};

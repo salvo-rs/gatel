@@ -1,13 +1,23 @@
 //! The Gatel command line.
 //!
 //! Exit codes are a contract, because scripts read them:
-//! 0 success, 1 the configuration was rejected, 2 the command was used wrongly,
+//! 0 success, 1 configuration rejected or recovery needs coordination, 2 misuse,
 //! 3 the gateway could not run.
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "admin-api")]
+mod admin;
 mod app;
+#[cfg(feature = "admin-api")]
+mod checkpoint_run;
+mod cli_output;
 mod explain;
+mod file_sources;
+mod passwd;
+mod plugins;
+mod precompress;
+mod serve;
 mod trust;
 mod watch;
 
@@ -15,7 +25,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use gatel_plan::Outcome;
 
 use crate::app::App;
@@ -37,11 +47,55 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect existing recovery storage without applying or repairing it.
+    #[cfg(feature = "admin-api")]
+    JournalInspect(admin::journal_cli::Options),
+    /// Export a fully covered checkpoint into a new directory with compacted history.
+    #[cfg(feature = "admin-api")]
+    JournalCompact(admin::journal_cli::compact::Options),
+    /// Format one KDL file to stdout, preserving comments and import statements.
+    Fmt {
+        #[arg(default_value = "gatel.kdl")]
+        config: PathBuf,
+        /// Exit 1 if formatting differs; emit no formatted text and never write files.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Pre-compress static assets into atomic .gz/.br/.zst sidecars.
+    Precompress(precompress::Options),
     /// Serve traffic, reloading when the configuration changes.
     Run {
+        #[cfg(feature = "admin-api")]
+        #[command(flatten)]
+        admin: admin::cli::Options,
+        #[cfg(feature = "admin-api")]
+        #[command(flatten)]
+        bootstrap: admin::bootstrap::Options,
+        #[cfg(feature = "admin-api")]
+        #[command(flatten)]
+        checkpoint: checkpoint_run::Options,
         #[arg(default_value = "gatel.kdl")]
         config: PathBuf,
         /// Compile and bind, then exit without serving. For deployment checks.
+        #[arg(long)]
+        dry_run: bool,
+        /// Additional named KDL source, repeatable; paths are relative to the working directory.
+        #[arg(long = "source", value_name = "NAME=PATH")]
+        sources: Vec<file_sources::NamedFile>,
+    },
+    /// Serve a static directory without a configuration file (development helper).
+    Serve {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(short, long, default_value = "8080", value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        /// IP address to listen on; explicitly opt in to external access.
+        #[arg(short, long, default_value = "127.0.0.1")]
+        listen: std::net::IpAddr,
+        /// List directories without an index file.
+        #[arg(short, long)]
+        browse: bool,
+        /// Compile and bind, then shut down immediately.
         #[arg(long)]
         dry_run: bool,
     },
@@ -49,16 +103,50 @@ enum Command {
     Validate {
         #[arg(default_value = "gatel.kdl")]
         config: PathBuf,
+        #[arg(long = "source", value_name = "NAME=PATH")]
+        sources: Vec<file_sources::NamedFile>,
     },
     /// Print what a configuration compiles to, in execution order.
     Explain {
         #[arg(default_value = "gatel.kdl")]
         config: PathBuf,
+        #[arg(long = "source", value_name = "NAME=PATH")]
+        sources: Vec<file_sources::NamedFile>,
     },
     /// Show what changing from one configuration to another would do.
-    Diff { before: PathBuf, after: PathBuf },
+    Diff {
+        before: PathBuf,
+        after: PathBuf,
+        /// Additional sources in the old configuration (repeatable).
+        #[arg(long = "before-source", value_name = "NAME=PATH")]
+        before_sources: Vec<file_sources::NamedFile>,
+        /// Additional sources in the new configuration (repeatable).
+        #[arg(long = "after-source", value_name = "NAME=PATH")]
+        after_sources: Vec<file_sources::NamedFile>,
+    },
     /// List the directives this build contains.
     Capabilities,
+    /// Generate a password hash from bounded UTF-8 stdin, never a password argument.
+    Passwd {
+        /// Read a password from a pipe or redirected file (not an echoing terminal).
+        #[arg(long, required = true)]
+        stdin: bool,
+        /// Bcrypt work factor. Default 12; lower values are for tests or explicit policy.
+        #[arg(short, long, value_parser = clap::value_parser!(u32).range(4..=16))]
+        cost: Option<u32>,
+        #[arg(long, value_enum, default_value = "bcrypt")]
+        algorithm: passwd::Algorithm,
+    },
+    /// Write shell completions to stdout, without loading configuration.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Write a roff manual to stdout, optionally for a subcommand.
+    ManPage {
+        /// Subcommand path, for example: run.
+        command: Vec<String>,
+    },
     /// Trust the development certificate authority on this machine.
     ///
     /// Only needed for `tls internal`. It changes what every program here
@@ -80,11 +168,63 @@ fn main() -> ExitCode {
     init_logging();
 
     match cli.command {
-        Command::Run { config, dry_run } => run(config, dry_run),
-        Command::Validate { config } => validate(config),
-        Command::Explain { config } => explain(config),
-        Command::Diff { before, after } => diff(before, after),
+        #[cfg(feature = "admin-api")]
+        Command::JournalInspect(options) => admin::journal_cli::run(options),
+        #[cfg(feature = "admin-api")]
+        Command::JournalCompact(options) => admin::journal_cli::compact::run(options),
+        Command::Fmt { config, check } => cli_output::format(&config, check),
+        Command::Precompress(options) => precompress::run(options),
+        Command::Run {
+            config,
+            dry_run,
+            sources,
+            #[cfg(feature = "admin-api")]
+            admin,
+            #[cfg(feature = "admin-api")]
+            bootstrap,
+            #[cfg(feature = "admin-api")]
+            checkpoint,
+        } => {
+            #[cfg(feature = "admin-api")]
+            if checkpoint.checkpoint_journal.is_some() {
+                return checkpoint_run::run(App::new_with_admin(config, sources), checkpoint, admin, dry_run);
+            }
+            run(
+                config,
+                dry_run,
+                sources,
+                #[cfg(feature = "admin-api")]
+                admin,
+                #[cfg(feature = "admin-api")]
+                bootstrap,
+            )
+        }
+        Command::Serve {
+            root,
+            port,
+            listen,
+            browse,
+            dry_run,
+        } => run_app(
+            serve::app(root, std::net::SocketAddr::new(listen, port), browse),
+            dry_run,
+        ),
+        Command::Validate { config, sources } => validate(config, sources),
+        Command::Explain { config, sources } => explain(config, sources),
+        Command::Diff {
+            before,
+            after,
+            before_sources,
+            after_sources,
+        } => diff(before, after, before_sources, after_sources),
         Command::Capabilities => capabilities(),
+        Command::Passwd {
+            stdin: _,
+            cost,
+            algorithm,
+        } => passwd::run(algorithm, cost),
+        Command::Completions { shell } => cli_output::completions(Cli::command(), shell),
+        Command::ManPage { command } => cli_output::man_page(Cli::command(), &command),
         Command::Trust { directory } => trust(directory, true),
         Command::Untrust { directory } => trust(directory, false),
     }
@@ -131,15 +271,15 @@ fn init_logging() {
     }
 }
 
-fn build(config: PathBuf) -> Result<App, ExitCode> {
-    App::new(config).map_err(|error| {
+fn build_sources(config: PathBuf, sources: Vec<file_sources::NamedFile>) -> Result<App, ExitCode> {
+    App::new_with_files(config, sources).map_err(|error| {
         eprintln!("gatel: {error}");
         ExitCode::from(RUNTIME_FAILURE)
     })
 }
 
-fn validate(config: PathBuf) -> ExitCode {
-    let app = match build(config) {
+fn validate(config: PathBuf, sources: Vec<file_sources::NamedFile>) -> ExitCode {
+    let app = match build_sources(config, sources) {
         Ok(app) => app,
         Err(code) => return code,
     };
@@ -161,8 +301,8 @@ fn validate(config: PathBuf) -> ExitCode {
     }
 }
 
-fn explain(config: PathBuf) -> ExitCode {
-    let app = match build(config) {
+fn explain(config: PathBuf, sources: Vec<file_sources::NamedFile>) -> ExitCode {
+    let app = match build_sources(config, sources) {
         Ok(app) => app,
         Err(code) => return code,
     };
@@ -178,19 +318,24 @@ fn explain(config: PathBuf) -> ExitCode {
     }
 }
 
-fn diff(before: PathBuf, after: PathBuf) -> ExitCode {
-    let compile = |path: PathBuf| -> Result<Arc<gatel_plan::Plan>, ExitCode> {
-        let app = build(path.clone())?;
+fn diff(
+    before: PathBuf,
+    after: PathBuf,
+    before_sources: Vec<file_sources::NamedFile>,
+    after_sources: Vec<file_sources::NamedFile>,
+) -> ExitCode {
+    let compile = |path: PathBuf, sources| -> Result<Arc<gatel_plan::Plan>, ExitCode> {
+        let app = build_sources(path.clone(), sources)?;
         app.compile().map_err(|diagnostics| {
             println!("{}:\n{diagnostics}", path.display());
             ExitCode::from(CONFIG_REJECTED)
         })
     };
-    let before = match compile(before) {
+    let before = match compile(before, before_sources) {
         Ok(plan) => plan,
         Err(code) => return code,
     };
-    let after = match compile(after) {
+    let after = match compile(after, after_sources) {
         Ok(plan) => plan,
         Err(code) => return code,
     };
@@ -199,10 +344,11 @@ fn diff(before: PathBuf, after: PathBuf) -> ExitCode {
 }
 
 fn capabilities() -> ExitCode {
-    let registry = match gatel_plan::Registry::builder()
-        .bundle(gatel_bundle_std::bundle())
-        .build()
-    {
+    println!("password algorithms");
+    for algorithm in gatel_password::algorithms() {
+        println!("  {algorithm}");
+    }
+    let registry = match plugins::registry() {
         Ok(registry) => registry,
         Err(error) => {
             eprintln!("gatel: {error}");
@@ -229,7 +375,65 @@ fn capabilities() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(config: PathBuf, dry_run: bool) -> ExitCode {
+fn run(
+    config: PathBuf,
+    dry_run: bool,
+    sources: Vec<file_sources::NamedFile>,
+    #[cfg(feature = "admin-api")] admin: admin::cli::Options,
+    #[cfg(feature = "admin-api")] bootstrap: admin::bootstrap::Options,
+) -> ExitCode {
+    #[cfg(feature = "admin-api")]
+    if admin.admin_listen.is_some() || bootstrap.bootstrap_journal.is_some() {
+        return run_app_inner(
+            App::new_with_admin(config, sources),
+            dry_run,
+            Some(admin),
+            Some(bootstrap),
+        );
+    }
+    run_app(App::new_with_files(config, sources), dry_run)
+}
+
+fn run_app(app: Result<App, String>, dry_run: bool) -> ExitCode {
+    run_app_inner(
+        app,
+        dry_run,
+        #[cfg(feature = "admin-api")]
+        None,
+        #[cfg(feature = "admin-api")]
+        None,
+    )
+}
+
+fn run_app_inner(
+    app: Result<App, String>,
+    dry_run: bool,
+    #[cfg(feature = "admin-api")] admin: Option<admin::cli::Options>,
+    #[cfg(feature = "admin-api")] bootstrap: Option<admin::bootstrap::Options>,
+) -> ExitCode {
+    let app = match app {
+        Ok(app) => Arc::new(app),
+        Err(error) => {
+            eprintln!("gatel: {error}");
+            return ExitCode::from(RUNTIME_FAILURE);
+        }
+    };
+    #[cfg(feature = "admin-api")]
+    let mut bootstrap = match bootstrap.map(|options| options.load(&app.registry)).transpose() {
+        Ok(loaded) => loaded.flatten(),
+        Err(error) => {
+            eprintln!("gatel: {error}");
+            return ExitCode::from(RUNTIME_FAILURE);
+        }
+    };
+    #[cfg(feature = "admin-api")]
+    let admin = match admin.map(|options| options.prepare()).transpose() {
+        Ok(prepared) => prepared.flatten(),
+        Err(error) => {
+            eprintln!("gatel: {error}");
+            return ExitCode::from(RUNTIME_FAILURE);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -238,21 +442,25 @@ fn run(config: PathBuf, dry_run: bool) -> ExitCode {
         }
     };
     runtime.block_on(async move {
-        let app = match build(config) {
-            Ok(app) => Arc::new(app),
-            Err(code) => return code,
-        };
-
         tracing::debug!(
             target: "gatel::process",
             event = "process_started",
-            boot_id = %app.store.boot_id(),
+            boot_id = %app.configuration_status().boot_id,
             config = %app.root.display(),
         );
 
-        match app.attempt() {
+        #[cfg(feature = "admin-api")]
+        let startup = if let Some(bootstrap) = &mut bootstrap {
+            tracing::warn!(target: "gatel::config", event = "checkpoint_bootstrap", "read-only checkpoint bootstrap; subsequent reloads are not persisted");
+            match bootstrap.restore(&app).await {
+                Ok(outcome) => outcome,
+                Err(error) => { eprintln!("gatel: {error}"); app.shutdown().await; return ExitCode::from(RUNTIME_FAILURE); }
+            }
+        } else { app.reload().await };
+        #[cfg(not(feature = "admin-api"))]
+        let startup = app.reload().await;
+        match startup {
             Outcome::Started { generation } => {
-                app.activate().await;
                 for address in app.server.active_addresses().await {
                     tracing::info!(target: "gatel::listener", event = "serving", %address);
                 }
@@ -265,25 +473,73 @@ fn run(config: PathBuf, dry_run: bool) -> ExitCode {
             Outcome::Rejected(diagnostics) => {
                 println!("{diagnostics}");
                 eprintln!("gatel: the configuration was rejected, nothing is serving");
+                app.shutdown().await;
                 return ExitCode::from(CONFIG_REJECTED);
             }
             other => {
                 eprintln!("gatel: could not start: {other:?}");
+                app.shutdown().await;
                 return ExitCode::from(RUNTIME_FAILURE);
             }
         }
 
+        #[cfg(feature = "admin-api")]
+        let mut admin = match admin.map(|prepared| prepared.start(&app)).transpose() {
+            Ok(admin) => admin,
+            Err(error) => {
+                eprintln!("gatel: {error}");
+                app.shutdown().await;
+                return ExitCode::from(RUNTIME_FAILURE);
+            }
+        };
         if dry_run {
+            #[cfg(feature = "admin-api")]
+            if let Some(admin) = admin.take()
+                && let Err(error) = admin.shutdown().await
+            {
+                eprintln!("gatel: {error}");
+                app.shutdown().await;
+                return ExitCode::from(RUNTIME_FAILURE);
+            }
             app.shutdown().await;
             println!("ok: bound and ready, exiting because of --dry-run");
             return ExitCode::SUCCESS;
         }
 
-        watch::reload_on_change(Arc::clone(&app)).await;
+        let wait = async {
+            if app.watches_configuration() {
+                watch::reload_on_change(Arc::clone(&app)).await;
+            } else {
+                watch::shutdown_signal().await;
+            }
+        };
+        #[cfg(feature = "admin-api")]
+        let mut failed = tokio::select! {
+            _ = wait => false,
+            result = async {
+                match admin.as_mut() {
+                    Some(server) => server.terminated().await,
+                    None => std::future::pending().await,
+                }
+            } => { eprintln!("gatel: admin listener stopped unexpectedly: {result:?}"); true }
+        };
+        #[cfg(not(feature = "admin-api"))]
+        wait.await;
 
         tracing::info!(target: "gatel::process", event = "shutdown_started");
+        #[cfg(feature = "admin-api")]
+        if let Some(admin) = admin
+            && let Err(error) = admin.shutdown().await
+        {
+            eprintln!("gatel: {error}");
+            failed = true;
+        }
         app.shutdown().await;
         tracing::info!(target: "gatel::process", event = "shutdown_complete");
+        #[cfg(feature = "admin-api")]
+        if failed {
+            return ExitCode::from(RUNTIME_FAILURE);
+        }
         ExitCode::SUCCESS
     })
 }

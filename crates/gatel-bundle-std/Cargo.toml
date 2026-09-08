@@ -14,9 +14,11 @@ gatel-observe.workspace = true
 gatel-plan.workspace = true
 
 async-compression.workspace = true
-bcrypt.workspace = true
+gatel-password.workspace = true
 bytes.workspace = true
 http.workspace = true
+httpdate.workspace = true
+url.workspace = true
 futures-util.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
@@ -28,5 +30,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+bcrypt.workspace = true
 # `start_paused` lets the timeout tests run in milliseconds rather than minutes.
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
+argon2 = ["gatel-password/argon2"]

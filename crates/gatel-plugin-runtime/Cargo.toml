@@ -1,0 +1,17 @@
+[package]
+name = "gatel-plugin-runtime"
+description = "Gatel plugin handler and resource contracts, independent of the compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gatel-model.workspace = true
+gatel-plugin-api.workspace = true
+gatel-observe.workspace = true
+salvo_core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

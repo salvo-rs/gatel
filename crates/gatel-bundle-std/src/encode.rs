@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use async_compression::tokio::bufread::{BrotliEncoder, DeflateEncoder, GzipEncoder, ZstdEncoder};
+use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use gatel_macros::FromNode;
@@ -99,7 +99,8 @@ impl Directive for Encode {
     fn meta(&self) -> &DirectiveMeta {
         // In the response phase, and ordered after `headers` so a header the
         // operator set is present on the compressed response too.
-        static META: DirectiveMeta = DirectiveMeta::middleware("encode", Phase::Response, Scopes::BOTH);
+        static META: DirectiveMeta =
+            DirectiveMeta::middleware("encode", Phase::Response, Scopes::BOTH).with_version("6");
         &META
     }
 
@@ -148,30 +149,15 @@ struct EncodeHandler {
 }
 
 impl EncodeHandler {
-    /// The best encoding both sides accept, in the operator's order of
-    /// preference rather than the client's.
+    /// Client quality chooses the encoding; operator order breaks ties.
     fn negotiate(&self, request: &Request) -> Option<Encoding> {
-        let accepted = request
-            .headers()
-            .get(http::header::ACCEPT_ENCODING)
-            .and_then(|value| value.to_str().ok())?;
-        let offers: Vec<(&str, f32)> = accepted
-            .split(',')
-            .filter_map(|entry| {
-                let mut parts = entry.split(';');
-                let token = parts.next()?.trim();
-                let quality = parts
-                    .find_map(|part| part.trim().strip_prefix("q=")?.parse::<f32>().ok())
-                    .unwrap_or(1.0);
-                Some((token, quality))
-            })
-            .collect();
-
-        self.encodings.iter().copied().find(|encoding| {
-            offers
-                .iter()
-                .any(|(token, quality)| *quality > 0.0 && (*token == encoding.token() || *token == "*"))
-        })
+        let chosen =
+            crate::encoding_accept::select(request.headers(), self.encodings.iter().map(|e| e.token()))
+                .coding()?;
+        self.encodings
+            .iter()
+            .copied()
+            .find(|encoding| encoding.token() == chosen)
     }
 }
 
@@ -186,30 +172,36 @@ impl Handler for EncodeHandler {
     ) {
         let chosen = self.negotiate(request);
         let head_only = request.method() == http::Method::HEAD;
+        let no_transform = crate::encode_metadata::no_transform(request.headers());
 
+        let previous = crate::file_encoding::push(depot, &self.encodings, self.min_size.bytes());
         ctrl.call_next(request, depot, response).await;
+        crate::file_encoding::restore(depot, previous);
 
         // Whatever happens, the response depends on what the client accepts,
         // so a shared cache must key on it. This is set even when nothing is
         // compressed, or a cache could store an uncompressed copy and serve it
         // to a client that would have received a compressed one.
-        response.headers_mut().insert(
-            http::header::VARY,
-            http::HeaderValue::from_static("accept-encoding"),
-        );
+        crate::vary::append(response.headers_mut(), "accept-encoding");
+
+        // The file producer already selected both bytes and validators using
+        // our offers; transforming again would invalidate its preconditions.
+        if crate::file_encoding::is_selected(depot) {
+            return;
+        }
 
         let Some(encoding) = chosen else { return };
         // Taken first because the decision depends on the body's own size
         // hint: a handler that wrote bytes in memory leaves the length header
         // for hyper to compute, so the header is not there yet.
         let body = std::mem::take(response.body_mut());
-        if head_only || !should_compress(response, &body, self.min_size) {
+        if head_only || no_transform || !should_compress(response, &body, self.min_size) {
             *response.body_mut() = body;
             return;
         }
 
         // Length changes, and is not known until the body ends.
-        response.headers_mut().remove(http::header::CONTENT_LENGTH);
+        crate::encode_metadata::transformed(response.headers_mut());
         response.headers_mut().insert(
             http::header::CONTENT_ENCODING,
             http::HeaderValue::from_static(encoding.token()),
@@ -223,6 +215,12 @@ fn should_compress(response: &Response, body: &ResBody, min_size: ByteSize) -> b
     use http_body::Body as _;
 
     let headers = response.headers();
+    if headers.contains_key(http::header::CONTENT_RANGE)
+        || crate::encode_metadata::no_transform(headers)
+        || response.status_code == Some(http::StatusCode::PARTIAL_CONTENT)
+    {
+        return false;
+    }
     if headers.contains_key(http::header::CONTENT_ENCODING) {
         // Already encoded — by a backend, or by a `file-server` serving a
         // precompressed file. Compressing again would only cost CPU.
@@ -255,7 +253,7 @@ fn should_compress(response: &Response, body: &ResBody, min_size: ByteSize) -> b
 
 /// Already-compressed formats do not get smaller, and trying wastes CPU on
 /// every byte served.
-fn is_compressible(content_type: &str) -> bool {
+pub(crate) fn is_compressible(content_type: &str) -> bool {
     let base = content_type
         .split(';')
         .next()
@@ -287,7 +285,7 @@ fn is_compressible(content_type: &str) -> bool {
 ///
 /// Nothing is buffered: the encoder reads as the client reads, so a slow client
 /// slows the backend rather than filling memory.
-fn compress(body: ResBody, encoding: Encoding) -> ResBody {
+pub(crate) fn compress(body: ResBody, encoding: Encoding) -> ResBody {
     let stream = http_body_util::BodyStream::new(body)
         .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) })
         .map_err(std::io::Error::other);
@@ -307,7 +305,8 @@ fn compress(body: ResBody, encoding: Encoding) -> ResBody {
         Encoding::Zstd => boxed(ZstdEncoder::new(reader)),
         Encoding::Brotli => boxed(BrotliEncoder::new(reader)),
         Encoding::Gzip => boxed(GzipEncoder::new(reader)),
-        Encoding::Deflate => boxed(DeflateEncoder::new(reader)),
+        // RFC 9110 section 8.4.1.2 requires the RFC 1950 zlib wrapper.
+        Encoding::Deflate => boxed(ZlibEncoder::new(reader)),
     }
 }
 
@@ -316,6 +315,37 @@ mod tests {
     use gatel_model::{Origin, Value};
 
     use super::*;
+
+    #[tokio::test]
+    async fn http_deflate_has_zlib_framing_and_an_adler_checksum() {
+        use http_body_util::BodyExt;
+        use tokio::io::AsyncReadExt;
+        let plain = b"HTTP deflate is zlib wrapped, not a raw DEFLATE stream.\n".repeat(100);
+        let body = compress(ResBody::Once(Bytes::from(plain.clone())), Encoding::Deflate);
+        let encoded = body.collect().await.unwrap().to_bytes();
+        // RFC 1950 framing is verified separately from the decoder so using
+        // the same wrong wrapper on both sides cannot make this test pass.
+        assert_eq!(encoded[0] & 0x0f, 8, "CM must select DEFLATE");
+        assert!(encoded[0] >> 4 <= 7, "zlib window must not exceed 32 KiB");
+        assert_eq!(u16::from_be_bytes([encoded[0], encoded[1]]) % 31, 0);
+        assert_eq!(
+            encoded[1] & 0x20,
+            0,
+            "HTTP does not negotiate preset dictionaries"
+        );
+        let (mut a, mut b) = (1_u32, 0_u32);
+        for byte in &plain {
+            a = (a + *byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        assert_eq!(&encoded[encoded.len() - 4..], &((b << 16) | a).to_be_bytes());
+        let mut decoded = Vec::new();
+        async_compression::tokio::bufread::ZlibDecoder::new(encoded.as_ref())
+            .read_to_end(&mut decoded)
+            .await
+            .unwrap();
+        assert_eq!(decoded, plain);
+    }
 
     /// A body that does not know its own length, as a streaming backend
     /// response does not.

@@ -1,0 +1,9 @@
+// Shared by all plugin blocking work in this CLI application, across reloads.
+// Declared algorithm memory, not process RSS or a wall-clock CPU quota.
+global {
+    http "127.0.0.1:8080"
+    blocking jobs=8 memory="128MiB"
+}
+site "*" {
+    route "/" { respond "ok" }
+}

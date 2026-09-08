@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gatel-plugin-runtime.workspace = true
+gatel-plugin-api.workspace = true
 gatel-model.workspace = true
 gatel-observe.workspace = true
 gatel-macros.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "gatel-maintenance"
+description = "Optional maintenance middleware for Gatel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gatel-model.workspace = true
+gatel-macros.workspace = true
+gatel-plugin-runtime.workspace = true
+gatel-plugin-api.workspace = true
+salvo_core.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

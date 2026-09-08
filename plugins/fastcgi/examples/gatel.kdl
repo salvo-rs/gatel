@@ -1,0 +1,8 @@
+// Start a FastCGI responder on 127.0.0.1:9000 before serving requests.
+// cargo run -p gatel --features fastcgi -- run plugins/fastcgi/examples/gatel.kdl
+global { http "127.0.0.1:8080" }
+site "*" {
+    route "/*" {
+        fastcgi "127.0.0.1:9000" root="." script="index.php" server-name="localhost"
+    }
+}

@@ -23,6 +23,149 @@ fn snapshot(text: &str) -> Snapshot {
     ))
 }
 
+#[test]
+fn terminals_have_stable_route_specific_owners() {
+    let registry = Registry::builder()
+        .bundle(Bundle::new("fixture", "1").with(Stub(DirectiveMeta::terminal("answer"))))
+        .build()
+        .unwrap();
+    let normalized = |other: &str| {
+        gatel_plan::normalize(&snapshot(&format!(
+        "global {{ http \":8080\"; }}\nsite \"*\" {{ route \"/a\" {{ answer; }}; route \"/{other}\" {{ answer; }}; }}"
+    )), &registry).unwrap()
+    };
+    let spec = normalized("b");
+    let owners = spec.sites[0]
+        .routes
+        .iter()
+        .map(|route| {
+            let gatel_plan::Terminal::Directive(terminal) = &route.terminal else {
+                panic!("expected directive");
+            };
+            let expected = gatel_model::ResourceId::derived(
+                gatel_model::ResourceKind::Directive,
+                &[route.id.name(), "answer", "route"],
+            );
+            assert_eq!(terminal.owner, expected);
+            terminal.owner.clone()
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(owners[0], owners[1]);
+    let changed = normalized("c");
+    let original = spec.sites[0]
+        .routes
+        .iter()
+        .find(|r| r.path.describe() == "/a")
+        .unwrap();
+    let retained = changed.sites[0]
+        .routes
+        .iter()
+        .find(|r| r.id == original.id)
+        .unwrap();
+    let (gatel_plan::Terminal::Directive(a), gatel_plan::Terminal::Directive(b)) =
+        (&original.terminal, &retained.terminal)
+    else {
+        panic!("expected directives");
+    };
+    assert_eq!(a.owner, b.owner);
+}
+
+#[test]
+fn external_cache_effect_cannot_bypass_a_guard_in_another_scope() {
+    let make = |reverse| {
+        let cache = DirectiveMeta::middleware("external-cache", Phase::Request, Scopes::BOTH)
+            .with_effects(&[gatel_plan::Effect::CacheLookup]);
+        Registry::builder()
+            .bundle(
+                Bundle::new("external", "1")
+                    .with(Stub(if reverse { cache.before(&["guard"]) } else { cache }))
+                    .with(Stub(DirectiveMeta::middleware(
+                        "guard",
+                        Phase::Guard,
+                        Scopes::BOTH,
+                    )))
+                    .with(Stub(DirectiveMeta::terminal("answer"))),
+            )
+            .build()
+            .unwrap()
+    };
+    let input =
+        snapshot("global { http \":8080\" }\nsite \"*\" { external-cache; route \"/\" { guard; answer; }; }");
+    let registry = make(false);
+    let spec = gatel_plan::normalize(&input, &registry).unwrap();
+    let chain = gatel_plan::ordering::order_route(
+        spec.sites[0]
+            .directives
+            .iter()
+            .chain(spec.sites[0].routes[0].directives.iter())
+            .cloned()
+            .collect(),
+        &spec.sites[0].routes[0].terminal,
+    )
+    .unwrap();
+    assert_eq!(chain[0].meta.name, "guard");
+    assert_eq!(chain[1].meta.name, "external-cache");
+    assert!(gatel_plan::normalize(&input, &make(true)).is_err());
+}
+
+#[test]
+fn terminal_constraints_are_checked_during_normalization() {
+    use gatel_plan::Effect;
+    let middleware = || DirectiveMeta::middleware("guard", Phase::Guard, Scopes::BOTH);
+    let terminal = || DirectiveMeta::terminal("answer");
+    for (guard, answer, message) in [
+        (middleware().conflicts_with(&["answer"]), terminal(), "conflicts"),
+        (middleware(), terminal().conflicts_with(&["guard"]), "conflicts"),
+        (middleware(), terminal().before(&["guard"]), "must execute last"),
+        (
+            middleware().with_effects(&[Effect::ReadRequestBody]),
+            terminal().with_effects(&[Effect::RequestBodyLimit]),
+            "must execute last",
+        ),
+    ] {
+        let registry = Registry::builder()
+            .bundle(Bundle::new("external", "1").with(Stub(guard)).with(Stub(answer)))
+            .build()
+            .unwrap();
+        for text in [
+            "global { http \":8080\" }\nsite \"*\" { guard; route \"/\" { answer; }; }",
+            "global { http \":8080\" }\nsite \"*\" { route \"/\" { guard; answer; }; }",
+        ] {
+            let error = gatel_plan::normalize(&snapshot(text), &registry).unwrap_err();
+            assert!(error.iter().any(|d| d.message.contains(message)), "{error}");
+        }
+    }
+}
+
+#[test]
+fn middleware_can_precede_terminal_and_conflict_with_kernel_proxy() {
+    let registry = Registry::builder()
+        .bundle(
+            Bundle::new("external", "1")
+                .with(Stub(
+                    DirectiveMeta::middleware("guard", Phase::Guard, Scopes::BOTH)
+                        .before(&["answer"])
+                        .conflicts_with(&["proxy"]),
+                ))
+                .with(Stub(DirectiveMeta::terminal("answer").before(&["absent"]))),
+        )
+        .build()
+        .unwrap();
+    let valid = snapshot("global { http \":8080\" }\nsite \"*\" { guard; route \"/\" { answer; }; }");
+    let spec = gatel_plan::normalize(&valid, &registry).unwrap();
+    let _plan = compile(Arc::new(spec), &registry);
+    let invalid = snapshot(
+        "global { http \":8080\" }\nsite \"*\" { guard; route \"/\" { proxy \"127.0.0.1:9000\"; }; }",
+    );
+    let error = gatel_plan::normalize(&invalid, &registry).unwrap_err();
+    assert!(
+        error
+            .iter()
+            .any(|d| d.message.contains("conflicts with terminal `proxy`")),
+        "{error}"
+    );
+}
+
 /// A stand-in terminal, so a route has one.
 struct Stub(DirectiveMeta);
 

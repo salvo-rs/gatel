@@ -17,6 +17,14 @@ use tokio::net::TcpStream;
 
 use crate::pool::Body;
 
+/// Probe timeout/caller cancellation must also close its HTTP driver socket.
+struct Driver<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for Driver<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Why a probe failed. Kept as a string because nothing branches on it: a
 /// failed probe is a failed probe, and the text is for the operator.
 pub type ProbeError = String;
@@ -32,7 +40,17 @@ pub async fn probe(
     protocol: UpstreamProtocol,
     timeout: Duration,
 ) -> Result<(), ProbeError> {
-    match tokio::time::timeout(timeout, run(address, kind, protocol)).await {
+    probe_with_tls(address, kind, protocol, timeout, None).await
+}
+
+pub(crate) async fn probe_with_tls(
+    address: SocketAddr,
+    kind: &HealthKind,
+    protocol: UpstreamProtocol,
+    timeout: Duration,
+    tls: Option<&gatel_tls::ClientTls>,
+) -> Result<(), ProbeError> {
+    match tokio::time::timeout(timeout, run(address, kind, protocol, tls)).await {
         Ok(result) => result,
         Err(_) => Err(format!("no answer within {timeout:?}")),
     }
@@ -50,11 +68,23 @@ pub async fn probe_unix(
     protocol: UpstreamProtocol,
     timeout: Duration,
 ) -> Result<(), ProbeError> {
+    probe_unix_with_tls(path, kind, protocol, timeout, None).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn probe_unix_with_tls(
+    path: &std::path::Path,
+    kind: &HealthKind,
+    protocol: UpstreamProtocol,
+    timeout: Duration,
+    tls: Option<&gatel_tls::ClientTls>,
+) -> Result<(), ProbeError> {
     let run = async {
         let stream = tokio::net::UnixStream::connect(path)
             .await
             .map_err(|error| error.to_string())?;
-        check(stream, kind, protocol, &path.display().to_string()).await
+        // A filesystem path is not an HTTP authority (especially in H2).
+        secure_check(stream, kind, protocol, "localhost", tls).await
     };
     match tokio::time::timeout(timeout, run).await {
         Ok(result) => result,
@@ -75,24 +105,60 @@ pub async fn probe_unix(
     ))
 }
 
-async fn run(address: SocketAddr, kind: &HealthKind, protocol: UpstreamProtocol) -> Result<(), ProbeError> {
+#[cfg(not(unix))]
+pub(crate) async fn probe_unix_with_tls(
+    path: &std::path::Path,
+    kind: &HealthKind,
+    protocol: UpstreamProtocol,
+    timeout: Duration,
+    _tls: Option<&gatel_tls::ClientTls>,
+) -> Result<(), ProbeError> {
+    probe_unix(path, kind, protocol, timeout).await
+}
+
+async fn run(
+    address: SocketAddr,
+    kind: &HealthKind,
+    protocol: UpstreamProtocol,
+    tls: Option<&gatel_tls::ClientTls>,
+) -> Result<(), ProbeError> {
     let stream = TcpStream::connect(address)
         .await
         .map_err(|error| error.to_string())?;
     let _ = stream.set_nodelay(true);
-    check(stream, kind, protocol, &address.to_string()).await
+    secure_check(stream, kind, protocol, &address.to_string(), tls).await
+}
+
+async fn secure_check<IO>(
+    stream: IO,
+    kind: &HealthKind,
+    protocol: UpstreamProtocol,
+    authority: &str,
+    tls: Option<&gatel_tls::ClientTls>,
+) -> Result<(), ProbeError>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // TCP-connect is deliberately transport-only, even for a TLS upstream.
+    if matches!(kind, HealthKind::TcpConnect) {
+        return Ok(());
+    }
+    match tls {
+        Some(tls) => check(tls.connect(stream).await?, kind, protocol, authority, "https").await,
+        None => check(stream, kind, protocol, authority, "http").await,
+    }
 }
 
 /// The check itself, over whatever kind of socket got here.
 ///
 /// `authority` is what goes in the `Host` header when the configuration did
-/// not say — for an address that is the address, and for a socket path it is
-/// the path, which is at least true rather than invented.
+/// not say — the socket address for TCP, and `localhost` for Unix sockets.
 async fn check<IO>(
     stream: IO,
     kind: &HealthKind,
     protocol: UpstreamProtocol,
     authority: &str,
+    scheme: &str,
 ) -> Result<(), ProbeError>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -104,9 +170,14 @@ where
     };
 
     let authority = host.clone().unwrap_or_else(|| authority.to_string());
+    let uri = match protocol {
+        UpstreamProtocol::Http1 => path.parse::<http::Uri>(),
+        UpstreamProtocol::Http2 => format!("{scheme}://{authority}{path}").parse::<http::Uri>(),
+    }
+    .map_err(|error| error.to_string())?;
     let request = http::Request::builder()
         .method(http::Method::GET)
-        .uri(path.as_str())
+        .uri(uri)
         .header(http::header::HOST, authority)
         // A probe is not a browser and should not be served a cached page.
         .header(http::header::CACHE_CONTROL, "no-cache")
@@ -120,24 +191,24 @@ where
                 .map_err(|error| error.to_string())?;
             // The driver ends when the sender is dropped, which happens as soon
             // as this function returns; a probe never leaves a task behind.
-            let driver = tokio::spawn(connection);
+            let driver = Driver(tokio::spawn(connection));
             let response = sender
                 .send_request(request)
                 .await
                 .map_err(|error| error.to_string());
-            driver.abort();
+            drop(driver);
             response?
         }
         UpstreamProtocol::Http2 => {
             let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
                 .await
                 .map_err(|error| error.to_string())?;
-            let driver = tokio::spawn(connection);
+            let driver = Driver(tokio::spawn(connection));
             let response = sender
                 .send_request(request)
                 .await
                 .map_err(|error| error.to_string());
-            driver.abort();
+            drop(driver);
             response?
         }
     };
@@ -153,6 +224,14 @@ where
 fn empty_body() -> Body {
     Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
 }
+
+#[cfg(test)]
+#[path = "probe_cancellation_tests.rs"]
+mod cancellation_tests;
+
+#[cfg(all(test, unix))]
+#[path = "probe_unix_authority_tests.rs"]
+mod unix_authority_tests;
 
 #[cfg(test)]
 mod tests {

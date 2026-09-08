@@ -210,7 +210,8 @@ impl Directive for ErrorPages {
     fn meta(&self) -> &DirectiveMeta {
         // The response phase: it changes what goes back, and only after
         // everything that could produce an error has run.
-        static META: DirectiveMeta = DirectiveMeta::middleware("error-pages", Phase::Response, Scopes::BOTH);
+        static META: DirectiveMeta =
+            DirectiveMeta::middleware("error-pages", Phase::Response, Scopes::BOTH).with_version("2");
         &META
     }
 
@@ -325,10 +326,38 @@ impl Handler for ErrorPagesHandler {
             return;
         };
 
+        // These describe the body we are replacing, not the configured page.
+        // In particular a zero-length 406 or an upstream encoded error must
+        // not lend its framing, validators or digests to the new bytes.
+        for name in [
+            "content-length",
+            "content-encoding",
+            "content-range",
+            "accept-ranges",
+            "etag",
+            "last-modified",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+            "trailer",
+            "transfer-encoding",
+            "content-location",
+            "content-language",
+            "content-disposition",
+        ] {
+            response.headers_mut().remove(name);
+        }
+        // Preserve status-specific controls (WWW-Authenticate, Retry-After,
+        // Allow), cache policy and Vary. Only representation metadata is reset.
         *response.body_mut() = ResBody::None;
         response
             .headers_mut()
             .insert(http::header::CONTENT_TYPE, page.content_type.clone());
+        response.headers_mut().insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&page.body.len().to_string()).expect("bounded page length"),
+        );
         let _ = response.write_body(page.body.clone());
     }
 }
@@ -371,6 +400,8 @@ mod tests {
             .0
             .expect("the configuration is valid")
             .build(BuildContext {
+                secrets: Default::default(),
+                blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),
@@ -478,6 +509,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn replacement_drops_old_representation_but_keeps_protocol_controls() {
+        let pages = handler(node(vec![page("401", &[("body", "sign in")])]));
+        let mut response = Response::new();
+        let stale = [
+            "content-length",
+            "content-encoding",
+            "content-range",
+            "accept-ranges",
+            "etag",
+            "last-modified",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+            "trailer",
+            "transfer-encoding",
+            "content-location",
+            "content-language",
+            "content-disposition",
+        ];
+        for name in stale {
+            response
+                .headers_mut()
+                .insert(name, HeaderValue::from_static("old"));
+        }
+        for (name, value) in [
+            ("www-authenticate", "Basic realm=\"test\""),
+            ("retry-after", "10"),
+            ("allow", "GET, HEAD"),
+            ("cache-control", "no-store"),
+            ("vary", "accept-encoding"),
+            ("set-cookie", "session=; Max-Age=0"),
+        ] {
+            response
+                .headers_mut()
+                .insert(name, HeaderValue::from_static(value));
+        }
+        let controls = response.headers().clone();
+        let mut depot = Depot::new();
+        crate::generated(&mut depot);
+        let mut ctrl = FlowCtrl::new(vec![pages, Arc::new(Failing(401))]);
+        ctrl.call_next(&mut Request::default(), &mut depot, &mut response)
+            .await;
+        for name in stale {
+            if name == "content-length" {
+                assert_eq!(response.headers()[name], "7");
+            } else {
+                assert!(!response.headers().contains_key(name), "{name}");
+            }
+        }
+        for name in [
+            "www-authenticate",
+            "retry-after",
+            "allow",
+            "cache-control",
+            "vary",
+            "set-cookie",
+        ] {
+            assert_eq!(response.headers()[name], controls[name], "{name}");
+        }
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+        assert!(matches!(response.body_mut(), ResBody::Once(bytes) if bytes.as_ref() == b"sign in"));
+    }
+
     #[test]
     fn a_page_needs_a_file_or_a_body() {
         let (config, diagnostics) = decode(node(vec![page("404", &[])]));
@@ -542,6 +638,8 @@ mod tests {
             .unwrap();
         let error = config
             .build(BuildContext {
+                secrets: Default::default(),
+                blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),

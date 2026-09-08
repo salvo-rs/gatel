@@ -19,6 +19,16 @@ use crate::directive::Registry;
 use crate::normalize::normalize;
 use crate::plan::{BindingChange, Plan, compile, diff_bindings};
 
+#[path = "generation_version.rs"]
+mod version;
+
+struct CandidateBase<R> {
+    expected_head: RevVector,
+    base_generation: Generation,
+    previous: Option<Arc<Committed<R>>>,
+    refresh: bool,
+}
+
 /// A committed generation: an immutable plan plus whatever the host built from
 /// it. A connection pins one of these when it is accepted and keeps it until it
 /// closes, so a reload never changes what an in-flight request sees.
@@ -30,10 +40,21 @@ pub struct Committed<R> {
     pub runtime: R,
     /// The source revisions this generation was built from.
     pub revs: RevVector,
+    /// Exact compilation input, not latest observed (possibly rejected) intent.
+    /// Private to prevent replacing provenance separately from runtime creation.
+    sources: Arc<Snapshot>,
     pub committed_at: Instant,
 }
 
 impl<R> Committed<R> {
+    /// Immutable source union used to build this runtime. May contain secrets;
+    /// trusted recovery/inspection only, never a public status response.
+    /// NoOp does not replace it. This proves publication provenance, not host
+    /// activation, disk durability, raw file contents or external resource state.
+    pub fn source_snapshot(&self) -> &Snapshot {
+        &self.sources
+    }
+
     pub fn spec_hash(&self) -> Fingerprint {
         self.plan.spec_hash()
     }
@@ -70,8 +91,12 @@ pub enum Outcome {
     /// Preparing resources failed — a port in use, a certificate that will not
     /// load. Nothing was published; the previous generation still serves.
     PrepareFailed(String),
-    /// A source moved while this candidate was compiling. The caller should
-    /// observe again rather than publish something already out of date.
+    /// The observation cannot publish: it was overtaken, reused a revision
+    /// with changed content, is unregistered, exceeds source capacity, or the
+    /// host has permanently sealed publication for shutdown.
+    /// Observe current intent again; identity/capacity violations require fixing
+    /// the producer or host limits, not retrying the same candidate in a loop.
+    /// A sealed store cannot resume publication; create a new host lifetime.
     Stale(String),
 }
 
@@ -107,11 +132,7 @@ impl Outcome {
             Outcome::Stale(_) => gatel_observe::Reload::Stale,
         });
         if let Some(generation) = self.generation() {
-            telemetry
-                .metrics
-                .process
-                .generation
-                .set(generation.number() as i64);
+            telemetry.metrics.process.generation.observe(generation.number());
         }
         match self {
             Outcome::Rejected(diagnostics) => telemetry.health.reload_failed(
@@ -133,6 +154,7 @@ impl Outcome {
 /// worked" from "still serving the last good configuration".
 #[derive(Debug, Clone)]
 pub struct Failure {
+    pub attempts: u32,
     pub stage: &'static str,
     pub summary: String,
     pub at: Instant,
@@ -147,10 +169,44 @@ pub struct Status {
     pub plan_hash: Option<Fingerprint>,
     pub revs: RevVector,
     pub last_failure: Option<Failure>,
+    /// Latest admitted revisions differ from the published build input. False
+    /// before publication. This includes NoOp and in-flight intent, not just
+    /// rejected changes, and does not imply a different effective plan.
+    pub observed_differs: bool,
     pub uptime: Option<Duration>,
 }
 
+/// Optimistic write precondition for one store lifetime and observed intent.
+/// Includes the observed head: rejected and no-op revisions also invalidate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    pub boot_id: BootId,
+    pub generation: Generation,
+    pub revs: RevVector,
+}
+
+/// A failed precondition is not a configuration failure and mutates nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub actual: Version,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("configuration write precondition no longer matches")
+    }
+}
+impl std::error::Error for Conflict {}
+
 impl Status {
+    pub fn version(&self) -> Version {
+        Version {
+            boot_id: self.boot_id,
+            generation: self.generation,
+            revs: self.revs.clone(),
+        }
+    }
+
     /// Serving traffic, whether or not the newest configuration was accepted.
     pub fn is_serving(&self) -> bool {
         self.generation != Generation::NONE
@@ -176,18 +232,60 @@ pub struct Preparation<'a, R> {
 }
 
 struct State<R> {
+    sealed: bool,
     boot_id: BootId,
     generation: Generation,
     current: Option<Arc<Committed<R>>>,
     /// The newest source revisions anyone has observed, which is what makes a
     /// slow candidate detect that it was overtaken.
     head: RevVector,
+    /// Latest admitted source intent, including failed configuration. Arc keeps
+    /// readers and replacement cleanup from cloning/dropping trees under locks.
+    intent: std::collections::BTreeMap<gatel_model::SourceId, Arc<gatel_model::SourceSnapshot>>,
     last_failure: Option<Failure>,
 }
+
+impl<R> State<R> {
+    fn validate_candidate(&self, expected: &RevVector, base: Generation) -> Result<(), Outcome> {
+        if self.sealed {
+            return Err(Outcome::Stale("configuration publication is sealed".into()));
+        }
+        if self.head != *expected {
+            return Err(Outcome::Stale(stale_reason(expected, &self.head)));
+        }
+        if self.generation != base {
+            return Err(Outcome::Stale(format!(
+                "generation moved from {base} to {} while preparing",
+                self.generation
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[path = "generation_observe.rs"]
+mod observation;
+
+#[path = "generation_intent.rs"]
+mod intent;
+
+#[path = "generation_capture.rs"]
+mod capture;
+pub use capture::ConfigurationCapture;
+
+#[path = "generation_restore.rs"]
+mod restore;
+pub use restore::RestoreIntentError;
+
+#[path = "generation_writer.rs"]
+mod writer;
+pub use writer::{SourceWriteError, SourceWriter};
 
 /// Holds the current generation and serializes commits.
 pub struct GenerationStore<R> {
     state: RwLock<State<R>>,
+    source_limit: std::num::NonZeroUsize,
+    allowed_sources: Option<std::collections::BTreeSet<gatel_model::SourceId>>,
 }
 
 impl<R> Default for GenerationStore<R> {
@@ -198,12 +296,23 @@ impl<R> Default for GenerationStore<R> {
 
 impl<R> GenerationStore<R> {
     pub fn new() -> Self {
+        Self::with_source_limit(std::num::NonZeroUsize::new(256).expect("nonzero default"))
+    }
+
+    /// Maximum distinct source identities observed in this store lifetime.
+    /// Empty tombstones still consume an identity; dropping history could
+    /// allow old revisions to reappear. This does not bound source payloads.
+    pub fn with_source_limit(source_limit: std::num::NonZeroUsize) -> Self {
         Self {
+            source_limit,
+            allowed_sources: None,
             state: RwLock::new(State {
+                sealed: false,
                 boot_id: BootId::generate(),
                 generation: Generation::NONE,
                 current: None,
                 head: RevVector::default(),
+                intent: Default::default(),
                 last_failure: None,
             }),
         }
@@ -211,6 +320,29 @@ impl<R> GenerationStore<R> {
 
     pub fn boot_id(&self) -> BootId {
         self.read().boot_id
+    }
+
+    /// Irreversibly fence new observations and publication, including candidates
+    /// already preparing. Existing readers retain the current generation.
+    /// This does not cancel/join preparation or drain runtime resources.
+    pub fn seal(&self) {
+        self.write().sealed = true;
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.read().sealed
+    }
+
+    /// Restrict observations to a host-defined source set, fixed for this store
+    /// lifetime. Empty means deny all sources. Frontends must not choose their
+    /// identity from unauthenticated request data; this is not authentication.
+    pub fn with_allowed_sources(sources: impl IntoIterator<Item = gatel_model::SourceId>) -> Self {
+        let allowed: std::collections::BTreeSet<_> = sources.into_iter().collect();
+        let mut store = Self::with_source_limit(
+            std::num::NonZeroUsize::new(allowed.len().max(1)).expect("positive capacity"),
+        );
+        store.allowed_sources = Some(allowed);
+        store
     }
 
     /// The generation a new connection should pin.
@@ -227,6 +359,10 @@ impl<R> GenerationStore<R> {
             plan_hash: state.current.as_ref().map(|committed| committed.plan_hash()),
             revs: state.head.clone(),
             last_failure: state.last_failure.clone(),
+            observed_differs: state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.revs != state.head),
             uptime: state
                 .current
                 .as_ref()
@@ -253,20 +389,87 @@ impl<R> GenerationStore<R> {
     pub fn attempt<P>(&self, snapshot: &Snapshot, registry: &Registry, prepare: P) -> Outcome
     where
         P: FnOnce(Preparation<'_, R>) -> Result<R, String>,
+        R: crate::publication::PublishRuntime,
     {
-        // Publishing the observation first is what makes staleness detectable:
-        // a candidate that started earlier will find the head has moved past
-        // the revisions it was built from.
-        let (expected_head, base_generation, previous) = {
-            let mut state = self.write();
-            state.head.merge_max(&snapshot.revs());
-            (state.head.clone(), state.generation, state.current.clone())
-        };
+        self.attempt_conditionally(snapshot, registry, None, false, prepare)
+            .expect("unconditional attempts cannot fail a precondition")
+    }
 
+    /// Check a previously read status version under the observation write lock.
+    /// A conflict never observes the supplied revisions or invokes preparation.
+    /// Once admitted, normal stale checks still protect preparation and commit.
+    /// This is not authorization, source revision allocation, or persistence.
+    pub fn attempt_if<P>(
+        &self,
+        expected: &Version,
+        snapshot: &Snapshot,
+        registry: &Registry,
+        prepare: P,
+    ) -> Result<Outcome, Conflict>
+    where
+        P: FnOnce(Preparation<'_, R>) -> Result<R, String>,
+        R: crate::publication::PublishRuntime,
+    {
+        self.attempt_conditionally(snapshot, registry, Some(expected), false, prepare)
+    }
+
+    /// Rebuild external resources even when the compiled plan is unchanged.
+    /// Success publishes a new generation; failures retain the current one.
+    /// This does not discover changed files or revoke resources held by old
+    /// generations. Preparation must still be cancellation/stale-safe.
+    pub fn refresh<P>(&self, snapshot: &Snapshot, registry: &Registry, prepare: P) -> Outcome
+    where
+        P: FnOnce(Preparation<'_, R>) -> Result<R, String>,
+        R: crate::publication::PublishRuntime,
+    {
+        self.attempt_conditionally(snapshot, registry, None, true, prepare)
+            .expect("unconditional refresh cannot fail a precondition")
+    }
+
+    /// Version-conditional resource refresh, with the same observation and
+    /// publication fencing as `attempt_if`.
+    pub fn refresh_if<P>(
+        &self,
+        expected: &Version,
+        snapshot: &Snapshot,
+        registry: &Registry,
+        prepare: P,
+    ) -> Result<Outcome, Conflict>
+    where
+        P: FnOnce(Preparation<'_, R>) -> Result<R, String>,
+        R: crate::publication::PublishRuntime,
+    {
+        self.attempt_conditionally(snapshot, registry, Some(expected), true, prepare)
+    }
+
+    fn finish_attempt<P>(
+        &self,
+        snapshot: &Snapshot,
+        registry: &Registry,
+        prepare: P,
+        base: CandidateBase<R>,
+    ) -> Outcome
+    where
+        P: FnOnce(Preparation<'_, R>) -> Result<R, String>,
+        R: crate::publication::PublishRuntime,
+    {
+        let CandidateBase {
+            expected_head,
+            base_generation,
+            previous,
+            refresh,
+        } = base;
         let spec = match normalize(snapshot, registry) {
             Ok(spec) => Arc::new(spec),
             Err(diagnostics) => {
-                self.record_failure("normalize", format!("{} problems", diagnostics.error_count()));
+                if let Err(stale) = self.record_failure(
+                    &expected_head,
+                    base_generation,
+                    "normalize",
+                    format!("{} problems", diagnostics.error_count()),
+                ) {
+                    return stale;
+                }
                 return Outcome::Rejected(diagnostics);
             }
         };
@@ -283,10 +486,11 @@ impl<R> GenerationStore<R> {
         // reason to build anything or consume a generation number.
         if let Some(committed) = &previous
             && committed.plan_hash() == plan.plan_hash()
+            && !refresh
         {
             let mut state = self.write();
-            if state.head != expected_head {
-                return Outcome::Stale(stale_reason(&expected_head, &state.head));
+            if let Err(stale) = state.validate_candidate(&expected_head, base_generation) {
+                return stale;
             }
             state.last_failure = None;
             return Outcome::NoOp {
@@ -295,7 +499,13 @@ impl<R> GenerationStore<R> {
         }
 
         let Some(next_generation) = base_generation.next() else {
-            return Outcome::PrepareFailed("generation counter exhausted".to_string());
+            let message = "generation counter exhausted".to_string();
+            if let Err(stale) =
+                self.record_failure(&expected_head, base_generation, "prepare", message.clone())
+            {
+                return stale;
+            }
+            return Outcome::PrepareFailed(message);
         };
         let boot_id = { self.read().boot_id };
 
@@ -308,36 +518,46 @@ impl<R> GenerationStore<R> {
         }) {
             Ok(runtime) => runtime,
             Err(message) => {
-                self.record_failure("prepare", message.clone());
+                if let Err(stale) =
+                    self.record_failure(&expected_head, base_generation, "prepare", message.clone())
+                {
+                    return stale;
+                }
                 return Outcome::PrepareFailed(message);
             }
         };
 
+        // Deep-copy trees outside the generation/publication locks. Pin them
+        // with this runtime so later failed intent cannot contaminate recovery
+        // input, and old readers retain their own generation's provenance.
+        let sources = Arc::new(snapshot.clone());
+        let revs = sources.revs();
         let mut state = self.write();
-        if state.head != expected_head {
+        if let Err(stale) = state.validate_candidate(&expected_head, base_generation) {
             // `runtime` is dropped here, which is what releases whatever
             // preparation acquired.
-            return Outcome::Stale(stale_reason(&expected_head, &state.head));
-        }
-        if state.generation != base_generation {
-            return Outcome::Stale(format!(
-                "generation moved from {base_generation} to {} while preparing",
-                state.generation
-            ));
+            return stale;
         }
 
         let first = state.current.is_none();
-        state.generation = next_generation;
-        state.current = Some(Arc::new(Committed {
+        let committed = Arc::new(Committed {
             number: next_generation,
             boot_id: state.boot_id,
             plan,
             runtime,
-            revs: snapshot.revs(),
+            revs,
+            sources,
             committed_at: Instant::now(),
-        }));
+        });
+        // Allocate before locking shared runtime state. Publication itself only
+        // swaps owned values; no fallible preparation or plugin callbacks here.
+        let publication = committed.runtime.begin_publication();
+        state.generation = next_generation;
+        state.current = Some(committed.clone());
         state.last_failure = None;
         drop(state);
+        crate::publication::PublishGuard::published(publication);
+        committed.runtime.finish_publication();
 
         if first {
             Outcome::Started {
@@ -351,13 +571,25 @@ impl<R> GenerationStore<R> {
         }
     }
 
-    fn record_failure(&self, stage: &'static str, summary: String) {
+    fn record_failure(
+        &self,
+        expected: &RevVector,
+        base: Generation,
+        stage: &'static str,
+        summary: String,
+    ) -> Result<(), Outcome> {
         let mut state = self.write();
+        state.validate_candidate(expected, base)?;
         state.last_failure = Some(Failure {
+            attempts: state
+                .last_failure
+                .as_ref()
+                .map_or(1, |failure| failure.attempts.saturating_add(1)),
             stage,
             summary,
             at: Instant::now(),
         });
+        Ok(())
     }
 }
 
@@ -366,6 +598,38 @@ fn stale_reason(expected: &RevVector, actual: &RevVector) -> String {
         .first_difference(actual)
         .unwrap_or_else(|| "a source was observed again while preparing".to_string())
 }
+
+#[cfg(test)]
+#[path = "generation_races.rs"]
+mod races;
+
+#[cfg(test)]
+#[path = "generation_preconditions.rs"]
+mod preconditions;
+
+#[cfg(test)]
+#[path = "generation_refresh.rs"]
+mod refresh_tests;
+
+#[cfg(test)]
+#[path = "generation_metrics.rs"]
+mod metric_tests;
+
+#[cfg(test)]
+#[path = "generation_identity.rs"]
+mod identity;
+
+#[cfg(test)]
+#[path = "generation_finish.rs"]
+mod finish_tests;
+
+#[cfg(test)]
+#[path = "generation_seal.rs"]
+mod seal_tests;
+
+#[cfg(test)]
+#[path = "generation_provenance.rs"]
+mod provenance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -410,7 +674,7 @@ mod tests {
         }
     }
 
-    fn registry() -> Registry {
+    pub(super) fn registry() -> Registry {
         Registry::builder()
             .bundle(Bundle::new("std", "1").with(Respond(DirectiveMeta::terminal("respond"))))
             .build()
@@ -418,7 +682,7 @@ mod tests {
     }
 
     /// Build a snapshot from KDL-shaped nodes without going through a file.
-    fn snapshot(rev: u64, body: &str, port: u16) -> Snapshot {
+    pub(super) fn snapshot(rev: u64, body: &str, port: u16) -> Snapshot {
         let origin = Origin::synthetic("test");
         let global = Node::new("global", origin.clone()).with_child(
             Node::new("http", origin.clone())
@@ -444,7 +708,7 @@ mod tests {
         ))
     }
 
-    fn invalid_snapshot(rev: u64) -> Snapshot {
+    pub(super) fn invalid_snapshot(rev: u64) -> Snapshot {
         let origin = Origin::synthetic("test");
         Snapshot::new().with(SourceSnapshot::new(
             SourceId::file("main"),
@@ -454,11 +718,11 @@ mod tests {
         ))
     }
 
-    fn store() -> GenerationStore<usize> {
+    pub(super) fn store() -> GenerationStore<usize> {
         GenerationStore::new()
     }
 
-    fn prepare_ok(preparation: Preparation<'_, usize>) -> Result<usize, String> {
+    pub(super) fn prepare_ok(preparation: Preparation<'_, usize>) -> Result<usize, String> {
         Ok(preparation.generation.number() as usize)
     }
 

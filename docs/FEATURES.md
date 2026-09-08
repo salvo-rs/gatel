@@ -24,8 +24,43 @@ carries; it is the same list, generated rather than written down.
 | Provenance and clean-room rules written down | yes | done | `docs/design/provenance.md` |
 | Threat model, with which defences are tested and which are not | yes | done | `docs/design/threat-model.md` |
 | `validate`, `explain`, `diff`, `capabilities`, `trust` | yes | done | exit codes covered by `crates/gatel/src/main.rs`; every example compiles in `gatel-http/tests/examples.rs` |
-| Admin API as a second source under `runtime/` | no (2.1) | not started | the `admin` block is refused at compile time rather than accepted and ignored: `gatel-plan/tests/normalize.rs` |
+| Admin API as a second source under `runtime/` | no (2.1) | partial | Optional `admin-api`: source-bound KDL PUT, full-version CAS, authenticated version/status queries, loopback listener and diagnostic read reserve. `admin_tests.rs`, `admin_server_tests.rs`, `app_source_union_tests.rs` and CLI tests cover the implemented boundary. Legacy resource endpoints, scoped token permissions and full audit remain open; an `admin` KDL block is still not a supported activation mechanism. See [ADMIN.md](ADMIN.md). |
+| Runtime checkpoint persistence, recovery and offline compaction | no (2.1) | partial | `checkpoint_run` CLI tests, `app_checkpoint_*` tests and journal checkpoint/compaction crash tests cover dual snapshots, save-failure latching, restart and source-preserving export. Production mode is checkpoint-only, not WAL; idempotent receipts, online rotation and power-loss validation remain open. See [CLI.md](CLI.md). |
 | Kubernetes source | no | not started | — |
+
+## Optional plugins
+
+Optional `decode` restores bounded request decompression for gzip/br/zstd/deflate.
+See [DECODE.md](DECODE.md) for limits, buffering, metadata changes and reload scope.
+
+| Capability | Required for 2.0 | Status | Proof |
+|---|---|---|---|
+| Plugin SDK independent of compiler | yes | partial | `gatel-plugin-api` and `gatel-plugin-runtime`; maintenance package has no plan dependency; stable API and external fixture remain open |
+| Middleware before/conflict constraints | yes | done | `gatel-plan/src/directive.rs` composition tests; normalize validates merged chains before prepare |
+| Maintenance mode as a removable package | no | done | `gatel/tests/plugins.rs`: feature on/off capabilities and validation; real HTTP GET/HEAD and live reload |
+| Declared upstream grants and single-backend handles | yes | done | SDK dispatch allowlist test and `plugin_lifecycle.rs` host-grant checks |
+| Managed plugin tasks and typed resource services | yes | partial | `plugin_lifecycle.rs`, `plugin_tasks.rs`: commit-only, dedup, cancellation, LKG, NoOp, pinning; Secret/DNS/dial services and worker supervision remain open |
+| FastCGI / SCGI / child-process CGI packages | yes | partial | Optional FastCGI/SCGI and Windows process CGI share HTTP mapping/lifecycle. Unix socket protocol tests and Windows real-process HTTP tests passed; Linux/macOS process CGI remains open. See [CGI.md](CGI.md). |
+
+## CLI artifacts and v1 migration audit
+
+`gatel fmt [CONFIG] [--check]` now provides single-file, comment-preserving KDL
+formatting through the same guarded parser as configuration loading. It never
+expands imports, compiles plugins or writes configuration files. Windows/Linux
+binary tests cover idempotence, check exit codes, unchanged source, missing imports,
+unknown plugin syntax, invalid UTF-8/syntax, nesting and size limits. This does not
+complete the outstanding v1 adapter, recursive formatter or in-place editing work.
+
+Basic Auth execution and input limits are documented in [AUTH.md](AUTH.md): host-injected blocking work with atomic job/memory admission, cancellation-retained reservations, KDL blocking budgets published with the generation, an embedding API for usage-preserving limit changes, shared `gatel-password` policies, optional Argon2id (`argon2` feature), strict parameter validation and LKG tests. This does not complete AUTH-01's remaining algorithms, rotation/revocation, fairness or Admin API budget management.
+
+The metrics terminal exposes a coherent budget sample and fixed-cardinality admission/completion counters; see [METRICS.md](METRICS.md). These are shared blocking-work metrics, not authentication-success rates or CPU-time measurements.
+
+| Capability | Required for 2.0 | Status | Proof |
+|---|---|---|---|
+| Shell completions and roff manuals generated from the actual command tree | yes | done | `gatel/tests/cli_artifacts.rs`: five shell generators, root/subcommand manuals, current options, deterministic output and usage errors; `src/cli_output.rs`: write/flush error policy. Interactive shell installation and man rendering are not fully verified. See [CLI.md](CLI.md). |
+| Static-directory `serve` CLI through the normal transaction and HTTP runtime | yes | done | `gatel/tests/serve.rs`: files, HEAD, Range, browse, hidden files, updates, invalid local KDL ignored, dry-run and errors. `src/serve.rs`: typed immutable Snapshot and NoOp. Defaults to loopback; Unix-only signal/path cases, Windows console Ctrl+C not yet verified. |
+| Bounded stdin password hash generation (`passwd --stdin`) | yes | partial | `gatel/tests/passwd.rs`: bcrypt and optional Argon2id capability/CLI/actual HTTP agreement. `gatel-password`: shared validation/generation policy. Hidden interactive input, standalone legacy executable and further algorithms remain open. |
+| Complete v1 parameter/default/CLI migration inventory | yes | partial | [compat-v1.md](compat-v1.md) inventories old CLI and utility entry points against local main eaf9bde; configuration/parser/examples and binary differential validation remain open. |
 
 ## Reload
 
@@ -46,6 +81,7 @@ carries; it is the same list, generated rather than written down.
 |---|---|---|---|
 | HTTP/1.1 and HTTP/2, keep-alive, graceful drain | yes | done | `gatel-http/tests/serving.rs` |
 | WebSocket and other upgrades, with idle and lifetime bounds | yes | done | `gatel-http/tests/upgrade.rs` |
+| Upgrades retain generation/connection capacity and obey shutdown grace | yes | done | `upgrade.rs`: real echo tunnel across reload, capacity admission, deadline closes socket; `connection_work.rs` one-shot handoff |
 | Host, path, method, header, query, cookie and client-IP matching | yes | done | `gatel-http/src/dispatch.rs`, `gatel-plan/src/matcher.rs` |
 | Routes ordered by specificity; an ambiguous pair is a compile error | yes | done | `gatel-plan/tests/normalize.rs` |
 | A site's own directives cover requests that matched no route | yes | done | `gatel-http/tests/observe.rs` |
@@ -60,6 +96,7 @@ carries; it is the same list, generated rather than written down.
 |---|---|---|---|
 | Ten balancing strategies | yes | done | `gatel-state/src/selector.rs` |
 | Bounded connection pool with reuse, and pre-send checkout failures | yes | done | `gatel-state/src/pool.rs` |
+| A drained pool cannot reopen for a new endpoint or park returning leases | yes | done | `gatel-state/src/pool/tests.rs`; includes withdrawal of every DNS address and accurate waiter/in-use accounting |
 | Per-stage timeouts: queue, connect, response head, body gap, overall | yes | done | every one of them applied, including `body-idle`, which bounds the gap between response chunks so a backend that answers and then stalls is cut off rather than held until `overall`. `gatel-state/src/pool/`, `gatel-http/src/proxy/`, `gatel-http/tests/retry.rs` |
 | Active health checks, TCP and HTTP | yes | done | `gatel-state/src/supervisor.rs`, `probe.rs` |
 | Passive health with ejection | yes | done | `gatel-state/src/endpoint.rs`, `gatel-http/tests/proxy.rs` |
@@ -99,8 +136,9 @@ carries; it is the same list, generated rather than written down.
 | Directive | Required for 2.0 | Status | Proof |
 |---|---|---|---|
 | `respond`, `redirect` | yes | done | unit tests in each module |
-| `file-server` — containment, symlinks, ETag, conditional requests, precompressed | yes | done | `gatel-bundle-std/src/file_server.rs`, `gatel-http/tests/directives.rs` |
+| `file-server` — containment, symlinks, ETag, conditional requests, precompressed | yes | done | `gatel-bundle-std/src/file_server.rs`, `gatel-http/tests/directives.rs`; `file_listing.rs` verifies public symlink aliases cannot expose hidden resolved targets through direct requests, directory indexes/listings or precompressed variants. No concurrent filesystem mutation sandbox. |
 | `file-server` — range requests, and large files streamed rather than buffered | yes | done | `gatel-bundle-std/src/ranges.rs`, `gatel-http/tests/directives.rs` |
+| `file-server` — opt-in directory browsing | yes | bounded implementation | `gatel-http/tests/file_listing.rs`; URL-encoded links, root-contained entries, 10,000 scanned entries / 2 MiB HTML per listing; over-limit listings return non-cacheable 503. Pagination remains pending. |
 | `file-server` — a fallback, so a single-page application can be hosted at all | yes | done | `fallback=` is nginx's `try_files $uri $uri/ /index.html`; `gatel-http/tests/directives.rs` |
 | `headers` | yes | done | unit tests; framing headers are protected |
 | `encode` — gzip, brotli, zstd, deflate, streaming, `Vary`, minimum size | yes | done | `gatel-bundle-std/src/encode.rs`, `tests/directives.rs` |
@@ -118,9 +156,14 @@ carries; it is the same list, generated rather than written down.
 | `error-pages` | yes | done | `tests/guards.rs` |
 | `metrics`, `health` | yes | done | `gatel-http/tests/observe.rs` |
 | `forward-auth` | yes | done | `gatel-bundle-std/src/forward_auth.rs`, `gatel-http/tests/forward_auth.rs`; asks a declared upstream through the same pool the proxy uses, and one of those tests proves it shares the connection |
-| `cache` — in memory, bounded, honouring the response and `Vary` | yes | done | `gatel-bundle-std/src/cache/`, `gatel-http/tests/cache.rs`; no revalidation, no request coalescing, and expired entries are reclaimed on read or eviction rather than by a sweeper — see the module docs |
+| `cache` — in memory, bounded, honouring the response and `Vary` | yes | done | `gatel-bundle-std/src/cache/`, `gatel-http/tests/cache.rs`; expired entries are reclaimed on read or eviction rather than by a sweeper |
+| `cache` — origin revalidation | yes | partial | `gatel-http/tests/cache_revalidate.rs`: unencoded GET with ETag or Last-Modified, 304 reconstruction and invalid-validator rejection; client-conditional requests, HEAD, encoded representations, request coalescing and stale-on-error remain outside this profile |
+| `cache` — ambiguous cached ETag handling | yes | bounded implementation | Fresh entries with duplicate or malformed ETag forward client If-None-Match to the origin instead of deciding 304/body locally; real HTTP coverage in `cache_revalidate.rs`. Unconditional cache hits remain allowed; this is not wholesale validation of every origin header. |
+| `cache` — retirement after an unstoreable new 200 | yes | bounded implementation | `cache_replacement.rs`: private/no-store, missing freshness, invalid Age, oversized and truncated Content-Length/chunked bodies retire the observed copy. Per-copy identity preserves concurrent replacements and other Vary copies; removal advances the bounded global invalidation revision. Non-200 responses and bypassed requests are outside this rule; client-cancellation injection remains pending. |
+| `cache` — H2 reset during a cold fill | yes | bounded implementation | `cache_h2.rs`: cancelling before downstream response headers closes the incomplete HTTP/1 origin connection within 3 seconds, while the H2 connection remains usable for a subsequent complete fill and hit. This does not prove the warm-copy retirement timing or H1 disconnect path. |
+| `cache` — H1 abortive close during a cold fill | yes | bounded implementation | `cache_h1.rs`: SO_LINGER=0 client close releases the incomplete origin within 3 seconds; a new client connection fills and hits a complete response. This is not a FIN/half-close or warm-copy cancellation test. |
 | Argon2, scrypt and PBKDF2 for `basic-auth` | no | not started | bcrypt covers what people have |
-| The CGI family | no | not started | deliberately after 2.0 |
+| The CGI family | no | partial | Optional FastCGI/SCGI and Windows child-process CGI plugins are implemented; other process platforms and further resource policies remain open. See `CGI.md` and `ROADMAP.md` for validation boundaries. |
 
 ## Observability
 
@@ -229,11 +272,24 @@ Everything else marked 2.1 is deliberate: `circuit-breaker`, the other ACME
 challenge types and the Admin API are each large enough to want their own
 release, and none of them is needed to put this in front of a service.
 
+## HTTP compression interoperability
+
+`encode "deflate"` produces an RFC 1950 zlib-wrapped stream, as required by
+[RFC 9110 §8.4.1.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.4.1.2),
+not raw DEFLATE. Its directive behavior version is 5. Tests check the wrapper,
+Adler-32 trailer and complete decoding, plus real HTTP responses with caching
+and alternating identity/deflate negotiation. This does not restore the old
+request-decompression directive by itself; the separate optional `decode` plugin
+now provides bounded decode-before-forward behavior (see above).
+
 ## Where the ACME protocol comes from
 
 `certon`, which is the same organisation, the same licence, and already what v1
-uses — one implementation rather than two. Only its issuer is used, not its
-certificate manager: Gatel already owns a certificate store, a resolver, a
+uses — one implementation rather than two. Gatel uses its issuer and, since
+certon 0.3, its semantic certificate persistence contract (`CertStore`). Its
+certificate manager does not own Gatel's serving lifecycle: Gatel already owns
+an active certificate store, a resolver, a
 background supervisor and a route table, and adopting a second set would split
 "a renewal is not a configuration change" across two places that both believe
 it.
+See [CERTON.md](CERTON.md) for the exact policy, persistence and publication split.

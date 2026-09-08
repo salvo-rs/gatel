@@ -6,322 +6,23 @@
 //! "unknown node" and "missing capability" are both decided during compilation
 //! rather than when a request arrives.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use gatel_model::{Code, Diagnostic, Diagnostics, Fingerprint, Hasher, Node, ResourceId, did_you_mean};
+use gatel_model::{Code, Diagnostic, Diagnostics, Hasher, Node, ResourceId, did_you_mean};
+pub use gatel_plugin_api::{DirectiveMeta, Effect, FailurePolicy, Phase, Role, Scope, Scopes};
+#[cfg(test)]
 use salvo_core::Handler;
 
-/// Where a middleware sits in the request chain.
-///
-/// The order is fixed by the enum, not by where the operator wrote the node:
-/// putting `basic-auth` after `proxy` in the file cannot move authentication
-/// after the terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Phase {
-    /// Outermost. Sees every request and the final response. May fail open.
-    Observe,
-    /// Rejections happen here: authentication, rate limits, filters, limits.
-    Guard,
-    /// Request rewriting.
-    Request,
-    /// Innermost, closest to the terminal. Response transformation.
-    Response,
-}
-
-impl Phase {
-    pub const ALL: [Phase; 4] = [Phase::Observe, Phase::Guard, Phase::Request, Phase::Response];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Phase::Observe => "observe",
-            Phase::Guard => "guard",
-            Phase::Request => "request",
-            Phase::Response => "response",
-        }
-    }
-}
-
-impl fmt::Display for Phase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// What a directive contributes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Middleware(Phase),
-    /// A route's single terminal. Exactly one per route.
-    Terminal,
-}
-
-impl Role {
-    pub fn phase(self) -> Option<Phase> {
-        match self {
-            Role::Middleware(phase) => Some(phase),
-            Role::Terminal => None,
-        }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Role::Terminal)
-    }
-}
-
-/// Which scopes a directive may appear in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Scopes {
-    pub site: bool,
-    pub route: bool,
-}
-
-impl Scopes {
-    pub const SITE: Self = Self {
-        site: true,
-        route: false,
-    };
-    pub const ROUTE: Self = Self {
-        site: false,
-        route: true,
-    };
-    pub const BOTH: Self = Self {
-        site: true,
-        route: true,
-    };
-
-    pub fn allows(self, scope: Scope) -> bool {
-        match scope {
-            Scope::Site => self.site,
-            Scope::Route => self.route,
-        }
-    }
-
-    pub fn describe(self) -> &'static str {
-        match (self.site, self.route) {
-            (true, true) => "site or route",
-            (true, false) => "site",
-            (false, true) => "route",
-            (false, false) => "nowhere",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    Site,
-    Route,
-}
-
-const fn scope_name(scope: Scope) -> &'static str {
+fn scope_name(scope: Scope) -> &'static str {
     match scope {
         Scope::Site => "site",
         Scope::Route => "route",
     }
 }
 
-impl fmt::Display for Scope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Scope::Site => "site",
-            Scope::Route => "route",
-        })
-    }
-}
-
-/// What happens when this directive fails at request time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailurePolicy {
-    /// The request fails. The default, and the only option for anything that
-    /// affects authorization, routing or the response body.
-    Closed,
-    /// The request continues. Only observation may declare this.
-    Open,
-}
-
-/// Everything about a directive that does not depend on its configuration.
-#[derive(Debug, Clone)]
-pub struct DirectiveMeta {
-    /// The node name claimed in KDL.
-    pub name: &'static str,
-    pub scopes: Scopes,
-    pub role: Role,
-    /// Default ordering within a phase; a node may override it with `order=`.
-    pub order: i32,
-    /// Bumped when the compiled behaviour changes, so a plan built by an older
-    /// binary is never mistaken for an equivalent one.
-    pub version: &'static str,
-    pub failure_policy: FailurePolicy,
-}
-
-impl DirectiveMeta {
-    pub const fn middleware(name: &'static str, phase: Phase, scopes: Scopes) -> Self {
-        Self {
-            name,
-            scopes,
-            role: Role::Middleware(phase),
-            order: 0,
-            version: "1",
-            failure_policy: FailurePolicy::Closed,
-        }
-    }
-
-    pub const fn terminal(name: &'static str) -> Self {
-        Self {
-            name,
-            scopes: Scopes::ROUTE,
-            role: Role::Terminal,
-            order: 0,
-            version: "1",
-            failure_policy: FailurePolicy::Closed,
-        }
-    }
-
-    pub const fn with_version(mut self, version: &'static str) -> Self {
-        self.version = version;
-        self
-    }
-
-    /// Move this directive within its phase.
-    ///
-    /// Lower runs first. Needed only where alphabetical order would put a
-    /// directive in the wrong place — a timeout that has to wrap the other
-    /// guards rather than sit among them.
-    pub const fn with_order(mut self, order: i32) -> Self {
-        self.order = order;
-        self
-    }
-
-    pub const fn fail_open(mut self) -> Self {
-        self.failure_policy = FailurePolicy::Open;
-        self
-    }
-
-    pub fn hash_into(&self, hasher: &mut Hasher) {
-        hasher.update_str(self.name);
-        hasher.update_str(self.version);
-        hasher.update_u64(match self.role {
-            Role::Middleware(phase) => phase as u64,
-            Role::Terminal => 100,
-        });
-        hasher.update_i64(self.order as i64);
-        hasher.update_bool(self.failure_policy == FailurePolicy::Open);
-    }
-}
-
-/// State a directive keeps between requests.
-///
-/// A directive that needs one declares it here rather than reaching for a
-/// global: a rate limiter's buckets must survive a reload that did not change
-/// the limit, and must *not* survive one that did.
-pub struct DirectiveState {
-    /// Changes exactly when the existing buckets or counters stop meaning what
-    /// they meant. Raising a window does; renaming an unrelated route does not.
-    pub compatibility: Fingerprint,
-    /// Builds a fresh instance when the existing one cannot be reused.
-    pub create: Box<dyn Fn() -> Arc<dyn Any + Send + Sync> + Send + Sync>,
-}
-
-impl std::fmt::Debug for DirectiveState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectiveState")
-            .field("compatibility", &self.compatibility.short())
-            .finish()
-    }
-}
-
-/// What a directive is given when its handler is built.
-///
-/// Everything here is decided before anything is published, so a secret that
-/// cannot be read or a path that does not exist stops a reload rather than
-/// failing a request later.
-pub struct BuildContext<'a> {
-    /// The directory `file:` references resolve against.
-    pub root: &'a std::path::Path,
-    /// Whatever [`DirectiveConfig::state`] asked for, resolved against what is
-    /// already running. `None` for a directive that asked for nothing.
-    pub state: Option<Arc<dyn Any + Send + Sync>>,
-    /// What the process measures and reports about itself. Process-wide and
-    /// older than any generation, like a socket: a directive that exposes it
-    /// captures the handle, it is never rebuilt for a reload.
-    pub telemetry: &'a Arc<gatel_observe::Telemetry>,
-    /// The backends this generation can reach, for a directive that has to ask
-    /// one something. Handed over here and nowhere else, so the set a directive
-    /// can reach is fixed when it is built.
-    pub upstreams: &'a crate::subrequest::SharedUpstreams,
-}
-
-impl BuildContext<'_> {
-    /// Read the material a reference names, with the usual bounds and
-    /// permission checks.
-    pub fn secret(&self, reference: &gatel_model::SecretRef) -> Result<gatel_model::SecretString, String> {
-        gatel_model::resolve_secret(reference, self.root)
-    }
-
-    /// The upstream this directive named, checked to exist.
-    ///
-    /// Compilation already refused an unknown name, so a failure here means the
-    /// runtime and the plan disagree — which is worth stopping a reload for
-    /// rather than discovering on a request.
-    pub fn upstream(&self, upstream: &ResourceId) -> Result<crate::subrequest::SharedUpstreams, String> {
-        if !self.upstreams.has(upstream) {
-            return Err(format!("upstream `{}` has no runtime", upstream.name()));
-        }
-        Ok(Arc::clone(self.upstreams))
-    }
-
-    /// Take the state as a concrete type, or say what went wrong.
-    pub fn state<T: Any + Send + Sync>(&self, what: &str) -> Result<Arc<T>, String> {
-        self.state
-            .clone()
-            .ok_or_else(|| format!("{what} was not provided"))?
-            .downcast::<T>()
-            .map_err(|_| format!("{what} is not of the expected type"))
-    }
-}
-
-/// A decoded directive configuration.
-///
-/// `hash_into` must cover everything that changes behaviour and nothing that
-/// does not, because it is what decides whether a reload is a no-op.
-pub trait DirectiveConfig: Any + Send + Sync + 'static {
-    fn hash_into(&self, hasher: &mut Hasher);
-
-    /// Build the handler for one generation. Called during `prepare`, so a
-    /// failure here rejects the candidate and leaves the running configuration
-    /// untouched.
-    ///
-    /// Anything it needs from outside — a secret, a resolved path, its own
-    /// state — arrives in the context.
-    fn build(&self, cx: BuildContext<'_>) -> Result<Arc<dyn Handler>, String>;
-
-    /// What this directive needs to keep between requests, if anything.
-    fn state(&self) -> Option<DirectiveState> {
-        None
-    }
-
-    /// Upstreams this directive refers to by name.
-    ///
-    /// Declared so compilation can check the names against what the file
-    /// actually declares. A directive that keeps this to itself would turn a
-    /// typo into a 502 the first time somebody was refused, at which point the
-    /// operator is reading the wrong logs.
-    fn upstreams(&self) -> Vec<ResourceId> {
-        Vec::new()
-    }
-
-    /// One line for `gatel explain`.
-    fn describe(&self) -> String;
-}
-
-/// A directive implementation: metadata plus a decoder.
-pub trait Directive: Send + Sync + 'static {
-    fn meta(&self) -> &DirectiveMeta;
-
-    fn decode(&self, node: &Node, diagnostics: &mut Diagnostics) -> Option<Arc<dyn DirectiveConfig>>;
-}
+pub use gatel_plugin_runtime::{BuildContext, Bundle, Directive, DirectiveConfig, DirectiveState};
 
 /// A directive as it appears at one place in the configuration.
 #[derive(Clone)]
@@ -389,28 +90,6 @@ impl fmt::Debug for DirectiveInstance {
             .field("scope", &self.scope)
             .field("order", &self.order)
             .finish()
-    }
-}
-
-/// A named group of directives, shipped and trimmed as a unit.
-pub struct Bundle {
-    pub name: &'static str,
-    pub version: &'static str,
-    pub directives: Vec<Arc<dyn Directive>>,
-}
-
-impl Bundle {
-    pub fn new(name: &'static str, version: &'static str) -> Self {
-        Self {
-            name,
-            version,
-            directives: Vec::new(),
-        }
-    }
-
-    pub fn with(mut self, directive: impl Directive) -> Self {
-        self.directives.push(Arc::new(directive));
-        self
     }
 }
 
@@ -515,9 +194,33 @@ impl Registry {
 
         // `order` is read here rather than by the directive, so every directive
         // gets consistent ordering without opting in.
+        if node
+            .props
+            .iter()
+            .filter(|property| property.name == "order")
+            .count()
+            > 1
+        {
+            diagnostics.error(
+                Code::InvalidValue,
+                node.origin.clone(),
+                "`order` must not be repeated",
+            );
+            return None;
+        }
         let order = match node.prop("order") {
             Some(property) => match property.value.as_int() {
-                Some(value) => value as i32,
+                Some(value) => match i32::try_from(value) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        diagnostics.error(
+                            Code::InvalidValue,
+                            property.origin.clone(),
+                            "`order` must fit a signed 32-bit integer",
+                        );
+                        return None;
+                    }
+                },
                 None => {
                     diagnostics.error(
                         Code::InvalidValue,
@@ -566,8 +269,17 @@ pub struct RegistryBuilder {
 
 impl RegistryBuilder {
     pub fn bundle(mut self, bundle: Bundle) -> Self {
+        if self.bundles.iter().any(|(name, _)| *name == bundle.name) {
+            self.conflicts
+                .push(format!("bundle `{}` is registered more than once", bundle.name));
+        }
         self.bundles.push((bundle.name, bundle.version));
         for directive in bundle.directives {
+            let meta = directive.meta();
+            if meta.failure_policy == FailurePolicy::Open && meta.role != Role::Middleware(Phase::Observe) {
+                self.conflicts
+                    .push(format!("`{}` declares fail-open outside observation", meta.name));
+            }
             let name = directive.meta().name;
             if self.directives.insert(name, directive).is_some() {
                 self.conflicts
@@ -579,10 +291,12 @@ impl RegistryBuilder {
 
     /// Fails rather than silently letting one bundle shadow another, because a
     /// shadowed directive would change behaviour with no diagnostic anywhere.
-    pub fn build(self) -> Result<Registry, String> {
+    pub fn build(mut self) -> Result<Registry, String> {
         if !self.conflicts.is_empty() {
             return Err(self.conflicts.join("; "));
         }
+        // Registration order is a host implementation detail, not behaviour.
+        self.bundles.sort_unstable();
         Ok(Registry {
             directives: self.directives,
             bundles: self.bundles,
@@ -748,5 +462,212 @@ mod tests {
             .unwrap()
             .build_hash();
         assert_ne!(full, trimmed);
+    }
+
+    #[test]
+    fn bundle_registration_order_does_not_change_build_identity() {
+        let one = || Bundle::new("one", "1").with(Noop(DirectiveMeta::terminal("respond")));
+        let two = || Bundle::new("two", "1").with(Noop(DirectiveMeta::terminal("redirect")));
+        let a = Registry::builder().bundle(one()).bundle(two()).build().unwrap();
+        let b = Registry::builder().bundle(two()).bundle(one()).build().unwrap();
+        assert_eq!(a.build_hash(), b.build_hash());
+        assert_eq!(a.bundles(), b.bundles());
+    }
+
+    #[test]
+    fn conflicting_bundle_identity_is_rejected_even_without_directive_overlap() {
+        let error = Registry::builder()
+            .bundle(Bundle::new("same", "1").with(Noop(DirectiveMeta::terminal("respond"))))
+            .bundle(Bundle::new("same", "2").with(Noop(DirectiveMeta::terminal("redirect"))))
+            .build()
+            .unwrap_err();
+        assert!(error.contains("bundle `same` is registered more than once"));
+    }
+
+    #[test]
+    fn changing_allowed_scopes_changes_build_identity() {
+        let make = |scopes| {
+            Registry::builder()
+                .bundle(Bundle::new("test", "1").with(Noop(DirectiveMeta::middleware(
+                    "headers",
+                    Phase::Response,
+                    scopes,
+                ))))
+                .build()
+                .unwrap()
+                .build_hash()
+        };
+        assert_ne!(make(Scopes::SITE), make(Scopes::ROUTE));
+        assert_ne!(make(Scopes::BOTH), make(Scopes::ROUTE));
+    }
+
+    #[test]
+    fn out_of_range_order_is_rejected_instead_of_wrapping() {
+        for value in [i64::MIN, i32::MIN as i64 - 1, i32::MAX as i64 + 1, i64::MAX] {
+            let mut diagnostics = Diagnostics::new();
+            let result = registry().decode(
+                &node("headers").with_prop("order", Value::int(value, Origin::synthetic("test"))),
+                Scope::Route,
+                &mut diagnostics,
+            );
+            assert!(result.is_none());
+            assert_eq!(diagnostics.iter().next().unwrap().code, Code::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn a_security_directive_cannot_register_as_fail_open() {
+        let error = Registry::builder()
+            .bundle(Bundle::new("unsafe", "1").with(Noop(
+                DirectiveMeta::middleware("authentication", Phase::Guard, Scopes::BOTH).fail_open(),
+            )))
+            .build()
+            .unwrap_err();
+        assert!(error.contains("fail-open outside observation"));
+    }
+
+    #[test]
+    fn duplicate_order_is_not_silently_removed_before_decode() {
+        let mut duplicate = node("headers");
+        duplicate = duplicate.with_prop("order", Value::int(1, Origin::synthetic("test")));
+        let mut second = duplicate.props[0].clone();
+        second.value = Value::int(2, Origin::synthetic("test"));
+        duplicate.props.push(second);
+        let mut diagnostics = Diagnostics::new();
+        assert!(
+            registry()
+                .decode(&duplicate, Scope::Route, &mut diagnostics)
+                .is_none()
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .next()
+                .unwrap()
+                .message
+                .contains("must not be repeated")
+        );
+    }
+
+    fn composition(metas: Vec<DirectiveMeta>) -> Vec<DirectiveInstance> {
+        let mut builder = Bundle::new("composition", "1");
+        for meta in metas {
+            builder = builder.with(Noop(meta));
+        }
+        let registry = Registry::builder().bundle(builder).build().unwrap();
+        registry
+            .names()
+            .map(|name| {
+                registry
+                    .decode(&node(name), Scope::Route, &mut Diagnostics::new())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn required_order_overrides_user_order_and_outer_scope() {
+        let mut chain = composition(vec![
+            DirectiveMeta::middleware("guard", Phase::Guard, Scopes::BOTH).before(&["consumer"]),
+            DirectiveMeta::middleware("consumer", Phase::Guard, Scopes::BOTH),
+        ]);
+        for item in &mut chain {
+            if item.meta.name == "consumer" {
+                item.scope = Scope::Site;
+                item.order = -999;
+            }
+        }
+        let ordered = crate::ordering::order_chain(chain).unwrap();
+        assert_eq!(
+            ordered.iter().map(|item| item.meta.name).collect::<Vec<_>>(),
+            ["guard", "consumer"]
+        );
+    }
+
+    #[test]
+    fn cycles_and_conflicting_plugins_are_rejected() {
+        let a = || DirectiveMeta::middleware("a", Phase::Guard, Scopes::BOTH);
+        let b = || DirectiveMeta::middleware("b", Phase::Guard, Scopes::BOTH);
+        assert!(
+            crate::ordering::order_chain(composition(vec![a().before(&["b"]), b().before(&["a"])])).is_err()
+        );
+        assert!(crate::ordering::order_chain(composition(vec![a().conflicts_with(&["b"]), b()])).is_err());
+    }
+
+    #[test]
+    fn requirements_for_absent_optional_plugins_do_not_fail() {
+        let chain = composition(vec![
+            DirectiveMeta::middleware("guard", Phase::Guard, Scopes::BOTH).before(&["absent"]),
+        ]);
+        assert_eq!(crate::ordering::order_chain(chain).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn effect_rules_apply_to_external_names_across_scopes() {
+        for effects in [
+            &[Effect::ReadRequestBody][..],
+            &[Effect::CallUpstream][..],
+            &[Effect::ConsumeQuota][..],
+        ] {
+            let mut chain = composition(vec![
+                DirectiveMeta::middleware("external-budget", Phase::Guard, Scopes::BOTH)
+                    .with_effects(&[Effect::RequestBodyLimit]),
+                DirectiveMeta::middleware("external-work", Phase::Guard, Scopes::BOTH).with_effects(effects),
+            ]);
+            for instance in &mut chain {
+                if instance.meta.name == "external-work" {
+                    instance.scope = Scope::Site;
+                    instance.order = i32::MIN;
+                } else {
+                    instance.order = i32::MAX;
+                }
+            }
+            let chain = crate::ordering::order_chain(chain).unwrap();
+            assert_eq!(chain[0].meta.name, "external-budget");
+            assert_eq!(chain[1].meta.name, "external-work");
+        }
+    }
+
+    #[test]
+    fn effects_cannot_be_overridden_by_explicit_constraints_or_phase() {
+        let budget = || {
+            DirectiveMeta::middleware("budget", Phase::Guard, Scopes::BOTH)
+                .with_effects(&[Effect::RequestBodyLimit])
+        };
+        let reader = || {
+            DirectiveMeta::middleware("reader", Phase::Guard, Scopes::BOTH)
+                .with_effects(&[Effect::ReadRequestBody])
+        };
+        assert!(
+            crate::ordering::order_chain(composition(vec![budget(), reader().before(&["budget"]),])).is_err()
+        );
+        let mut late = budget();
+        late.role = Role::Middleware(Phase::Response);
+        assert!(crate::ordering::order_chain(composition(vec![late, reader()])).is_err());
+        // Two composite limit/read middleware cannot both protect each other's reads.
+        assert!(
+            crate::ordering::order_chain(composition(vec![
+                budget().with_effects(&[Effect::RequestBodyLimit, Effect::ReadRequestBody]),
+                reader().with_effects(&[Effect::RequestBodyLimit, Effect::ReadRequestBody]),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn effect_identity_is_canonical_and_behavior_sensitive() {
+        let hash = |effects| {
+            let mut hasher = Hasher::new();
+            DirectiveMeta::terminal("test")
+                .with_effects(effects)
+                .hash_into(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(
+            hash(&[Effect::CallUpstream, Effect::ConsumeQuota]),
+            hash(&[Effect::ConsumeQuota, Effect::CallUpstream, Effect::ConsumeQuota]),
+        );
+        assert_ne!(hash(&[]), hash(&[Effect::CallUpstream]));
+        assert_ne!(hash(&[Effect::ReadRequestBody]), hash(&[Effect::ConsumeQuota]));
     }
 }

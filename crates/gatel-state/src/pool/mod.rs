@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -134,10 +134,10 @@ pub(super) struct EndpointPool {
     pub(super) idle: Mutex<VecDeque<Idle>>,
     pub(super) waiting: AtomicU64,
     pub(super) counters: Counters,
-    /// The addresses this endpoint currently has, or empty for "everything is
-    /// still current". Read when a connection is returned, so one that reached
+    /// The addresses this endpoint currently has, or None before any update.
+    /// Some(empty) revokes every address. Read when a connection is returned, so one that reached
     /// a replaced container is dropped rather than parked.
-    pub(super) live: Mutex<Vec<SocketAddr>>,
+    pub(super) live: Mutex<Option<Vec<SocketAddr>>>,
 }
 
 /// Live connections to one upstream's backends.
@@ -155,6 +155,7 @@ pub struct ConnectionPool {
     /// traffic, where it would look like the backend's fault.
     tls: Option<Arc<gatel_tls::ClientTls>>,
     endpoints: Mutex<HashMap<String, Arc<EndpointPool>>>,
+    draining: AtomicBool,
 }
 
 impl std::fmt::Debug for ConnectionPool {
@@ -211,6 +212,11 @@ pub struct PoolStats {
 }
 
 impl ConnectionPool {
+    /// Share prepared trust and client identity with independent health connections.
+    pub(crate) fn tls(&self) -> Option<&gatel_tls::ClientTls> {
+        self.tls.as_deref()
+    }
+
     pub fn new(
         config: gatel_plan::Pool,
         protocol: UpstreamProtocol,
@@ -222,6 +228,7 @@ impl ConnectionPool {
             protocol,
             tls,
             endpoints: Mutex::new(HashMap::new()),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -249,12 +256,18 @@ impl ConnectionPool {
         let mut endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
         Arc::clone(endpoints.entry(endpoint.id.clone()).or_insert_with(|| {
             Arc::new(EndpointPool {
-                permits: Arc::new(Semaphore::new(config.max_per_endpoint as usize)),
+                permits: {
+                    let permits = Arc::new(Semaphore::new(config.max_per_endpoint as usize));
+                    if self.draining.load(Ordering::Acquire) {
+                        permits.close();
+                    }
+                    permits
+                },
                 granted: AtomicU32::new(config.max_per_endpoint),
                 idle: Mutex::new(VecDeque::new()),
                 waiting: AtomicU64::new(0),
                 counters: Counters::default(),
-                live: Mutex::new(Vec::new()),
+                live: Mutex::new(None),
             })
         }))
     }
@@ -265,6 +278,9 @@ impl ConnectionPool {
         endpoint: &Arc<Endpoint>,
         timeouts: &Timeouts,
     ) -> Result<Lease, CheckoutError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(CheckoutError::Draining);
+        }
         let Policy { config, .. } = self.policy();
         let slot = self.slot(endpoint, &config);
 
@@ -285,6 +301,7 @@ impl ConnectionPool {
                 Ok(Err(_)) => return Err(CheckoutError::Draining),
                 Err(_) => return Err(CheckoutError::QueueTimeout(timeouts.queue)),
             };
+        drop(_waiting_guard);
 
         // Drop stale idle connections rather than sending a request into a
         // socket the backend has already closed.
@@ -319,14 +336,16 @@ impl ConnectionPool {
     }
 
     pub fn stats(&self) -> Vec<PoolStats> {
-        let granted = self.policy().config.max_per_endpoint;
         let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
         let mut stats: Vec<PoolStats> = endpoints
             .iter()
             .map(|(id, slot)| PoolStats {
                 endpoint: id.clone(),
                 idle: slot.idle.lock().unwrap_or_else(|p| p.into_inner()).len(),
-                in_use: granted.saturating_sub(slot.permits.available_permits() as u32),
+                in_use: slot
+                    .granted
+                    .load(Ordering::Acquire)
+                    .saturating_sub(slot.permits.available_permits() as u32),
                 waiting: slot.waiting.load(Ordering::Relaxed),
                 opened: slot.counters.opened.load(Ordering::Relaxed),
                 reused: slot.counters.reused.load(Ordering::Relaxed),
@@ -350,7 +369,7 @@ impl ConnectionPool {
         let Some(slot) = endpoints.get(endpoint) else {
             return 0;
         };
-        *slot.live.lock().unwrap_or_else(|p| p.into_inner()) = keep.to_vec();
+        *slot.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(keep.to_vec());
         let mut idle = slot.idle.lock().unwrap_or_else(|p| p.into_inner());
         let before = idle.len();
         // A connection with no address is a Unix socket, which no change of
@@ -367,6 +386,7 @@ impl ConnectionPool {
     /// finish normally; their connections are simply not returned.
     pub fn drain(&self) {
         let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
+        self.draining.store(true, Ordering::Release);
         for slot in endpoints.values() {
             slot.permits.close();
             slot.idle.lock().unwrap_or_else(|p| p.into_inner()).clear();

@@ -49,6 +49,25 @@ pub struct UpstreamRuntimes {
 }
 
 impl UpstreamRuntimes {
+    /// Observe current upstream TLS files against the policy actually loaded
+    /// in each pool. Invalid/missing material requests preparation too, so the
+    /// transaction reports failure and retains the last serving generation.
+    /// This is not an atomic snapshot of several files or a revocation API.
+    pub fn tls_material_changed(&self, root: &std::path::Path) -> bool {
+        self.runtimes.iter().any(|runtime| {
+            let Some(spec) = &runtime.spec.tls else {
+                return false;
+            };
+            match gatel_tls::ClientTls::new(spec, runtime.spec.protocol, root) {
+                Ok(current) => runtime
+                    .pool
+                    .tls()
+                    .is_none_or(|loaded| loaded.identity() != current.identity()),
+                Err(_) => true,
+            }
+        })
+    }
+
     /// Resolve every upstream in a plan against what is already running.
     ///
     /// This is the point where "the operator raised a pool limit" and "the
@@ -61,6 +80,17 @@ impl UpstreamRuntimes {
     /// TLS. Everything else here is a lookup against what is already running
     /// and cannot fail.
     pub fn resolve(
+        plan: &Plan,
+        state: &StateRegistry,
+        root: &std::path::Path,
+    ) -> Result<(Self, Vec<(ResourceId, UpstreamResolution)>), String> {
+        let result = Self::prepare(plan, state, root)?;
+        result.0.adopt_policies();
+        Ok(result)
+    }
+
+    /// Resolve candidate state without changing the policies of reused pools.
+    pub fn prepare(
         plan: &Plan,
         state: &StateRegistry,
         root: &std::path::Path,
@@ -91,14 +121,20 @@ impl UpstreamRuntimes {
                 state.bind(&binding(StateKind::Endpoints), || EndpointSet::new(upstream));
             let (selector, selector_resolution) =
                 state.bind(&binding(StateKind::Selector), SelectorState::new);
-            let (pool, pool_resolution) = state.bind(&binding(StateKind::Pool), || {
+            let mut pool_binding = binding(StateKind::Pool);
+            if let Some(tls) = &tls {
+                let mut compatibility = gatel_model::Hasher::new();
+                compatibility.update_str("prepared-pool-tls-v1");
+                compatibility.update_fingerprint(&pool_binding.compatibility);
+                compatibility.update_fingerprint(&tls.identity());
+                pool_binding.compatibility = compatibility.finish();
+            }
+            let (pool, pool_resolution) = state.bind(&pool_binding, || {
                 ConnectionPool::new(upstream.pool, upstream.protocol, upstream.resolve, tls)
             });
             // Sizing and lookup timing are deliberately not part of what makes
             // a pool reusable, so a kept pool is holding the previous
-            // generation's numbers until it is handed the new ones. Done for
-            // every pool, not only a reused one, so there is one path.
-            pool.adopt(upstream.pool, upstream.resolve);
+            // generation's numbers until publication calls adopt_policies.
 
             resolutions.push((
                 upstream.id.clone(),
@@ -118,6 +154,13 @@ impl UpstreamRuntimes {
         }
 
         Ok((Self { runtimes }, resolutions))
+    }
+
+    /// Apply already validated policies only when this generation publishes.
+    pub fn adopt_policies(&self) {
+        for runtime in &self.runtimes {
+            runtime.pool.adopt(runtime.spec.pool, runtime.spec.resolve);
+        }
     }
 
     pub fn get(&self, id: &ResourceId) -> Option<&Arc<UpstreamRuntime>> {

@@ -23,6 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 // ---------------------------------------------------------------------------
 
 pub struct Gateway {
+    pub blocking_budget: Option<Arc<gatel_plan::blocking::Budget>>,
     pub store: Arc<GenerationStore<Arc<Runtime>>>,
     pub binds: Arc<BindTable>,
     pub state: Arc<StateRegistry>,
@@ -43,8 +44,12 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(tag: &str) -> Self {
+        // SystemTime can repeat across parallel tests (notably on Windows).
+        // A process-local sequence keeps equal tags from sharing a directory.
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "gatel-e2e-{tag}-{}-{:?}",
+            "gatel-e2e-{tag}-{}-{:?}-{sequence}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -56,6 +61,7 @@ impl Gateway {
         let binds = Arc::new(BindTable::new());
         Self {
             server: Arc::new(Server::new(Arc::clone(&store), Arc::clone(&binds))),
+            blocking_budget: None,
             store,
             binds,
             state: Arc::new(StateRegistry::new()),
@@ -79,6 +85,10 @@ impl Gateway {
     /// two processes only in the ways that matter — the sockets are real and
     /// only one of them can have a port.
     pub async fn stop(&self) {
+        let acme = self.acme.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(acme) = acme {
+            acme.shutdown().await;
+        }
         self.server.shutdown().await;
         self.binds.retain(&[]);
     }
@@ -92,6 +102,7 @@ impl Gateway {
         let store = Arc::new(GenerationStore::new());
         let binds = Arc::new(BindTable::new());
         Self {
+            blocking_budget: None,
             server: Arc::new(Server::new(Arc::clone(&store), Arc::clone(&binds))),
             store,
             binds,
@@ -112,6 +123,14 @@ impl Gateway {
 
     /// Apply a configuration exactly the way the binary does.
     pub async fn apply(&self, kdl: &str) -> Outcome {
+        self.apply_mode(kdl, false).await
+    }
+
+    pub async fn refresh(&self, kdl: &str) -> Outcome {
+        self.apply_mode(kdl, true).await
+    }
+
+    async fn apply_mode(&self, kdl: &str, refresh: bool) -> Outcome {
         let path = self.directory.join("gatel.kdl");
         std::fs::write(&path, kdl).unwrap();
         self.revision.set(self.revision.get() + 1);
@@ -135,6 +154,16 @@ impl Gateway {
             }
         };
 
+        self.apply_snapshot_mode(&snapshot, refresh).await
+    }
+
+    /// Submit a complete multi-source observation through normal prepare/commit.
+    /// Tests compose source revisions themselves; no runtime state is edited here.
+    pub async fn apply_snapshot(&self, snapshot: &Snapshot) -> Outcome {
+        self.apply_snapshot_mode(snapshot, false).await
+    }
+
+    async fn apply_snapshot_mode(&self, snapshot: &Snapshot, refresh: bool) -> Outcome {
         let binds = Arc::clone(&self.binds);
         let state = Arc::clone(&self.state);
         let certificates = Arc::clone(&self.certificates);
@@ -143,10 +172,14 @@ impl Gateway {
         let telemetry = Arc::clone(&self.telemetry);
         let root = self.directory.clone();
         let ca_directory = self.directory.join("ca");
-        let outcome = self.store.attempt(&snapshot, &self.registry, move |preparation| {
+        let plugin_retirements = self.server.plugin_retirements().clone();
+        let build = move |preparation: gatel_plan::Preparation<'_, Arc<Runtime>>| {
             prepare(
                 &preparation,
                 &Resources {
+                    blocking_budget: self.blocking_budget.as_deref(),
+                    blocking: self.server.blocking_executor(),
+                    plugin_retirements: &plugin_retirements,
                     binds: &binds,
                     state: &state,
                     certificates: &certificates,
@@ -157,7 +190,12 @@ impl Gateway {
                     internal_ca: ca_directory.clone(),
                 },
             )
-        });
+        };
+        let outcome = if refresh {
+            self.store.refresh(snapshot, &self.registry, build)
+        } else {
+            self.store.attempt(snapshot, &self.registry, build)
+        };
         outcome.record(&self.telemetry);
         if matches!(outcome, Outcome::Started { .. } | Outcome::Reloaded { .. }) {
             self.server.sync().await;

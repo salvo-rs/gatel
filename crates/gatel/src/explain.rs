@@ -117,6 +117,7 @@ pub fn diff(before: &Plan, after: &Plan) -> String {
     if before.spec_hash() == after.spec_hash() {
         out.push_str("the configuration is the same; the difference is in the build\n");
     }
+    diff_resources(&mut out, &before.spec, &after.spec);
 
     let listeners = |plan: &Plan| -> Vec<String> {
         plan.listeners
@@ -175,6 +176,62 @@ pub fn diff(before: &Plan, after: &Plan) -> String {
         }
     }
     out
+}
+
+/// Compare normalized resources without printing plugin configuration values
+/// or hashes derived from those values (which may contain sensitive data).
+fn diff_resources(out: &mut String, before: &gatel_plan::Spec, after: &gatel_plan::Spec) {
+    use std::collections::BTreeMap;
+
+    use gatel_model::{Fingerprint, Hasher, ResourceId, SourceId};
+    fn resources(spec: &gatel_plan::Spec) -> BTreeMap<ResourceId, (SourceId, Fingerprint)> {
+        let mut values = BTreeMap::new();
+        macro_rules! collect {
+            ($items:expr) => {
+                for item in $items {
+                    let mut hash = Hasher::new();
+                    item.hash_into(&mut hash);
+                    values.insert(item.id.clone(), (item.owner.clone(), hash.finish()));
+                }
+            };
+        }
+        collect!(&spec.listeners);
+        collect!(&spec.sites);
+        collect!(&spec.upstreams);
+        values
+    }
+    let mut changes = String::new();
+    let mut old_global = Hasher::new();
+    let mut new_global = Hasher::new();
+    before.global.hash_into(&mut old_global);
+    after.global.hash_into(&mut new_global);
+    if old_global.finish() != new_global.finish() {
+        changes.push_str("  ~ global configuration changed\n");
+    }
+    let old = resources(before);
+    let new = resources(after);
+    for (id, (owner, hash)) in &old {
+        match new.get(id) {
+            None => changes.push_str(&format!("  - {id} (owner {owner})\n")),
+            Some((next_owner, next_hash)) => {
+                if owner != next_owner {
+                    changes.push_str(&format!("  ~ {id} owner {owner} -> {next_owner}\n"));
+                }
+                if hash != next_hash {
+                    changes.push_str(&format!("  ~ {id} configuration changed\n"));
+                }
+            }
+        }
+    }
+    for (id, (owner, _)) in &new {
+        if !old.contains_key(id) {
+            changes.push_str(&format!("  + {id} (owner {owner})\n"));
+        }
+    }
+    if !changes.is_empty() {
+        out.push_str("resources\n");
+        out.push_str(&changes);
+    }
 }
 
 fn terminal_summary(terminal: &Terminal) -> String {

@@ -8,6 +8,119 @@ use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+async fn open_tunnel(address: std::net::SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(head.starts_with(b"HTTP/1.1 101"));
+    stream
+}
+
+#[tokio::test]
+async fn tunnel_keeps_connection_capacity_and_generation_until_closed() {
+    let gateway = Gateway::new("upgrade-lifetime");
+    let port = free_port();
+    let backend = upgrade_backend().await;
+    let source = |body: &str| {
+        format!(
+            r#"
+global {{ http "127.0.0.1:{port}"; limits connections=1; }}
+site "*" {{ route "/ws" {{ proxy "{backend}"; }}; route "/" {{ respond "{body}"; }} }}
+"#
+        )
+    };
+    let outcome = gateway.apply(&source("old")).await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::Started { .. }),
+        "{outcome:?}"
+    );
+    let old = gateway.store.current().unwrap();
+    let weak = std::sync::Arc::downgrade(&old);
+    let metrics = old.runtime.listeners.values().next().unwrap().metrics.clone();
+    drop(old);
+    let mut tunnel = open_tunnel(gateway.address()).await;
+    gateway.apply(&source("new")).await;
+    assert!(weak.upgrade().is_some(), "upgrade released its generation");
+    assert_eq!(metrics.connections_active.get(), 1);
+    let mut waiting = TcpStream::connect(gateway.address()).await.unwrap();
+    waiting
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut byte = [0];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), waiting.read(&mut byte))
+            .await
+            .is_err(),
+        "upgrade stopped counting toward max-connections"
+    );
+    tunnel.write_all(b"ping").await.unwrap();
+    let mut echo = [0; 9];
+    tunnel.read_exact(&mut echo).await.unwrap();
+    assert_eq!(&echo, b"echo:ping");
+    drop(tunnel);
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(2), waiting.read_to_string(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.ends_with("new"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn shutdown_deadline_cancels_upgraded_io() {
+    let gateway = Gateway::new("upgrade-shutdown");
+    let port = free_port();
+    let backend = upgrade_backend().await;
+    gateway
+        .apply(&format!(
+            r#"
+global {{ http "127.0.0.1:{port}"; grace-period "50ms"; }}
+site "*" {{ route "/ws" {{ proxy "{backend}"; }} }}
+"#
+        ))
+        .await;
+    let mut tunnel = open_tunnel(gateway.address()).await;
+    let metrics = gateway
+        .store
+        .current()
+        .unwrap()
+        .runtime
+        .listeners
+        .values()
+        .next()
+        .unwrap()
+        .metrics
+        .clone();
+    tokio::time::timeout(Duration::from_secs(2), gateway.server.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(metrics.connections_active.get(), 0);
+    let mut bytes = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(1), tunnel.read_to_end(&mut bytes)).await;
+    assert!(closed.is_ok(), "upgraded socket survived shutdown");
+}
+
 #[tokio::test]
 async fn an_upgrade_is_forwarded_and_the_tunnel_carries_bytes() {
     let gateway = Gateway::new("upgrade");

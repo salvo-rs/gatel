@@ -34,6 +34,13 @@ struct Task {
     handle: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for Task {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        self.handle.abort();
+    }
+}
+
 impl Census {
     pub fn new() -> Self {
         Self::default()
@@ -52,17 +59,20 @@ impl Census {
         // generation's numbers standing for a whole interval.
         publish(runtimes, telemetry);
 
-        let (sender, mut receiver) = watch::channel(false);
+        let (sender, receiver) = watch::channel(false);
         let runtimes = Arc::clone(runtimes);
         let telemetry = Arc::clone(telemetry);
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = receiver.changed() => return,
-                    _ = tokio::time::sleep(INTERVAL) => publish(&runtimes, &telemetry),
-                }
-            }
-        });
+        let handle = tokio::spawn(crate::worker::supervise(
+            gatel_observe::workers::WorkerKind::Census,
+            String::new(),
+            Arc::clone(&telemetry),
+            receiver,
+            move |receiver| {
+                let runtimes = Arc::clone(&runtimes);
+                let telemetry = Arc::clone(&telemetry);
+                sample_loop(receiver, move || publish(&runtimes, &telemetry))
+            },
+        ));
         *running = Some(Task { stop: sender, handle });
     }
 
@@ -73,13 +83,40 @@ impl Census {
     }
 
     pub async fn is_running(&self) -> bool {
-        self.running.lock().await.is_some()
+        self.running
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.handle.is_finished())
     }
 }
 
-async fn stop(task: Task) {
+async fn sample_loop(mut stop: watch::Receiver<bool>, mut sample: impl FnMut()) {
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            _ = tokio::time::sleep(INTERVAL) => sample(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "census_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+async fn stop(mut task: Task) {
     let _ = task.stop.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), task.handle).await;
+    if tokio::time::timeout(Duration::from_secs(5), &mut task.handle)
+        .await
+        .is_err()
+    {
+        task.handle.abort();
+        let _ = (&mut task.handle).await;
+    }
 }
 
 /// Sample every upstream, and forget the ones no longer configured.

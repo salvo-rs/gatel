@@ -15,9 +15,11 @@
 //!
 //! # What it does not do
 //!
-//! It does not revalidate. A stale entry is a miss, and the origin is asked
-//! again in full rather than with `If-None-Match` — which is what nginx does
-//! without `proxy_cache_revalidate`. It is worth adding and is not here.
+//! Stale unencoded GET responses with an ETag or Last-Modified can be revalidated. A candidate
+//! is taken by one request, and a valid 304 reconstructs its complete body.
+//! Client-conditional requests, HEAD, encoded representations and entries
+//! without valid validators still go to the origin without this optimization. There is
+//! no stale-on-error fallback or automatic retry of an invalid 304.
 //!
 //! It does not coalesce. Ten simultaneous requests for one uncached page are
 //! ten requests to the origin — nginx has `proxy_cache_lock` for this, and a
@@ -34,7 +36,14 @@
 //! a store each, so the memory a configuration can use is the sum of every
 //! `max-size` in it.
 
+mod age;
+#[cfg(test)]
+mod cancellation;
+mod conditional;
+mod control;
+mod invalidation;
 mod policy;
+mod revalidate;
 mod store;
 
 use std::any::Any;
@@ -52,7 +61,8 @@ pub use store::Store;
 
 #[derive(Debug, FromNode)]
 struct Fields {
-    /// Everything held, together.
+    /// Retained-data budget including keys, headers, variants and entry overhead.
+    /// This is not a hard limit on allocator overhead or process RSS.
     #[gatel(prop, default = ByteSize::mib(64))]
     max_size: ByteSize,
     /// The largest single response worth keeping.
@@ -86,18 +96,15 @@ impl DirectiveConfig for Config {
     }
 
     fn state(&self) -> Option<DirectiveState> {
-        // What is already stored stays stored across a reload. Everything held
-        // was decided by the response that produced it, so changing a size
-        // bound does not make any of it wrong — and emptying the cache on a
-        // reload would send every request to the origin at once, which is the
-        // one moment a gateway can least afford it.
-        //
-        // Nothing goes into the compatibility hash, so no change to this
-        // directive throws the cache away. A changed budget is applied by
-        // eviction on the next write.
+        // Policy changes create a new generation-owned store. Mutating the
+        // old store during prepare would affect live requests even if another
+        // resource later fails. Unchanged policy retains warmed entries.
+        let mut compatibility = Hasher::new();
+        compatibility.update_str("cache-policy-state-v2");
+        self.hash_into(&mut compatibility);
         let max_size = self.max_size;
         Some(DirectiveState {
-            compatibility: Hasher::new().finish(),
+            compatibility: compatibility.finish(),
             create: Box::new(move || Arc::new(Store::new(max_size)) as Arc<dyn Any + Send + Sync>),
         })
     }
@@ -126,7 +133,9 @@ impl Directive for Cache {
         // The request phase: after every guard, so a cached copy is never a
         // way past one, and outside the terminal, so there is a response to
         // store.
-        static META: DirectiveMeta = DirectiveMeta::middleware("cache", Phase::Request, Scopes::BOTH);
+        static META: DirectiveMeta = DirectiveMeta::middleware("cache", Phase::Request, Scopes::BOTH)
+            .with_effects(&[gatel_plan::Effect::CacheLookup])
+            .with_version("16");
         &META
     }
 
@@ -167,14 +176,24 @@ struct CacheHandler {
 
 impl CacheHandler {
     /// What this request would be stored under, before `Vary`.
-    fn key(&self, request: &Request) -> store::Key {
+    fn key(&self, request: &Request, depot: &Depot) -> store::Key {
         let host = crate::authority(request).unwrap_or("");
         let target = request
             .uri()
             .path_and_query()
             .map(|path| path.as_str())
             .unwrap_or("/");
-        store::Key::new(request.method(), host, target)
+        let scheme = if depot.get::<bool>("gatel.tls").copied().unwrap_or(false) {
+            "https"
+        } else {
+            "http"
+        };
+        let mut key = store::Key::new(request.method(), scheme, host, target);
+        key.namespace = depot
+            .get::<gatel_plan::ExecutionIdentity>(gatel_plan::ExecutionIdentity::DEPOT_KEY)
+            .map(|identity| identity.0.to_string())
+            .unwrap_or_default();
+        key
     }
 
     /// Replay a stored response.
@@ -185,7 +204,7 @@ impl CacheHandler {
         // been somewhere else. Age accumulates along a chain of caches; a
         // gateway that reports only its own resident time tells a browser a
         // response is fresher than it is, and the error grows with every hop.
-        let age = entry.age().as_secs() + entry.age_on_arrival;
+        let age = entry.current_age().as_secs();
         if let Ok(value) = http::HeaderValue::from_str(&age.to_string()) {
             response.headers_mut().insert(http::header::AGE, value);
         }
@@ -195,20 +214,6 @@ impl CacheHandler {
         );
         response.body(ResBody::Once(entry.body.clone()));
     }
-}
-
-/// How old the response already was when it got here.
-///
-/// A response from an origin that is itself behind a cache arrives with an
-/// `Age`, and RFC 9111 says age accumulates: what a client is told has to be
-/// this plus however long it then sat here.
-fn arrived_with_age(response: &Response) -> u64 {
-    response
-        .headers()
-        .get(http::header::AGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0)
 }
 
 /// RFC 9211 `Cache-Status`, so "why did this not cache" has an answer on the
@@ -228,27 +233,114 @@ impl Handler for CacheHandler {
         response: &mut Response,
         ctrl: &mut FlowCtrl,
     ) {
+        let only_if_cached = policy::only_if_cached(request);
+        if depot
+            .get::<gatel_plan::ExecutionIdentity>(gatel_plan::ExecutionIdentity::DEPOT_KEY)
+            .is_err()
+        {
+            if only_if_cached {
+                cache_only_miss(request, depot, response, ctrl);
+            } else {
+                ctrl.call_next(request, depot, response).await;
+                status_header(response, "fwd=uri-miss; detail=missing-execution-identity");
+            }
+            return;
+        }
+        let key = self.key(request, depot);
         if let Err(refusal) = policy::request_is_cacheable(request) {
+            if only_if_cached {
+                cache_only_miss(request, depot, response, ctrl);
+                return;
+            }
+            let unsafe_method = !matches!(
+                *request.method(),
+                http::Method::GET | http::Method::HEAD | http::Method::OPTIONS | http::Method::TRACE
+            );
             ctrl.call_next(request, depot, response).await;
+            let status = response.status_code.unwrap_or(StatusCode::OK);
+            if unsafe_method && (status.is_success() || status.is_redirection()) {
+                self.store.invalidate(&key);
+                for associated in invalidation::associated(&key, response.headers()) {
+                    self.store.invalidate(&associated);
+                }
+            }
             status_header(response, &format!("fwd=uri-miss; detail={}", refusal.as_str()));
             return;
         }
 
-        let key = self.key(request);
-        let vary = self.store.vary_for(&key).unwrap_or_default();
-        let signature = store::signature(request.headers(), &vary);
-
+        let stale = if !only_if_cached && revalidate::eligible(request) {
+            self.store
+                .take_stale(&key, request.headers())
+                .and_then(|(revision, entry)| {
+                    revalidate::validator(&entry).map(|validator| (revision, entry, validator))
+                })
+        } else {
+            None
+        };
         if policy::may_serve_from_cache(request)
-            && let Some(entry) = self.store.get(&key, &signature)
+            && let Some(entry) = self.store.get_matching(&key, request.headers(), |entry| {
+                policy::entry_satisfies_request(request, entry)
+                    && conditional::evaluate(request.headers(), entry) != conditional::Decision::Forward
+            })
         {
             // The terminal is never reached, which is the point.
             crate::generated(depot);
             self.serve(&entry, response);
+            if conditional::evaluate(request.headers(), &entry) == conditional::Decision::NotModified {
+                response.status_code(StatusCode::NOT_MODIFIED);
+                *response.body_mut() = ResBody::None;
+                response.headers_mut().remove(http::header::CONTENT_LENGTH);
+                response.headers_mut().remove(http::header::CONTENT_RANGE);
+            }
             ctrl.skip_rest();
             return;
         }
 
+        if only_if_cached {
+            cache_only_miss(request, depot, response, ctrl);
+            return;
+        }
+        let revision = stale
+            .as_ref()
+            .map(|(revision, ..)| *revision)
+            .unwrap_or_else(|| self.store.revision());
+        if let Some((_, _, validator)) = &stale {
+            request
+                .headers_mut()
+                .insert(validator.header(), validator.value());
+        }
+        let started = std::time::Instant::now();
+        let observed = self.store.observe(&key, request.headers());
         ctrl.call_next(request, depot, response).await;
+        let received = std::time::Instant::now();
+        // A new 200 response supersedes the observed copy even
+        // when policy/size/body failure prevents storing it. Identity guards
+        // preserve concurrent replacements; successful put replaces identity.
+        let _retirement = (response.status_code.unwrap_or(StatusCode::OK) == StatusCode::OK)
+            .then(|| self.store.retire_on_drop(observed));
+        let revalidated = stale.is_some() && response.status_code == Some(StatusCode::NOT_MODIFIED);
+        if let Some((_, entry, validator)) = &stale {
+            request.headers_mut().remove(validator.header());
+            if response.status_code == Some(StatusCode::NOT_MODIFIED)
+                && revalidate::merge(entry, validator, response).is_err()
+            {
+                crate::generated(depot);
+                response.status_code(StatusCode::BAD_GATEWAY);
+                response.headers_mut().clear();
+                *response.body_mut() = ResBody::None;
+                let _ = response.write_body("502 invalid cache validation response\n");
+                status_header(response, "fwd=miss; detail=invalid-validation");
+                return;
+            }
+        }
+        let Some(initial_age) = age::initial(
+            response.headers(),
+            std::time::SystemTime::now(),
+            received.duration_since(started),
+        ) else {
+            status_header(response, "fwd=miss; detail=invalid-age");
+            return;
+        };
 
         let ttl = match policy::freshness(request, response, self.default_ttl) {
             Ok(ttl) => ttl,
@@ -285,7 +377,8 @@ impl Handler for CacheHandler {
         // answers is only known now.
         let vary = policy::vary_on(response);
         let signature = store::signature(request.headers(), &vary);
-        self.store.put(
+        let stored = self.store.put_guarded(
+            revision,
             key,
             signature,
             vary,
@@ -293,15 +386,42 @@ impl Handler for CacheHandler {
                 status: response.status_code.unwrap_or(StatusCode::OK).as_u16(),
                 headers: response.headers().clone(),
                 body: collected.clone(),
-                stored: std::time::Instant::now(),
+                stored: received,
                 ttl,
-                age_on_arrival: arrived_with_age(response),
+                age_on_arrival: initial_age,
             },
+            stale.is_some(),
         );
 
-        status_header(response, "fwd=miss; stored");
+        status_header(
+            response,
+            if stored {
+                if revalidated {
+                    "fwd=stale; fwd-status=304; stored"
+                } else {
+                    "fwd=miss; stored"
+                }
+            } else {
+                "fwd=miss; detail=fill-rejected"
+            },
+        );
         *response.body_mut() = ResBody::Once(collected);
     }
+}
+
+fn cache_only_miss(request: &Request, depot: &mut Depot, response: &mut Response, ctrl: &mut FlowCtrl) {
+    crate::generated(depot);
+    response.status_code(StatusCode::GATEWAY_TIMEOUT);
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    status_header(response, "fwd=uri-miss; detail=only-if-cached");
+    *response.body_mut() = ResBody::None;
+    if request.method() != http::Method::HEAD {
+        let _ = response.write_body("504 no acceptable cached response\n");
+    }
+    ctrl.skip_rest();
 }
 
 enum Collected {

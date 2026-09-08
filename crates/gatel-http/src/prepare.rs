@@ -23,7 +23,12 @@ use crate::dispatch::{Dispatcher, PreparedRoute, PreparedSite};
 pub type AcmeIntent = (Arc<gatel_tls::Acme>, Vec<gatel_tls::Wanted>);
 
 /// What preparation is allowed to touch: everything that outlives a generation.
+#[derive(Clone)]
 pub struct Resources<'a> {
+    /// Optional host controller. Without it explicit KDL budget changes reject.
+    pub blocking_budget: Option<&'a gatel_plan::blocking::Budget>,
+    pub blocking: &'a gatel_plan::blocking::Executor,
+    pub plugin_retirements: &'a Arc<crate::plugin_retirement::Retirements>,
     pub binds: &'a BindTable,
     pub state: &'a StateRegistry,
     pub certificates: &'a Arc<CertificateStore>,
@@ -75,6 +80,11 @@ impl std::fmt::Debug for ListenerRuntime {
 /// Everything one generation needs to serve traffic.
 #[derive(Debug)]
 pub struct Runtime {
+    certificate_change: gatel_tls::store::CertificateUpdates,
+    state_change: gatel_state::registry::StateUpdate,
+    pub secrets: Arc<gatel_plan::SecretDependencies>,
+    blocking_change: Option<gatel_plan::blocking::PreparedChange>,
+    pub plugin_tasks: crate::plugin_tasks::PluginTasks,
     pub listeners: BTreeMap<SocketAddr, Arc<ListenerRuntime>>,
     pub upstreams: Arc<UpstreamRuntimes>,
     /// The sites that want automatic certificates, and who gets them. Empty
@@ -94,12 +104,70 @@ impl Runtime {
     }
 }
 
+pub struct RuntimePublication<'a> {
+    certificates: gatel_tls::store::CertificatePublication<'a>,
+    state: gatel_state::registry::StatePublication<'a>,
+    blocking: Option<gatel_plan::blocking::Publication<'a>>,
+    upstreams: &'a UpstreamRuntimes,
+}
+
+impl gatel_plan::publication::PublishGuard for RuntimePublication<'_> {
+    fn published(self) {
+        // Keep the registry guard until pool policies have caught up. Another
+        // candidate must not stage/publish newer state and then have an older
+        // publication overwrite its pool policies.
+        self.upstreams.adopt_policies();
+        self.certificates.publish();
+        self.state.publish();
+        if let Some(blocking) = self.blocking {
+            blocking.publish();
+        }
+    }
+}
+
+impl gatel_plan::publication::PublishRuntime for Runtime {
+    type Guard<'a> = RuntimePublication<'a>;
+    fn finish_publication(&self) {
+        self.certificate_change.finish();
+        self.state_change.finish();
+    }
+    fn begin_publication(&self) -> Self::Guard<'_> {
+        RuntimePublication {
+            state: self.state_change.begin(),
+            certificates: self.certificate_change.begin(),
+            blocking: self
+                .blocking_change
+                .as_ref()
+                .map(|change| change.begin_publication()),
+            upstreams: &self.upstreams,
+        }
+    }
+}
+
 /// Build a runtime for a candidate plan.
 pub fn prepare(
     preparation: &Preparation<'_, Arc<Runtime>>,
     resources: &Resources<'_>,
 ) -> Result<Arc<Runtime>, String> {
+    let state_owner = resources.state.clone();
+    let staged_state = resources.state.stage();
+    let staged_resources = Resources {
+        state: &staged_state,
+        ..resources.clone()
+    };
+    let resources = &staged_resources;
     let plan: &Arc<Plan> = preparation.plan;
+    let mut certificate_change =
+        gatel_tls::store::CertificateUpdates::new(Arc::clone(resources.certificates));
+    let blocking_change = match resources.blocking_budget {
+        Some(budget) => {
+            Some(budget.prepare(resources.blocking, plan.spec.global.blocking.unwrap_or_default())?)
+        }
+        None if plan.spec.global.blocking.is_some() => {
+            return Err("host does not provide a configurable blocking budget".into());
+        }
+        None => None,
+    };
 
     // Bind first: a port conflict is the most common reason a reload cannot
     // proceed, and finding it before building handlers keeps the failure cheap.
@@ -110,12 +178,13 @@ pub fn prepare(
         .collect();
     resources.binds.ensure(&wanted)?;
 
-    let (upstreams, resolutions) = UpstreamRuntimes::resolve(plan, resources.state, resources.root)?;
+    let (upstreams, resolutions) = UpstreamRuntimes::prepare(plan, resources.state, resources.root)?;
     let upstreams = Arc::new(upstreams);
     // The same handle every directive that has to ask a backend something is
     // built with. It is a generation's worth of backends, so a directive holds
     // the set its own generation had rather than whatever is current later.
     let reachable: gatel_plan::SharedUpstreams = Arc::clone(&upstreams) as _;
+    let plugins = crate::plugin_prepare::PreparedPlugins::prepare(plan, resources, &reachable)?;
     for (id, resolution) in &resolutions {
         if !resolution.all_reused() {
             tracing::debug!(
@@ -142,6 +211,7 @@ pub fn prepare(
             listener_plan,
             plan.spec.global.acme.as_ref(),
             &TlsPreparation {
+                updates: Some(&certificate_change),
                 store: resources.certificates,
                 internal: &internal,
                 acme: resources.acme,
@@ -155,28 +225,17 @@ pub fn prepare(
             for route in &site.routes {
                 let mut chain = Vec::with_capacity(route.chain.len() + 1);
                 for directive in &route.chain {
-                    let state = resolve_state(directive, resources.state);
-                    let cx = gatel_plan::BuildContext {
-                        root: resources.root,
-                        state,
-                        telemetry: resources.telemetry,
-                        upstreams: &reachable,
-                    };
-                    chain.push(directive.config.build(cx).map_err(|error| {
-                        format!(
-                            "`{}` in route `{}`: {error}",
-                            directive.meta.name,
-                            route.id.name()
-                        )
-                    })?);
+                    chain.push(plugins.handler(directive)?);
                 }
                 chain.push(build_terminal(
                     &route.terminal,
                     &upstreams,
                     resources,
+                    &plugins,
                     route.id.name(),
                 )?);
                 routes.push(PreparedRoute {
+                    execution: crate::execution::identity(route, plan),
                     id: route.id.clone(),
                     path: route.path.clone(),
                     methods: route.methods.clone(),
@@ -190,20 +249,12 @@ pub fn prepare(
             // request that reached this site and matched none of its routes.
             let mut fallback = Vec::with_capacity(site.fallback.len() + 1);
             for directive in &site.fallback {
-                let state = resolve_state(directive, resources.state);
-                let cx = gatel_plan::BuildContext {
-                    root: resources.root,
-                    state,
-                    telemetry: resources.telemetry,
-                    upstreams: &reachable,
-                };
-                fallback.push(directive.config.build(cx).map_err(|error| {
-                    format!("`{}` on site `{}`: {error}", directive.meta.name, site.id.name())
-                })?);
+                fallback.push(plugins.handler(directive)?);
             }
             fallback.push(Arc::new(crate::dispatch::NotFound));
 
             sites.push(PreparedSite {
+                fallback_execution: gatel_plan::ExecutionIdentity(plan.plan_hash()),
                 id: site.id.clone(),
                 host: site.host.clone(),
                 routes,
@@ -233,7 +284,19 @@ pub fn prepare(
         );
     }
 
+    staged_state.retain(&plan.bindings);
+    certificate_change.retain_sites(
+        plan.listeners
+            .iter()
+            .filter(|listener| listener.listener.protocol.is_tls())
+            .flat_map(|listener| listener.sites.iter().map(|site| site.id.clone())),
+    );
     Ok(Arc::new(Runtime {
+        certificate_change,
+        state_change: state_owner.update_from(&staged_state),
+        blocking_change,
+        secrets: Arc::clone(&plugins.secrets),
+        plugin_tasks: plugins.tasks(resources)?,
         listeners,
         upstreams,
         acme: acme_wanted(plan, resources)?,
@@ -266,7 +329,7 @@ fn terminal_name(terminal: &Terminal) -> &'static str {
 ///
 /// Reusing is the normal case: a reload that did not change a rate limit must
 /// not hand every client a fresh bucket.
-fn resolve_state(
+pub(crate) fn resolve_state(
     directive: &gatel_plan::DirectiveInstance,
     state: &StateRegistry,
 ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
@@ -280,6 +343,7 @@ fn build_terminal(
     terminal: &Terminal,
     upstreams: &Arc<UpstreamRuntimes>,
     resources: &Resources<'_>,
+    plugins: &crate::plugin_prepare::PreparedPlugins,
     route: &str,
 ) -> Result<Arc<dyn salvo_core::Handler>, String> {
     match terminal {
@@ -292,20 +356,7 @@ fn build_terminal(
                 resources.telemetry.metrics.upstream(upstream.name()),
             )))
         }
-        Terminal::Directive(instance) => {
-            let state = resolve_state(instance, resources.state);
-            let reachable: gatel_plan::SharedUpstreams = Arc::clone(upstreams) as _;
-            let cx = gatel_plan::BuildContext {
-                root: resources.root,
-                state,
-                telemetry: resources.telemetry,
-                upstreams: &reachable,
-            };
-            instance
-                .config
-                .build(cx)
-                .map_err(|error| format!("`{}` in route `{route}`: {error}", instance.meta.name))
-        }
+        Terminal::Directive(instance) => plugins.handler(instance),
     }
 }
 

@@ -5,6 +5,7 @@
 //! it cannot reach a log or a diagnostic by accident.
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::hash::Hasher;
@@ -96,8 +97,14 @@ impl fmt::Display for SecretRef {
 pub fn resolve_secret(reference: &SecretRef, root: &Path) -> Result<SecretString, String> {
     match reference {
         SecretRef::Env(name) => std::env::var(name)
-            .map(SecretString::new)
-            .map_err(|_| format!("the environment variable `{name}` is not set")),
+            .map_err(|_| format!("the environment variable `{name}` is not set"))
+            .and_then(|value| {
+                if value.len() as u64 > MAX_SECRET_BYTES {
+                    Err(format!("`{reference}` is larger than {MAX_SECRET_BYTES} bytes"))
+                } else {
+                    Ok(SecretString::new(value))
+                }
+            }),
         SecretRef::File(_) => {
             let path = reference.resolve_path(root)?;
             let metadata =
@@ -105,12 +112,21 @@ pub fn resolve_secret(reference: &SecretRef, root: &Path) -> Result<SecretString
             if !metadata.is_file() {
                 return Err(format!("`{reference}` is not a regular file"));
             }
+            // Validate the handle whose bytes will be read, not a prior path
+            // lookup that could now name a different inode.
+            let file =
+                std::fs::File::open(&path).map_err(|error| format!("cannot read `{reference}`: {error}"))?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("cannot inspect `{reference}`: {error}"))?;
+            if !metadata.is_file() {
+                return Err(format!("`{reference}` is not a regular file"));
+            }
             if metadata.len() > MAX_SECRET_BYTES {
                 return Err(format!("`{reference}` is larger than {MAX_SECRET_BYTES} bytes"));
             }
             check_permissions(reference, &metadata)?;
-            let contents = std::fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read `{reference}`: {error}"))?;
+            let contents = read_bounded(file, reference)?;
             // A trailing newline is what an editor adds, not part of the secret.
             Ok(SecretString::new(contents.trim_end_matches(['\r', '\n'])))
         }
@@ -119,6 +135,18 @@ pub fn resolve_secret(reference: &SecretRef, root: &Path) -> Result<SecretString
 
 /// A secret is a password, a token or a key. Anything much larger is a mistake.
 const MAX_SECRET_BYTES: u64 = 64 * 1024;
+
+fn read_bounded(reader: impl Read, reference: &SecretRef) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_SECRET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read `{reference}`: {error}"))?;
+    if bytes.len() as u64 > MAX_SECRET_BYTES {
+        return Err(format!("`{reference}` is larger than {MAX_SECRET_BYTES} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("`{reference}` is not valid UTF-8"))
+}
 
 #[cfg(unix)]
 fn check_permissions(reference: &SecretRef, metadata: &std::fs::Metadata) -> Result<(), String> {
@@ -285,5 +313,39 @@ mod tests {
         assert_ne!(a.observation("tls"), b.observation("tls"));
         assert_ne!(a.observation("tls"), a.observation("admin"));
         assert_eq!(a.observation("tls"), a.observation("tls"));
+    }
+
+    #[test]
+    fn an_unbounded_or_growing_reader_is_stopped_at_the_secret_limit() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Infinite(Rc<Cell<usize>>);
+        impl Read for Infinite {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'x');
+                self.0.set(self.0.get() + buffer.len());
+                Ok(buffer.len())
+            }
+        }
+        let read = Rc::new(Cell::new(0));
+        let reference = SecretRef::parse("token").unwrap();
+        let error = read_bounded(Infinite(Rc::clone(&read)), &reference).unwrap_err();
+        assert!(error.contains("larger than"));
+        assert_eq!(read.get() as u64, MAX_SECRET_BYTES + 1);
+    }
+
+    #[test]
+    fn bounded_secret_reads_accept_the_exact_limit_and_redact_invalid_utf8() {
+        let reference = SecretRef::parse("token").unwrap();
+        let bytes = vec![b'x'; MAX_SECRET_BYTES as usize];
+        assert_eq!(
+            read_bounded(bytes.as_slice(), &reference).unwrap().len(),
+            bytes.len()
+        );
+        let mut invalid = b"SECRET-SENTINEL".to_vec();
+        invalid.push(0xff);
+        let error = read_bounded(invalid.as_slice(), &reference).unwrap_err();
+        assert!(error.contains("not valid UTF-8"));
+        assert!(!error.contains("SECRET-SENTINEL"));
     }
 }

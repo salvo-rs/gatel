@@ -156,6 +156,8 @@ mod tests {
             .decode(&node, &mut diagnostics)
             .expect("the configuration is valid")
             .build(BuildContext {
+                secrets: Default::default(),
+                blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),

@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,6 +37,8 @@ struct State {
     counter: AtomicU64,
     /// Every challenge this authority fetched, and what it got.
     pub fetched: Mutex<Vec<(String, String)>>,
+    registration_keys: Mutex<Vec<serde_json::Value>>,
+    drop_registration: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -73,6 +75,8 @@ impl Authority {
             orders: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             fetched: Mutex::new(Vec::new()),
+            registration_keys: Mutex::new(Vec::new()),
+            drop_registration: AtomicBool::new(false),
         });
 
         let serving = Arc::clone(&state);
@@ -97,6 +101,14 @@ impl Authority {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    pub fn lose_registration_responses(&self) {
+        self.state.drop_registration.store(true, Ordering::SeqCst);
+    }
+
+    pub fn registration_keys(&self) -> Vec<serde_json::Value> {
+        self.state.registration_keys.lock().unwrap().clone()
+    }
 }
 
 async fn serve(mut stream: TcpStream, state: Arc<State>) {
@@ -104,6 +116,19 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) {
         let Some((method, path, body)) = read_request(&mut stream).await else {
             return;
         };
+        if path == "/new-account" {
+            let outer: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let protected: serde_json::Value =
+                serde_json::from_slice(&base64url(outer["protected"].as_str().unwrap())).unwrap();
+            state
+                .registration_keys
+                .lock()
+                .unwrap()
+                .push(protected["jwk"].clone());
+            if state.drop_registration.load(Ordering::SeqCst) {
+                return; // The request arrived; the client receives no response.
+            }
+        }
         let response = route(&method, &path, &body, &state).await;
         if stream.write_all(response.as_bytes()).await.is_err() {
             return;

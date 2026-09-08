@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use crate::census::{self, Census};
 use crate::endpoint::{EndpointSet, probe_delay};
-use crate::probe::probe;
+use crate::probe::probe_with_tls;
 use crate::resolve;
 use crate::upstream::{UpstreamRuntime, UpstreamRuntimes};
 
@@ -29,8 +29,17 @@ struct Worker {
     handle: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        self.handle.abort();
+    }
+}
+
 /// Owns every background task, and keeps them in step with the current plan.
 pub struct Supervisor {
+    /// Serializes complete reconciliations and terminal shutdown, not traffic.
+    closed: tokio::sync::Mutex<bool>,
     workers: tokio::sync::Mutex<BTreeMap<ResourceId, Worker>>,
     /// Kept apart from the probe workers because the two are wanted
     /// independently: an upstream may be probed and not resolved, resolved and
@@ -51,6 +60,7 @@ impl std::fmt::Debug for Supervisor {
 impl Supervisor {
     pub fn new(telemetry: Arc<Telemetry>) -> Self {
         Self {
+            closed: tokio::sync::Mutex::new(false),
             workers: tokio::sync::Mutex::new(BTreeMap::new()),
             resolvers: tokio::sync::Mutex::new(BTreeMap::new()),
             census: Census::new(),
@@ -62,6 +72,10 @@ impl Supervisor {
     ///
     /// Called after a commit, never before.
     pub async fn reconcile(&self, runtimes: &Arc<UpstreamRuntimes>) {
+        let closed = self.closed.lock().await;
+        if *closed {
+            return;
+        }
         self.census.follow(runtimes, &self.telemetry).await;
         self.reconcile_resolvers(runtimes).await;
         let mut workers = self.workers.lock().await;
@@ -76,7 +90,9 @@ impl Supervisor {
             match workers.get(*id) {
                 // Same probe over the same endpoints: leave it running, so the
                 // consecutive-result counters survive the reload.
-                Some(existing) if existing.identity == *identity => continue,
+                Some(existing) if existing.identity == *identity && !existing.handle.is_finished() => {
+                    continue;
+                }
                 Some(_) => {
                     if let Some(previous) = workers.remove(*id) {
                         stop(previous).await;
@@ -85,10 +101,14 @@ impl Supervisor {
                 None => {}
             }
             let (sender, receiver) = watch::channel(false);
-            let handle = tokio::spawn(probe_loop(
-                Arc::clone(runtime),
-                Arc::clone(&self.telemetry),
+            let runtime = Arc::clone(runtime);
+            let telemetry = Arc::clone(&self.telemetry);
+            let handle = tokio::spawn(crate::worker::supervise(
+                gatel_observe::workers::WorkerKind::Probe,
+                id.name().to_string(),
+                Arc::clone(&telemetry),
                 receiver,
+                move |receiver| probe_loop(Arc::clone(&runtime), Arc::clone(&telemetry), receiver),
             ));
             workers.insert(
                 (*id).clone(),
@@ -140,7 +160,9 @@ impl Supervisor {
             match resolvers.get(*id) {
                 // The same names, looked up the same way: leave it running, so
                 // a reload does not cost a round of lookups.
-                Some(existing) if existing.identity == *identity => continue,
+                Some(existing) if existing.identity == *identity && !existing.handle.is_finished() => {
+                    continue;
+                }
                 Some(_) => {
                     if let Some(previous) = resolvers.remove(*id) {
                         stop(previous).await;
@@ -149,7 +171,14 @@ impl Supervisor {
                 None => {}
             }
             let (sender, receiver) = watch::channel(false);
-            let handle = tokio::spawn(resolve::resolve_loop(Arc::clone(runtime), receiver));
+            let runtime = Arc::clone(runtime);
+            let handle = tokio::spawn(crate::worker::supervise(
+                gatel_observe::workers::WorkerKind::Resolver,
+                id.name().to_string(),
+                Arc::clone(&self.telemetry),
+                receiver,
+                move |receiver| resolve::resolve_loop(Arc::clone(&runtime), receiver),
+            ));
             resolvers.insert(
                 (*id).clone(),
                 Worker {
@@ -185,6 +214,8 @@ impl Supervisor {
     /// Stop every worker and wait for it, so a process exit leaves nothing
     /// half-done.
     pub async fn shutdown(&self) {
+        let mut closed = self.closed.lock().await;
+        *closed = true;
         self.census.shutdown().await;
         for map in [&self.workers, &self.resolvers] {
             let mut workers = map.lock().await;
@@ -195,19 +226,37 @@ impl Supervisor {
     }
 
     pub async fn running(&self) -> Vec<ResourceId> {
-        self.workers.lock().await.keys().cloned().collect()
+        self.workers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, worker)| !worker.handle.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     pub async fn resolving(&self) -> Vec<ResourceId> {
-        self.resolvers.lock().await.keys().cloned().collect()
+        self.resolvers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, worker)| !worker.handle.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 }
 
-async fn stop(worker: Worker) {
+async fn stop(mut worker: Worker) {
     let _ = worker.stop.send(true);
     // A probe wakes on the stop signal, so joining is bounded by one poll of
     // its select rather than by the probe interval.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), worker.handle).await;
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut worker.handle)
+        .await
+        .is_err()
+    {
+        worker.handle.abort();
+        let _ = (&mut worker.handle).await;
+    }
 }
 
 /// What makes a probe worker the same worker across a reload: the check itself
@@ -221,6 +270,15 @@ fn worker_identity(runtime: &UpstreamRuntime) -> Fingerprint {
         }
     }
     hasher.update_u64(runtime.spec.protocol as u64);
+    if let Some(tls) = runtime.pool.tls() {
+        hasher.update_fingerprint(&tls.identity());
+    }
+    match &runtime.spec.tls {
+        Some(tls) => tls.hash_into(&mut hasher),
+        None => {
+            hasher.update_none();
+        }
+    }
     hasher.update_unordered(&runtime.spec.endpoints, |endpoint, hasher| {
         hasher.update_str(&endpoint.id);
         endpoint.target.hash_into(hasher);
@@ -252,18 +310,25 @@ async fn probe_loop(
             let unix = endpoint.target.unix_path().map(std::path::Path::to_path_buf);
             let id = endpoint.id.clone();
             let timeout = policy.timeout;
+            let tls = runtime.pool.tls();
             checks.push(async move {
                 let result = match unix {
                     // A socket path has no addresses, so the address loop would
                     // have called it unhealthy for ever.
-                    Some(path) => crate::probe::probe_unix(&path, &kind, protocol, timeout).await,
-                    None => probe_any(&addresses, &kind, protocol, timeout).await,
+                    Some(path) => {
+                        crate::probe::probe_unix_with_tls(&path, &kind, protocol, timeout, tls).await
+                    }
+                    None => probe_any(&addresses, &kind, protocol, timeout, tls).await,
                 };
                 (id, result)
             });
         }
 
-        let results = join_all(checks).await;
+        let results = tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            results = join_all(checks) => results,
+        };
         for (id, result) in &results {
             report(&runtime.endpoints, &upstream, id, result);
         }
@@ -292,13 +357,19 @@ async fn probe_any(
     kind: &gatel_plan::HealthKind,
     protocol: gatel_plan::UpstreamProtocol,
     timeout: std::time::Duration,
+    tls: Option<&gatel_tls::ClientTls>,
 ) -> Result<(), String> {
     if addresses.is_empty() {
         return Err("the name has not resolved to an address".to_string());
     }
+    let started = tokio::time::Instant::now();
     let mut failures = Vec::new();
     for address in addresses {
-        match probe(*address, kind, protocol, timeout).await {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(format!("endpoint probe budget exhausted after {timeout:?}"));
+        }
+        match probe_with_tls(*address, kind, protocol, remaining, tls).await {
             Ok(()) => return Ok(()),
             Err(error) => failures.push(format!("{address}: {error}")),
         }
@@ -327,18 +398,41 @@ fn report(endpoints: &EndpointSet, upstream: &str, id: &str, result: &Result<(),
 /// short dependency list; the set is small and known.
 pub(crate) async fn join_all<F, T>(futures: Vec<F>) -> Vec<T>
 where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
 {
-    let handles: Vec<_> = futures.into_iter().map(tokio::spawn).collect();
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        if let Ok(value) = handle.await {
-            results.push(value);
+    // Poll as children of this future, not detached spawned tasks. Cancelling
+    // a probe/resolve round synchronously drops every unfinished operation.
+    let mut pending: Vec<_> = futures.into_iter().map(|future| Some(Box::pin(future))).collect();
+    let mut results: Vec<Option<T>> = std::iter::repeat_with(|| None).take(pending.len()).collect();
+    let mut remaining = pending.len();
+    std::future::poll_fn(move |cx| {
+        for (index, slot) in pending.iter_mut().enumerate() {
+            if let Some(future) = slot
+                && let std::task::Poll::Ready(value) = future.as_mut().poll(cx)
+            {
+                results[index] = Some(value);
+                *slot = None;
+                remaining -= 1;
+            }
         }
-    }
-    results
+        if remaining == 0 {
+            std::task::Poll::Ready(
+                results
+                    .iter_mut()
+                    .map(|value| value.take().expect("completed child"))
+                    .collect(),
+            )
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
+
+#[cfg(test)]
+#[path = "supervisor_cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -385,7 +479,7 @@ mod tests {
         }
     }
 
-    fn plan(text: &str) -> Plan {
+    pub(super) fn plan(text: &str) -> Plan {
         let registry = Registry::builder()
             .bundle(Bundle::new("std", "1").with(Respond(DirectiveMeta::terminal("respond"))))
             .build()
@@ -439,7 +533,7 @@ mod tests {
         }
     }
 
-    fn config(address: std::net::SocketAddr, check: &str) -> String {
+    pub(super) fn config(address: std::net::SocketAddr, check: &str) -> String {
         format!(
             r#"
 global {{ http "127.0.0.1:1" }}

@@ -55,7 +55,22 @@ enum OriginKind {
     Synthetic { reason: Arc<str> },
 }
 
+/// Lossless borrowed location view, independent of human-readable formatting.
+pub enum OriginLocation<'a> {
+    File { file: &'a str, span: Span },
+    Api { source: &'a str, pointer: &'a str },
+    Synthetic { reason: &'a str },
+}
+
 impl Origin {
+    pub fn location(&self) -> OriginLocation<'_> {
+        match &self.kind {
+            OriginKind::File { file, span } => OriginLocation::File { file, span: *span },
+            OriginKind::Api { source, pointer } => OriginLocation::Api { source, pointer },
+            OriginKind::Synthetic { reason } => OriginLocation::Synthetic { reason },
+        }
+    }
+
     pub fn file(file: impl Into<Arc<str>>, span: Span) -> Self {
         Self {
             kind: OriginKind::File {

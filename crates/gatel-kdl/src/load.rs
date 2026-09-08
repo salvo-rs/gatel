@@ -281,15 +281,32 @@ impl LoadContext {
     }
 }
 
-fn read_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
-    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
+    use std::io::Read;
+    // Reject ordinary FIFO/device paths before open, which can itself block.
+    // The opened handle is checked again; this is not a hostile-path sandbox.
+    if !std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("not a regular file".to_string());
+    }
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() {
         return Err("not a regular file".to_string());
     }
     if metadata.len() > max_bytes {
         return Err(format!("file is larger than {max_bytes} bytes"));
     }
-    std::fs::read_to_string(path).map_err(|error| error.to_string())
+    let mut text = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(|error| error.to_string())?;
+    if text.len() as u64 > max_bytes {
+        return Err(format!("file is larger than {max_bytes} bytes"));
+    }
+    Ok(text)
 }
 
 /// Resolve an import pattern. `*` and `?` are supported in the final component

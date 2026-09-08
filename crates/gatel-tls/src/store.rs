@@ -9,7 +9,7 @@
 //! handshake and leaves established connections alone.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use gatel_model::ResourceId;
 use gatel_plan::HostMatch;
@@ -18,10 +18,36 @@ use rustls::sign::CertifiedKey;
 
 use crate::certificate::Certificate;
 
+#[path = "publication.rs"]
+mod publication;
+pub use publication::{CertificatePublication, CertificateUpdates};
+
 /// Certificates, keyed by the site that owns them.
 #[derive(Default)]
 pub struct CertificateStore {
+    pub(crate) orders: crate::acme::order::Orders,
+    managed: std::sync::atomic::AtomicBool,
     entries: RwLock<BTreeMap<ResourceId, Certificate>>,
+    owners: Mutex<BTreeMap<ResourceId, Ownership>>,
+}
+
+struct Ownership {
+    identity: gatel_model::Fingerprint,
+    token: Arc<()>,
+}
+
+/// Authority for one asynchronous issuance, invalidated by a source change.
+pub(crate) struct Issuance {
+    site: ResourceId,
+    token: Option<Arc<()>>,
+}
+
+pub(crate) fn acme_owner(config: &gatel_plan::Acme, host: &str) -> gatel_model::Fingerprint {
+    let mut hash = gatel_model::Hasher::new();
+    hash.update_str("certificate-acme-owner-v1");
+    config.hash_into(&mut hash);
+    hash.update_str(host);
+    hash.finish()
 }
 
 impl std::fmt::Debug for CertificateStore {
@@ -34,6 +60,39 @@ impl std::fmt::Debug for CertificateStore {
 }
 
 impl CertificateStore {
+    pub(crate) fn issuance(&self, site: &ResourceId, identity: gatel_model::Fingerprint) -> Option<Issuance> {
+        let owners = self.owners.lock().unwrap_or_else(|p| p.into_inner());
+        match owners.get(site) {
+            Some(owner) if owner.identity != identity => None,
+            None if self.managed.load(std::sync::atomic::Ordering::Relaxed) => None,
+            owner => Some(Issuance {
+                site: site.clone(),
+                token: owner.map(|owner| owner.token.clone()),
+            }),
+        }
+    }
+
+    pub(crate) fn issuance_is_current(&self, issuance: &Issuance) -> bool {
+        let owners = self.owners.lock().unwrap_or_else(|p| p.into_inner());
+        self.issuance_matches(issuance, &owners)
+    }
+
+    fn issuance_matches(&self, issuance: &Issuance, owners: &BTreeMap<ResourceId, Ownership>) -> bool {
+        match (owners.get(&issuance.site), &issuance.token) {
+            (Some(owner), Some(token)) => Arc::ptr_eq(&owner.token, token),
+            (None, None) => !self.managed.load(std::sync::atomic::Ordering::Relaxed),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn put_issued(&self, issuance: &Issuance, certificate: Certificate) -> bool {
+        let owners = self.owners.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.issuance_matches(issuance, &owners) {
+            return false;
+        }
+        self.put(issuance.site.clone(), certificate);
+        true
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -61,6 +120,8 @@ impl CertificateStore {
 
     /// Forget the certificates of sites that no longer exist.
     pub fn retain(&self, sites: &[ResourceId]) -> Vec<ResourceId> {
+        let mut owners = self.owners.lock().unwrap_or_else(|p| p.into_inner());
+        owners.retain(|site, _| sites.contains(site));
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let removed: Vec<ResourceId> = entries
             .keys()

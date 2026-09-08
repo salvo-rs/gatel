@@ -11,7 +11,20 @@
 //! reported; only one takes the instance out of the load balancer.
 
 use std::collections::BTreeSet;
-use std::sync::RwLock;
+use std::sync::{Arc, OnceLock, RwLock};
+
+/// Authoritative configuration failure at the instant a report is sampled.
+#[derive(Debug, Clone)]
+pub struct ReloadFailure {
+    pub attempts: u32,
+    pub summary: String,
+}
+
+/// Host adapter, called without the Health lock. Implementations must be cheap,
+/// perform no I/O, and never recursively call Health::report.
+pub trait ReloadStatus: std::fmt::Debug + Send + Sync {
+    fn failure(&self) -> Option<ReloadFailure>;
+}
 
 /// Something worth telling an operator about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,6 +37,8 @@ pub enum Reason {
     /// Shutting down. In-flight requests are being finished; new ones belong
     /// somewhere else.
     Draining,
+    /// Local checkpoint completion is unknown; inspect/restart before more writes.
+    PersistenceUnknown,
     /// Serving the last configuration that worked while newer ones are refused.
     ReloadFailing { attempts: u32, summary: String },
     /// Every endpoint of this upstream is out.
@@ -33,12 +48,24 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Fixed, low-cardinality reason labels. Never use diagnostic text or
+    /// individual resource identities as labels for aggregate health metrics.
+    pub const CODES: [&'static str; 7] = [
+        "starting",
+        "no_listeners",
+        "draining",
+        "persistence_unknown",
+        "reload_failing",
+        "upstream_down",
+        "certificate_pending",
+    ];
+
     /// Whether this instance should be taken out of rotation.
     ///
     /// False for anything every replica would report at the same moment.
     pub fn blocks(&self) -> bool {
         match self {
-            Reason::Starting | Reason::NoListeners | Reason::Draining => true,
+            Reason::Starting | Reason::NoListeners | Reason::Draining | Reason::PersistenceUnknown => true,
             Reason::ReloadFailing { .. }
             | Reason::UpstreamDown { .. }
             | Reason::CertificatePending { .. } => false,
@@ -50,6 +77,9 @@ impl Reason {
             Reason::Starting => "no configuration has been accepted yet".to_string(),
             Reason::NoListeners => "no listener is bound".to_string(),
             Reason::Draining => "draining".to_string(),
+            Reason::PersistenceUnknown => {
+                "configuration persistence outcome unknown; inspect before retrying".to_string()
+            }
             Reason::ReloadFailing { attempts, summary } => {
                 format!("serving the last good configuration after {attempts} failed reload(s): {summary}")
             }
@@ -68,6 +98,7 @@ impl Reason {
             Reason::Starting => "starting",
             Reason::NoListeners => "no_listeners",
             Reason::Draining => "draining",
+            Reason::PersistenceUnknown => "persistence_unknown",
             Reason::ReloadFailing { .. } => "reload_failing",
             Reason::UpstreamDown { .. } => "upstream_down",
             Reason::CertificatePending { .. } => "certificate_pending",
@@ -134,6 +165,7 @@ impl Report {
 #[derive(Debug, Default)]
 pub struct Health {
     inner: RwLock<Inner>,
+    reload_status: OnceLock<Arc<dyn ReloadStatus>>,
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +173,7 @@ struct Inner {
     serving: bool,
     listeners: usize,
     draining: bool,
+    persistence_unknown: bool,
     failures: u32,
     last_failure: Option<String>,
     down: BTreeSet<String>,
@@ -148,6 +181,18 @@ struct Inner {
 }
 
 impl Health {
+    /// Local durability failure is latched for this host lifetime. A subsequent
+    /// in-memory commit cannot establish that disk and memory are reconciled.
+    /// Do not fail liveness: automatic restart is not a reconciliation protocol.
+    pub fn persistence_unknown(&self) {
+        self.write().persistence_unknown = true;
+    }
+
+    /// Install once during host construction. When installed, its None means
+    /// healthy configuration, not fallback to potentially late push notifications.
+    pub fn set_reload_status(&self, source: Arc<dyn ReloadStatus>) -> bool {
+        self.reload_status.set(source).is_ok()
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -167,7 +212,7 @@ impl Health {
     /// broken for an hour.
     pub fn reload_failed(&self, summary: impl Into<String>) {
         let mut inner = self.write();
-        inner.failures += 1;
+        inner.failures = inner.failures.saturating_add(1);
         inner.last_failure = Some(summary.into());
     }
 
@@ -218,8 +263,12 @@ impl Health {
     }
 
     pub fn report(&self) -> Report {
+        let configuration = self.reload_status.get().map(|source| source.failure());
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let mut reasons = Vec::new();
+        if inner.persistence_unknown {
+            reasons.push(Reason::PersistenceUnknown);
+        }
         if inner.draining {
             reasons.push(Reason::Draining);
         } else if !inner.serving {
@@ -227,10 +276,16 @@ impl Health {
         } else if inner.listeners == 0 {
             reasons.push(Reason::NoListeners);
         }
-        if inner.failures > 0 {
-            reasons.push(Reason::ReloadFailing {
+        let failure = configuration.unwrap_or_else(|| {
+            (inner.failures > 0).then(|| ReloadFailure {
                 attempts: inner.failures,
                 summary: inner.last_failure.clone().unwrap_or_default(),
+            })
+        });
+        if let Some(failure) = failure {
+            reasons.push(Reason::ReloadFailing {
+                attempts: failure.attempts,
+                summary: failure.summary,
             });
         }
         for upstream in &inner.down {
@@ -260,6 +315,61 @@ impl Health {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistence_failure_blocks_readiness_but_not_liveness_and_survives_commit() {
+        let health = Health::new();
+        health.committed(1);
+        assert_eq!(health.report().state, State::Ready);
+        health.persistence_unknown();
+        health.persistence_unknown();
+        health.committed(1);
+        let report = health.report();
+        assert_eq!(report.state, State::NotReady);
+        assert_eq!(report.reasons, vec![Reason::PersistenceUnknown]);
+        assert_eq!(report.reasons[0].code(), "persistence_unknown");
+        assert!(
+            report
+                .render()
+                .contains("blocking: configuration persistence outcome unknown")
+        );
+        assert!(health.alive());
+    }
+
+    #[test]
+    fn authoritative_reload_status_ignores_late_pushes_and_preserves_other_health() {
+        #[derive(Debug)]
+        struct Source(RwLock<Option<ReloadFailure>>);
+        impl ReloadStatus for Source {
+            fn failure(&self) -> Option<ReloadFailure> {
+                self.0.read().unwrap().clone()
+            }
+        }
+        let health = Health::new();
+        let source = Arc::new(Source(RwLock::new(Some(ReloadFailure {
+            attempts: 7,
+            summary: "current failure".into(),
+        }))));
+        assert!(health.set_reload_status(source.clone()));
+        assert!(!health.set_reload_status(source.clone()));
+        health.committed(1); // Late activation must not erase authoritative failure.
+        assert!(health.report().reasons.contains(&Reason::ReloadFailing {
+            attempts: 7,
+            summary: "current failure".into()
+        }));
+        *source.0.write().unwrap() = None;
+        health.reload_failed("obsolete notification");
+        assert_eq!(health.report().state, State::Ready);
+        health.certificate("pending", false);
+        assert_eq!(
+            health.report().reasons,
+            vec![Reason::CertificatePending {
+                site: "pending".into()
+            }]
+        );
+        health.draining();
+        assert_eq!(health.report().state, State::NotReady);
+    }
 
     #[test]
     fn nothing_is_ready_before_a_configuration_is_accepted() {
@@ -411,6 +521,7 @@ mod tests {
             Reason::Starting,
             Reason::NoListeners,
             Reason::Draining,
+            Reason::PersistenceUnknown,
             Reason::ReloadFailing {
                 attempts: 1,
                 summary: String::new(),
@@ -422,5 +533,6 @@ mod tests {
         ];
         let codes: BTreeSet<_> = reasons.iter().map(|reason| reason.code()).collect();
         assert_eq!(codes.len(), reasons.len());
+        assert_eq!(codes, Reason::CODES.into_iter().collect());
     }
 }

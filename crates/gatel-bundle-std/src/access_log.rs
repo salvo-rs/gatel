@@ -476,6 +476,8 @@ mod tests {
         let error = config
             .unwrap()
             .build(BuildContext {
+                secrets: Default::default(),
+                blocking: gatel_plan::blocking::Executor::process_default(),
                 root: &directory,
                 state: None,
                 telemetry: crate::testing::telemetry(),

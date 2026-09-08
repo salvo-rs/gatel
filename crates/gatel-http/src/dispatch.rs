@@ -18,6 +18,7 @@ use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 /// One route, with its chain already built into handlers.
 pub struct PreparedRoute {
     pub id: ResourceId,
+    pub execution: gatel_plan::ExecutionIdentity,
     pub path: PathMatch,
     pub methods: MethodMatch,
     pub matchers: Vec<Matcher>,
@@ -50,6 +51,7 @@ impl PreparedRoute {
 }
 
 pub struct PreparedSite {
+    pub fallback_execution: gatel_plan::ExecutionIdentity,
     pub id: ResourceId,
     pub host: HostMatch,
     pub routes: Vec<PreparedRoute>,
@@ -298,6 +300,7 @@ impl Handler for Dispatcher {
         // Before routing, because the limit belongs to the listener rather than
         // to whichever route happens to claim the request, and because a client
         // that declared too much should be told so without reading a byte.
+        gatel_plan::RequestBodyLimit::install(depot, self.max_body);
         if let crate::body::Declared::TooLarge(declared) = crate::body::limit(request, self.max_body) {
             self.metrics.unmatched_requests.increment();
             response.status_code(StatusCode::PAYLOAD_TOO_LARGE);
@@ -314,6 +317,7 @@ impl Handler for Dispatcher {
         // not a label, so an unmatched request is counted on the listener.
         let (chain, measure) = match self.resolve(request) {
             Ok((site, route)) => {
+                depot.insert(gatel_plan::ExecutionIdentity::DEPOT_KEY, route.execution);
                 depot.insert("gatel.site", site.id.name().to_string());
                 depot.insert("gatel.route", route.id.name().to_string());
                 (
@@ -322,6 +326,7 @@ impl Handler for Dispatcher {
                 )
             }
             Err(NoMatch::Site(site)) => {
+                depot.insert(gatel_plan::ExecutionIdentity::DEPOT_KEY, site.fallback_execution);
                 self.metrics.unmatched_requests.increment();
                 depot.insert("gatel.site", site.id.name().to_string());
                 (site.fallback.clone(), None)
@@ -386,6 +391,7 @@ mod tests {
 
     fn route(id: &str, path: &str, methods: MethodMatch, matchers: Vec<Matcher>) -> PreparedRoute {
         PreparedRoute {
+            execution: gatel_plan::ExecutionIdentity(gatel_model::Hasher::new().finish()),
             id: ResourceId::new(ResourceKind::Route, id),
             path: PathMatch::parse(path).unwrap(),
             methods,
@@ -398,6 +404,7 @@ mod tests {
 
     fn site(host: &str, routes: Vec<PreparedRoute>) -> PreparedSite {
         PreparedSite {
+            fallback_execution: gatel_plan::ExecutionIdentity(gatel_model::Hasher::new().finish()),
             id: ResourceId::new(ResourceKind::Site, host),
             host: HostMatch::parse(host).unwrap(),
             routes,

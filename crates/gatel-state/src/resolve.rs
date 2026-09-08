@@ -80,12 +80,26 @@ pub fn worker_identity(runtime: &UpstreamRuntime) -> Fingerprint {
 ///
 /// Runs a round immediately, so a process that has just started does not serve
 /// its first requests through the slower on-demand path in the pool.
-pub async fn resolve_loop(runtime: Arc<UpstreamRuntime>, mut stop: watch::Receiver<bool>) {
+pub async fn resolve_loop(runtime: Arc<UpstreamRuntime>, stop: watch::Receiver<bool>) {
     let policy = runtime.spec.resolve;
     let upstream = runtime.spec.id.name().to_string();
+    run_loop(policy, stop, || round(&runtime, &upstream, policy)).await;
+}
 
+async fn run_loop<F, R>(policy: Resolve, mut stop: watch::Receiver<bool>, mut round: F)
+where
+    F: FnMut() -> R,
+    R: std::future::Future<Output = Outcome>,
+{
     loop {
-        let outcome = round(&runtime, &upstream, policy).await;
+        if *stop.borrow() {
+            return;
+        }
+        let outcome = tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            outcome = async { round().await } => outcome,
+        };
         // A name that will not resolve is usually a container that has not
         // finished starting, and the interval a person writes is chosen for
         // steady state. Coming back sooner turns a minute of 503s into a
@@ -95,6 +109,7 @@ pub async fn resolve_loop(runtime: Arc<UpstreamRuntime>, mut stop: watch::Receiv
             Outcome::SomethingFailed => RETRY_AFTER.min(policy.interval),
         };
         tokio::select! {
+            biased;
             _ = stop.changed() => return,
             _ = tokio::time::sleep(delay) => {}
         }
@@ -185,6 +200,10 @@ impl Change {
 /// Short, because the usual cause is a container that has not finished
 /// starting, and the interval a person writes is chosen for steady state.
 pub const RETRY_AFTER: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+#[path = "resolve_cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {

@@ -19,16 +19,26 @@ pub mod directive;
 pub mod generation;
 pub mod matcher;
 pub mod normalize;
+pub mod ordering;
 pub mod plan;
+pub mod publication;
 pub mod spec;
 pub mod subrequest;
 pub mod upstream;
 
 pub use directive::{
     BuildContext, Bundle, Directive, DirectiveConfig, DirectiveInstance, DirectiveMeta, DirectiveState,
-    FailurePolicy, Phase, Registry, RegistryBuilder, Role, Scope, Scopes,
+    Effect, FailurePolicy, Phase, Registry, RegistryBuilder, Role, Scope, Scopes,
 };
-pub use generation::{Committed, Failure, GenerationStore, Outcome, Preparation, Status};
+pub use gatel_plugin_runtime::secrets::SecretDependencies;
+pub use gatel_plugin_runtime::{
+    BackgroundTask, BodyTooLarge, ExecutionIdentity, PreparedDirective, RequestBodyLimit, Shutdown,
+    ShutdownSignal, blocking,
+};
+pub use generation::{
+    Committed, ConfigurationCapture, Conflict, Failure, GenerationStore, Outcome, Preparation,
+    RestoreIntentError, SourceWriteError, SourceWriter, Status, Version,
+};
 pub use matcher::{HeaderLookup, HostMatch, MatchContext, Matcher, MethodMatch, PathMatch, parse_cidr};
 pub use normalize::normalize;
 pub use plan::{
@@ -40,7 +50,8 @@ pub use spec::{
     SiteTls, Spec, Terminal,
 };
 pub use subrequest::{
-    Answer, Ask, HeaderMap, Method, NoUpstreams, SharedUpstreams, StatusCode, Upstreams, async_trait,
+    Answer, Ask, HeaderMap, Method, NoUpstreams, ScopedUpstreams, SharedUpstreams, StatusCode,
+    UpstreamHandle, Upstreams, async_trait,
 };
 pub use upstream::{
     Balance, Endpoint, Family, Health, HealthKind, PassiveHealth, Pool, Resolve, Retry, RetryMode, Target,

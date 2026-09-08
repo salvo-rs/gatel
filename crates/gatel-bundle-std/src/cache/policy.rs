@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use salvo_core::http::{Request, Response, StatusCode};
 
+use super::control::Control;
+
 /// Statuses a response may be stored under.
 ///
 /// The heuristically cacheable set from RFC 9110, minus the ones that would be
@@ -67,11 +69,16 @@ impl Refusal {
 }
 
 /// Whether this request may be answered from a cache at all.
+pub fn only_if_cached(request: &Request) -> bool {
+    Control::parse(request.headers()).is_ok_and(|control| control.contains("only-if-cached"))
+}
+
 pub fn request_is_cacheable(request: &Request) -> Result<(), Refusal> {
     if !matches!(*request.method(), http::Method::GET | http::Method::HEAD) {
         return Err(Refusal::Method);
     }
-    if directive(header(request.headers(), http::header::CACHE_CONTROL), "no-store").is_some() {
+    let control = Control::parse(request.headers()).map_err(|_| Refusal::ClientSaidNo)?;
+    if control.contains("no-store") {
         return Err(Refusal::ClientSaidNo);
     }
     Ok(())
@@ -80,10 +87,27 @@ pub fn request_is_cacheable(request: &Request) -> Result<(), Refusal> {
 /// Whether a stored entry may be handed to this request, as opposed to being
 /// kept but not used.
 pub fn may_serve_from_cache(request: &Request) -> bool {
-    let control = header(request.headers(), http::header::CACHE_CONTROL);
+    let Ok(control) = Control::parse(request.headers()) else {
+        return false;
+    };
     // `no-cache` means "check with the origin first". This cache does not
     // revalidate, so honouring it means going to the origin.
-    directive(control, "no-cache").is_none() && directive(control, "max-age=0").is_none()
+    !control.contains("no-cache") && control.seconds("max-age") != Ok(Some(0))
+}
+
+/// Request freshness constraints apply to total age, not just local residence.
+pub fn entry_satisfies_request(request: &Request, entry: &super::store::Entry) -> bool {
+    let Ok(control) = Control::parse(request.headers()) else {
+        return false;
+    };
+    let age = entry.current_age();
+    if let Ok(Some(max)) = control.seconds("max-age")
+        && age > Duration::from_secs(max)
+    {
+        return false;
+    }
+    let min = control.seconds("min-fresh").ok().flatten().unwrap_or(0);
+    age.saturating_add(Duration::from_secs(min)) < entry.ttl
 }
 
 /// How long a response may be reused, or why it may not be stored.
@@ -102,17 +126,17 @@ pub fn freshness(
     }
 
     let headers = response.headers();
-    let control = header(headers, http::header::CACHE_CONTROL);
+    let control = Control::parse(headers).map_err(|_| Refusal::ResponseSaidNo)?;
 
     for refused in ["no-store", "private", "no-cache"] {
-        if directive(control, refused).is_some() {
+        if control.contains(refused) {
             return Err(Refusal::ResponseSaidNo);
         }
     }
     if headers.contains_key(http::header::SET_COOKIE) {
         return Err(Refusal::SetsACookie);
     }
-    if header(headers, http::header::VARY).is_some_and(|vary| vary.split(',').any(|v| v.trim() == "*")) {
+    if crate::vary::names(headers).iter().any(|name| name == "*") {
         return Err(Refusal::VariesOnEverything);
     }
 
@@ -120,14 +144,19 @@ pub fn freshness(
     // RFC 9111 allows a few more directives here; `public` and `s-maxage` are
     // the two that unambiguously mean "a shared cache may keep this".
     if request.headers().contains_key(http::header::AUTHORIZATION)
-        && directive(control, "public").is_none()
-        && seconds(control, "s-maxage").is_none()
+        && !control.contains("public")
+        && control.seconds("s-maxage").ok().flatten().is_none()
     {
         return Err(Refusal::Authorised);
     }
 
     // A shared cache prefers `s-maxage`, then `max-age`, then `Expires`.
-    if let Some(seconds) = seconds(control, "s-maxage").or_else(|| seconds(control, "max-age")) {
+    if let Some(seconds) = control
+        .seconds("s-maxage")
+        .ok()
+        .flatten()
+        .or_else(|| control.seconds("max-age").ok().flatten())
+    {
         return if seconds == 0 {
             Err(Refusal::NoFreshness)
         } else {
@@ -164,43 +193,11 @@ fn expires_in(response: &Response) -> Option<Duration> {
 /// Lower-cased and sorted, so two responses that name the same headers in a
 /// different order produce the same key.
 pub fn vary_on(response: &Response) -> Vec<String> {
-    let Some(vary) = header(response.headers(), http::header::VARY) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = vary
-        .split(',')
-        .map(|name| name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty())
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+    crate::vary::names(response.headers())
 }
 
 fn header(headers: &http::HeaderMap, name: http::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
-}
-
-/// Whether a comma-separated directive list contains `wanted`.
-fn directive(control: Option<&str>, wanted: &str) -> Option<()> {
-    control?
-        .split(',')
-        .any(|entry| entry.trim().eq_ignore_ascii_case(wanted))
-        .then_some(())
-}
-
-/// `name=seconds` out of a directive list.
-fn seconds(control: Option<&str>, name: &str) -> Option<u64> {
-    for entry in control?.split(',') {
-        let entry = entry.trim();
-        let Some((key, value)) = entry.split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case(name) {
-            return value.trim().trim_matches('"').parse().ok();
-        }
-    }
-    None
 }
 
 fn now_seconds() -> u64 {
@@ -210,56 +207,13 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse an HTTP date into seconds since the epoch.
-///
-/// Only the IMF-fixdate form, which is the one a server is required to send.
-/// The two obsolete forms are not parsed: a response using one of them is
-/// treated as having no `Expires`, which costs a cache entry rather than
-/// risking a wrong lifetime.
+/// Bounded HTTP-date parsing, including the obsolete HTTP wire formats.
 fn http_date(text: &str) -> Option<u64> {
-    // `Sun, 06 Nov 1994 08:49:37 GMT`
-    let text = text.trim();
-    let rest = text.get(5..)?;
-    let mut parts = rest.split(' ');
-    let day: u64 = parts.next()?.parse().ok()?;
-    let month = match parts.next()? {
-        "Jan" => 0,
-        "Feb" => 1,
-        "Mar" => 2,
-        "Apr" => 3,
-        "May" => 4,
-        "Jun" => 5,
-        "Jul" => 6,
-        "Aug" => 7,
-        "Sep" => 8,
-        "Oct" => 9,
-        "Nov" => 10,
-        "Dec" => 11,
-        _ => return None,
-    };
-    let year: u64 = parts.next()?.parse().ok()?;
-    let mut clock = parts.next()?.split(':');
-    let hour: u64 = clock.next()?.parse().ok()?;
-    let minute: u64 = clock.next()?.parse().ok()?;
-    let second: u64 = clock.next()?.parse().ok()?;
-
-    if year < 1970 {
-        return None;
-    }
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for (index, length) in LENGTHS.iter().enumerate().take(month) {
-        days += length + u64::from(index == 1 && is_leap(year));
-    }
-    days += day.checked_sub(1)?;
-    Some(((days * 24 + hour) * 60 + minute) * 60 + second)
-}
-
-fn is_leap(year: u64) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    httpdate::parse_http_date(text)
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -505,7 +459,9 @@ mod tests {
         // A leap year, which an off-by-one in the month table would get wrong.
         assert_eq!(http_date("Tue, 29 Feb 2000 00:00:00 GMT"), Some(951782400));
         // The obsolete forms are not parsed, and must not be half-parsed.
-        assert_eq!(http_date("Sunday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(http_date("Sunday, 06-Nov-94 08:49:37 GMT"), Some(784111777));
         assert_eq!(http_date("nonsense"), None);
+        assert_eq!(http_date("Sun, 06 Nov 18446744073709551615 08:49:37 GMT"), None);
+        assert_eq!(http_date("Sun, 32 Nov 1994 08:49:37 GMT"), None);
     }
 }

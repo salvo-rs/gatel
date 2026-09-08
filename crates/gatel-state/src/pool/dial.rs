@@ -38,6 +38,17 @@ impl ConnectionPool {
         endpoint: &Endpoint,
         timeouts: &Timeouts,
     ) -> Result<(Sender, Option<SocketAddr>), CheckoutError> {
+        // One timer owns the entire operation, including HTTP handshakes and
+        // Unix sockets. Per-stage timers below may fail earlier, but can never
+        // grant another connect budget after an earlier stage used it up.
+        connect_with_budget(timeouts.connect, self.dial_inner(endpoint, timeouts)).await
+    }
+
+    async fn dial_inner(
+        &self,
+        endpoint: &Endpoint,
+        timeouts: &Timeouts,
+    ) -> Result<(Sender, Option<SocketAddr>), CheckoutError> {
         // A Unix socket is not reached by address: there is nothing to
         // resolve, nothing to rotate, and nothing that can go stale.
         if let Some(path) = endpoint.target.unix_path() {
@@ -184,5 +195,55 @@ impl ConnectionPool {
                 Ok(Sender::Http2(sender))
             }
         }
+    }
+}
+
+async fn connect_with_budget<T>(
+    budget: Duration,
+    operation: impl std::future::Future<Output = Result<T, CheckoutError>>,
+) -> Result<T, CheckoutError> {
+    tokio::time::timeout(budget, operation)
+        .await
+        .unwrap_or(Err(CheckoutError::ConnectTimeout(budget)))
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn successive_stages_share_one_budget() {
+        let budget = Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let result = connect_with_budget(budget, async {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, Err(CheckoutError::ConnectTimeout(d)) if d == budget));
+        assert_eq!(started.elapsed(), budget);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_http2_handshake_is_cancelled_and_drops_transport() {
+        // H2 must write its preface. A full, unread transport keeps that write
+        // pending, unlike H1's locally constructed sender.
+        let (client, mut server) = tokio::io::duplex(1);
+        let pool = ConnectionPool::new(
+            Default::default(),
+            UpstreamProtocol::Http2,
+            Default::default(),
+            None,
+        );
+        let budget = Duration::from_secs(1);
+        let result = connect_with_budget(budget, pool.handshake(TokioIo::new(client))).await;
+        assert!(matches!(result, Err(CheckoutError::ConnectTimeout(_))));
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        tokio::time::timeout(budget, server.read_to_end(&mut bytes))
+            .await
+            .expect("cancelled handshake must close its transport")
+            .unwrap();
     }
 }

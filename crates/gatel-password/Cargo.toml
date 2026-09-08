@@ -1,0 +1,17 @@
+[package]
+name = "gatel-password"
+description = "Bounded password hash policies shared by Gatel authentication and CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bcrypt = { workspace = true, features = ["zeroize"] }
+zeroize = "1"
+argon2 = { version = "0.6", optional = true, features = ["zeroize"] }
+
+[features]
+default = []
+argon2 = ["dep:argon2"]

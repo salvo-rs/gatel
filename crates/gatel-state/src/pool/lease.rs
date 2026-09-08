@@ -105,13 +105,20 @@ impl Drop for Lease {
         // A connection to an address the name has since stopped resolving to
         // reached a container that is being replaced. Parking it would hand the
         // next request a socket to something on its way out.
-        if let Some(address) = self.address {
-            let live = self.slot.live.lock().unwrap_or_else(|p| p.into_inner());
-            if !live.is_empty() && !live.contains(&address) {
-                return;
-            }
+        // Hold the address snapshot until parking completes, so retire cannot
+        // remove an address between validation and insertion.
+        let live = self.slot.live.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(address) = self.address
+            && live
+                .as_ref()
+                .is_some_and(|addresses| !addresses.contains(&address))
+        {
+            return;
         }
         let mut idle = self.slot.idle.lock().unwrap_or_else(|p| p.into_inner());
+        if self.slot.permits.is_closed() {
+            return;
+        }
         if idle.len() >= self.config.max_idle_per_endpoint as usize {
             // Keeping more idle sockets than configured wastes file
             // descriptors on the backend as much as here.

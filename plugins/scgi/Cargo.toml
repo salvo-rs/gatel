@@ -1,0 +1,16 @@
+[package]
+name = "gatel-scgi"
+description = "Optional SCGI transport for Gatel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gatel-cgi-http.workspace = true
+gatel-plugin-runtime.workspace = true
+gatel-cgi-protocol.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

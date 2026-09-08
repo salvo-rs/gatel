@@ -143,7 +143,8 @@ pub struct Cors;
 impl Directive for Cors {
     fn meta(&self) -> &DirectiveMeta {
         // A guard, because a preflight is answered here and goes no further.
-        static META: DirectiveMeta = DirectiveMeta::middleware("cors", Phase::Guard, Scopes::BOTH);
+        static META: DirectiveMeta =
+            DirectiveMeta::middleware("cors", Phase::Guard, Scopes::BOTH).with_version("2");
         &META
     }
 
@@ -351,26 +352,7 @@ fn set(response: &mut Response, name: http::header::HeaderName, value: HeaderVal
 
 /// Add one name to `Vary` without losing what is already there.
 fn vary(response: &mut Response, name: &'static str) {
-    let existing = response
-        .headers()
-        .get(http::header::VARY)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    if existing
-        .split(',')
-        .any(|entry| entry.trim().eq_ignore_ascii_case(name))
-    {
-        return;
-    }
-    let combined = if existing.is_empty() {
-        name.to_string()
-    } else {
-        format!("{existing}, {name}")
-    };
-    if let Ok(value) = HeaderValue::from_str(&combined) {
-        response.headers_mut().insert(http::header::VARY, value);
-    }
+    crate::vary::append(response.headers_mut(), name);
 }
 
 /// Kept so the header names used above are checked against `http`.
@@ -413,6 +395,8 @@ mod tests {
             .0
             .expect("the configuration is valid")
             .build(BuildContext {
+                secrets: Default::default(),
+                blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),
                 state: None,
                 telemetry: crate::testing::telemetry(),

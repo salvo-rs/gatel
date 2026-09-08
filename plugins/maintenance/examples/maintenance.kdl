@@ -1,0 +1,6 @@
+// Requires the host's `maintenance` Cargo feature.
+global { http "127.0.0.1:8080" }
+site "*" {
+    maintenance enabled=#true retry-after=60
+    route "/*" { respond "online" }
+}
