@@ -48,15 +48,27 @@ impl Gateway {
         // A process-local sequence keeps equal tags from sharing a directory.
         static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Darwin's temporary root is long and sockaddr_un is only 104 bytes.
+        // Keep the fixture component compact for real Unix-socket backends.
         let directory = std::env::temp_dir().join(format!(
-            "gatel-e2e-{tag}-{}-{:?}-{sequence}",
+            "gt-{:x}-{sequence:x}-{:x}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&directory).unwrap();
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder
+            .create(&directory)
+            .unwrap_or_else(|error| panic!("fixture {tag}: {error}"));
         let store = Arc::new(GenerationStore::new());
         let binds = Arc::new(BindTable::new());
         Self {
