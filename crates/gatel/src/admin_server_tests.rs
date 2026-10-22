@@ -7,9 +7,24 @@ async fn request(address: SocketAddr, text: &str) -> String {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
         socket.write_all(text.as_bytes()).await.unwrap();
-        let mut output = String::new();
-        socket.read_to_string(&mut output).await.unwrap();
-        output
+        let mut output = Vec::new();
+        if let Err(error) = socket.read_to_end(&mut output).await {
+            // An oversized head can leave unread input when Hyper sends 431
+            // and closes. Darwin may report RST after delivering that reply.
+            // Accept only a complete, empty 431 response, never lost/truncated
+            // replies or resets on successful management requests.
+            assert!(
+                error.kind() == io::ErrorKind::ConnectionReset
+                    && output.starts_with(b"HTTP/1.1 431 ")
+                    && output.ends_with(b"\r\n\r\n")
+                    && String::from_utf8_lossy(&output)
+                        .to_ascii_lowercase()
+                        .contains("\r\ncontent-length: 0\r\n"),
+                "incomplete admin response: {error}; {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        String::from_utf8(output).unwrap()
     })
     .await
     .unwrap()

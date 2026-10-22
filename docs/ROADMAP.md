@@ -7,6 +7,7 @@
 
 - 最新公告命中旧锁文件：升级 rustls 0.23.46、rustls-webpki 0.103.16、webpki-roots 和 webpki-root-certs 1.0.10；直接依赖同时提高安全版本下限，不新增公告豁免。本地完整 cargo-deny 检查和 35 项 TLS/ACME/代理/重试回归通过。
 - macOS 已通过旧文件名测试，随后 Unix socket 夹具超过 sockaddr_un 长度限制。共享 Gateway 目录改为紧凑的 PID/时间/序号名，保留并发唯一性，Unix 创建时使用 0700；不跳过 socket 请求/池复用断言。
+- 第二轮远端运行 39812533793 已通过 macOS 默认测试，在全功能管理端口测试暴露了超大请求头关闭时的 TCP reset。读取器保留已收字节，仅在收到完整空正文 431（含 Content-Length: 0）后接受 ConnectionReset；空响应、截断头和其他状态的 reset 继续失败，不放宽生产解析器限制。
 
 修复后的 Rust 1.94 全工作区全功能全目标编译通过。全量本地复测曾遇并行链接临时空间不足，
 已限制构建并发重跑；产物、依赖和临时文件继续使用 D 盘任务缓存。远端最终结果以修复提交的 Actions 记录为准。
