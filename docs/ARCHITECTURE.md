@@ -1,5 +1,14 @@
 # Architecture
 
+Connections pin a generation by default. The opt-in `global { reload-drain "30s" }`
+policy retires older connections after successful Server reconciliation: HTTP
+stops accepting requests/streams gracefully, and the deadline also bounds
+unfinished handshakes and upgrade tunnels. Registration reads the current
+generation under the retirement lock so publication/reconciliation cannot miss
+an older reader. Weak per-generation entries do not retain runtimes; each
+connection owns its signal and capacity permit. Once announced, a deadline is
+not cancelled or extended by another reload. See CLI.md and reload_drain.rs.
+
 The optional loopback control-plane HTTP listener/handler and its security /
 transaction boundaries are documented in [ADMIN.md](ADMIN.md).
 

@@ -240,15 +240,30 @@ impl AdminApi {
         };
         // Do not attach a freshly sampled ETag to this outcome: another write may
         // already have happened. Clients fetch a new validator before retrying.
-        write_reply(self.writer.reload_kdl_if(version, text).await)
+        write_reply(
+            self.writer.reload_kdl_if(version, text).await,
+            self.checkpoint_mode,
+        )
     }
 }
 
-fn write_reply(result: Result<Outcome, SourceWriteError>) -> Response<Full<Bytes>> {
-    match result {
+fn write_reply(result: Result<Outcome, SourceWriteError>, checkpoint: bool) -> Response<Full<Bytes>> {
+    let durability = match &result {
         Ok(Outcome::Started { .. } | Outcome::Reloaded { .. } | Outcome::NoOp { .. }) => {
-            reply(StatusCode::OK, "applied in memory")
+            Some(if checkpoint { "checkpoint" } else { "memory" })
         }
+        Err(SourceWriteError::PersistenceUnknown) => Some("unknown"),
+        _ => None,
+    };
+    let mut response = match result {
+        Ok(Outcome::Started { .. } | Outcome::Reloaded { .. } | Outcome::NoOp { .. }) => reply(
+            StatusCode::OK,
+            if checkpoint {
+                "applied and checkpoint saved"
+            } else {
+                "applied in memory"
+            },
+        ),
         Ok(Outcome::Rejected(_)) | Err(SourceWriteError::Observation(_)) => {
             reply(StatusCode::UNPROCESSABLE_ENTITY, "configuration rejected")
         }
@@ -264,7 +279,14 @@ fn write_reply(result: Result<Outcome, SourceWriteError>) -> Response<Full<Bytes
             StatusCode::SERVICE_UNAVAILABLE,
             "configuration may be applied; persistence outcome unknown; inspect before retrying",
         ),
+    };
+    // A write result, not a durable request receipt or a status-query promise.
+    if let Some(durability) = durability {
+        response
+            .headers_mut()
+            .insert("x-gatel-durability", http::HeaderValue::from_static(durability));
     }
+    response
 }
 
 fn single(headers: &http::HeaderMap, key: header::HeaderName) -> Option<&str> {
@@ -292,12 +314,14 @@ async fn read_body<B: Body<Data = Bytes> + Unpin>(mut body: B) -> Result<Vec<u8>
 }
 
 fn reply(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
-    Response::builder().status(status)
+    Response::builder()
+        .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
         // A future HTTP/2 adapter must remove connection-specific headers.
         .header(header::CONNECTION, "close")
-        .body(Full::new(Bytes::from_static(message.as_bytes()))).unwrap()
+        .body(Full::new(Bytes::from_static(message.as_bytes())))
+        .unwrap()
 }
 
 #[cfg(test)]

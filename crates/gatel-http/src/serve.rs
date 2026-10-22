@@ -4,7 +4,8 @@
 //! as long as a generation. A connection pins the generation that was current
 //! when it was accepted and keeps it until it closes, so a reload never changes
 //! what an in-flight request sees, and an HTTP/2 connection's later streams stay
-//! with the configuration their connection started under.
+//! with the configuration their connection started under. An explicit
+//! reload-drain policy gracefully retires older connections with a deadline.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -15,11 +16,10 @@ use gatel_tls::TlsAcceptor;
 use hyper::service::Service as _;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use hyper_util::server::graceful::GracefulShutdown;
 use salvo_core::ConnCtrl;
 use salvo_core::http::uri::Scheme;
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 
 use crate::bind::BindTable;
 use crate::prepare::Runtime;
@@ -44,6 +44,7 @@ pub struct Server {
     /// because file descriptors and memory are the process's, not an address's.
     slots: Arc<Semaphore>,
     granted: std::sync::atomic::AtomicU32,
+    connection_retirements: Arc<crate::connection_drain::Retirements>,
 }
 
 impl Server {
@@ -67,6 +68,7 @@ impl Server {
             retiring: tokio::sync::Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(0)),
             granted: std::sync::atomic::AtomicU32::new(0),
+            connection_retirements: Arc::new(crate::connection_drain::Retirements::default()),
         }
     }
 
@@ -118,6 +120,8 @@ impl Server {
             return;
         }
         committed.runtime.plugin_tasks.activate();
+        self.connection_retirements
+            .retire_before(committed.number, committed.runtime.reload_drain);
         self.set_capacity(committed.runtime.limits.max_connections);
         for address in &wanted {
             if tasks.contains_key(address) {
@@ -130,7 +134,8 @@ impl Server {
             let store = Arc::clone(&self.store);
             let address = *address;
             let slots = Arc::clone(&self.slots);
-            let handle = tokio::spawn(accept_loop(listener, address, store, slots, stopped));
+            let retirements = Arc::clone(&self.connection_retirements);
+            let handle = tokio::spawn(accept_loop(listener, address, store, slots, stopped, retirements));
             tasks.insert(address, AcceptTask { stop, handle });
             tracing::info!(target: "gatel::listener", event = "listener_started", %address);
         }
@@ -200,8 +205,8 @@ async fn accept_loop(
     store: Arc<Store>,
     slots: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
+    retirements: Arc<crate::connection_drain::Retirements>,
 ) {
-    let graceful = GracefulShutdown::new();
     let mut connections = tokio::task::JoinSet::new();
     loop {
         // The slot is taken before accepting rather than after. A connection
@@ -237,7 +242,7 @@ async fn accept_loop(
 
         // The generation is pinned here, once, and held for the whole
         // connection.
-        let Some(committed) = store.current() else {
+        let Some((committed, retirement)) = retirements.pin(&store) else {
             continue;
         };
         // Existing accept loops can see a new commit before Server::sync.
@@ -249,21 +254,27 @@ async fn accept_loop(
         };
 
         let _ = stream.set_nodelay(true);
-        let watcher = graceful.watcher();
+        let stopped = stop.clone();
         connections.spawn(async move {
-            serve_connection(stream, peer, address, runtime, committed, watcher, slot).await;
+            // Owned by the task, including retirement and an upgraded tunnel.
+            let _slot = slot;
+            let serving = serve_connection(stream, peer, address, runtime, committed, stopped, &retirement);
+            tokio::pin!(serving);
+            tokio::select! {
+                _ = &mut serving => {},
+                deadline = retirement.deadline() => {
+                    let _ = tokio::time::timeout_at(deadline, serving).await;
+                },
+            }
         });
     }
 
-    // Include TLS/PROXY handshakes, not only Hyper's watched HTTP futures.
+    // Include TLS/PROXY handshakes and upgrade handoffs, not only HTTP futures.
     let grace = store
         .current()
         .map(|current| current.runtime.grace_period)
         .unwrap_or(std::time::Duration::from_secs(30));
-    let drain = async {
-        graceful.shutdown().await;
-        while connections.join_next().await.is_some() {}
-    };
+    let drain = async { while connections.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(grace, drain).await;
     connections.abort_all();
     while connections.join_next().await.is_some() {}
@@ -275,9 +286,8 @@ async fn serve_connection(
     local: SocketAddr,
     runtime: Arc<crate::prepare::ListenerRuntime>,
     generation: Arc<Committed<Arc<Runtime>>>,
-    watcher: hyper_util::server::graceful::Watcher,
-    // Held for the life of the connection: dropping it is what frees the slot.
-    _slot: OwnedSemaphorePermit,
+    stop: watch::Receiver<bool>,
+    retirement: &crate::connection_drain::Retirement,
 ) {
     let limits = &generation.runtime.limits;
     let metrics = Arc::clone(&runtime.metrics);
@@ -358,18 +368,16 @@ async fn serve_connection(
     // this too.
     let result = match &runtime.tls {
         None => {
-            let connection =
-                watcher.watch(builder.serve_connection_with_upgrades(TokioIo::new(stream), handler));
-            connection.await.map_err(|error| error.to_string())
+            let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), handler);
+            crate::connection_drain::http(connection, stop, retirement, &work).await
         }
         Some(config) => {
             let acceptor = TlsAcceptor::from(Arc::clone(config));
             match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream)).await {
                 Ok(Ok(stream)) => {
                     metrics.handshakes_ok.increment();
-                    let connection =
-                        watcher.watch(builder.serve_connection_with_upgrades(TokioIo::new(stream), handler));
-                    connection.await.map_err(|error| error.to_string())
+                    let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), handler);
+                    crate::connection_drain::http(connection, stop, retirement, &work).await
                 }
                 Ok(Err(error)) => {
                     metrics.handshakes_failed.increment();
@@ -398,9 +406,6 @@ async fn serve_connection(
         }
     };
 
-    if result.is_ok() {
-        work.finish().await;
-    }
     if let Err(error) = result {
         tracing::debug!(target: "gatel::connection", event = "connection_closed", %peer, %error);
     }

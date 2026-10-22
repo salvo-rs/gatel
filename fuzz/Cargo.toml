@@ -20,16 +20,16 @@ bytes = "1"
 futures-util = "0.3"
 http-body = "1"
 http-body-util = "0.1"
-gatel-plugin-runtime = { path = "../crates/gatel-plugin-runtime" }
+gatel-plugin-runtime = { version = "2.0.0-alpha.1", path = "../crates/gatel-plugin-runtime" }
 tokio = { version = "1", features = ["rt", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
-gatel-password = { path = "../crates/gatel-password", features = ["argon2"] }
-gatel-cgi-protocol = { path = "../crates/gatel-cgi-protocol" }
+gatel-password = { version = "2.0.0-alpha.1", path = "../crates/gatel-password", features = ["argon2"] }
+gatel-cgi-protocol = { version = "2.0.0-alpha.1", path = "../crates/gatel-cgi-protocol" }
 libfuzzer-sys = "0.4"
-gatel-kdl = { path = "../crates/gatel-kdl" }
-gatel-model = { path = "../crates/gatel-model" }
-gatel-plan = { path = "../crates/gatel-plan" }
-gatel-bundle-std = { path = "../crates/gatel-bundle-std" }
+gatel-kdl = { version = "2.0.0-alpha.1", path = "../crates/gatel-kdl" }
+gatel-model = { version = "2.0.0-alpha.1", path = "../crates/gatel-model" }
+gatel-plan = { version = "2.0.0-alpha.1", path = "../crates/gatel-plan" }
+gatel-bundle-std = { version = "2.0.0-alpha.1", path = "../crates/gatel-bundle-std" }
 salvo_core = { version = "0.96", default-features = false }
 http = "1"
 

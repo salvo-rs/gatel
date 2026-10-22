@@ -1,5 +1,30 @@
 # Gatel v2 后续完善计划
 
+## 2026-10-22：复核后的增量改进
+
+用户重新启动 v2 改进；下方 2026-09-09 的范围冻结和验证是历史记录。
+本次按以下顺序推进，不把实验 WAL 编解码或未经测量的路由树当作必做重写：
+
+1. 修复已记录远端 CI 的三个具体问题：macOS 文件名夹具、nightly 弃用 API、无版本 path 依赖；CI 补入已有 snapshot_codec fuzz 目标。
+2. 新增显式 `global { reload-drain "30s" }`，默认保留连接固定代。成功 Server 同步时优雅退役旧 H1/H2，期限覆盖未完成握手/响应/隧道，后续更新不取消或延长期限。
+3. 新增固定 main eaf9bde 的真实双二进制 HTTP 差分脚本与 CI，覆盖 11 项共同场景；不代替完整旧语法和功能迁移台账。
+4. 修复 checkpoint 成功响应错误描述为内存应用，新增 X-Gatel-Durability 区分 memory/checkpoint/unknown，保留现有未知结果锁存；不承诺 WAL 或幂等重试。
+5. 请求匹配借用 method/path/query，主机名规范化去掉中间 String；保留线性路由表与编译后 NoOp 判断，暂无吞吐提升数字。
+6. 同步 README、FEATURES、CLI、AUTH、ADMIN、ARCHITECTURE 和迁移说明；旧远端证据不冒充修改后 CI 通过。
+
+本次本机 Windows 验证：
+
+- `cargo test --workspace --all-features --all-targets --locked --offline --quiet`：1522 通过、4 ignored，退出 0；ignored 的外部互操作和定时长测未计为通过。
+- `cargo test -p gatel --no-default-features --test serve --test plugins --test passwd --locked --offline --quiet`：10 通过。
+- `cargo clippy --workspace --all-features --all-targets --locked --offline --quiet -- -D warnings`：通过。
+- `cargo +1.94.0 check --workspace --all-features --all-targets --locked --offline --quiet`：通过。
+- `cargo +nightly check --manifest-path fuzz/Cargo.toml --bins --locked --offline --quiet`，`RUSTFLAGS=-D warnings`：全部八目标编译通过，不是 sanitizer 运行或持续 fuzz。
+- `cargo deny --offline check bans`、xtask、格式化、YAML 解析与 `git diff --check`：通过；xtask 原有 generation.rs 601 行建议提示仍保留，未超过硬限。
+- 冻结 main eaf9bde 的 `gatel 0.1.4` 与当前 v2 `2.0.0-alpha.1`：差分 11 项通过，报告记录两份二进制 SHA-256。首轮发现夹具误用旧语法，按 main parser 修正 match/rewrite 后通过，不据此声称修复了 main 业务行为。
+- 构建、临时文件、依赖下载及验证报告均位于 `D:/BuildCache/gatel-v2-analysis`；MSRV、nightly 和 main 各自 target 已用 metadata 核对。
+
+以上为本地验证记录，不代表修改后远端 CI 已通过；远端结果以对应提交的 Actions 记录为准。未在本机 macOS/Linux 重跑。外部 CA、持续 fuzz、完整 WAL、资源级权限和服务安装仍需各自独立验收。
+
 更新：2026-09-09。状态：按用户要求冻结本轮功能范围，本轮验证与交接已完成；以下未完成项保留为后续规划，不继续自动扩展。
 
 ## 本轮收尾与后续入口

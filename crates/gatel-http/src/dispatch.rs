@@ -137,18 +137,18 @@ impl Dispatcher {
         request: &Request,
     ) -> Result<(&'a PreparedSite, &'a PreparedRoute), NoMatch<'a>> {
         let host = request_host(request);
-        let method = request.method().as_str().to_string();
+        let method = request.method().as_str();
         let uri = request.uri();
-        let path = uri.path().to_string();
-        let query = uri.query().map(str::to_string);
+        let path = uri.path();
+        let query = uri.query();
         let client_ip = self.client_ip(request);
 
         let headers = SalvoHeaders(request);
         let context = MatchContext {
             host: &host,
-            method: &method,
-            path: &path,
-            query: query.as_deref(),
+            method,
+            path,
+            query,
             headers: &headers,
             client_ip,
             tls: self.tls,
@@ -240,13 +240,12 @@ pub fn request_host(request: &Request) -> String {
         .headers()
         .get(http::header::HOST)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| request.uri().host().map(str::to_string))
+        .or_else(|| request.uri().host())
         .unwrap_or_default();
     let without_port = match raw.rsplit_once(':') {
         // Leave IPv6 literals alone; only a trailing `:port` is stripped.
         Some((head, tail)) if !head.ends_with(']') && tail.chars().all(|c| c.is_ascii_digit()) => head,
-        _ => &raw,
+        _ => raw,
     };
     without_port
         .trim()

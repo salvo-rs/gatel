@@ -52,6 +52,12 @@ token 在启动时读取，不随文件 watcher 自动轮换。默认模式的 `
 
 ## 响应与事务
 
+配置 PUT 的成功响应提供 `X-Gatel-Durability: memory|checkpoint`：前者仅确认内存应用，
+后者确认本次写入的检查点保存完成（包含 NoOp 的检查点收尾）。checkpoint 成功正文为
+`applied and checkpoint saved`，不再错误描述为仅应用于内存。
+持久化结果不明的 503 提供 `X-Gatel-Durability: unknown`；其他错误与只读查询不提供此头。
+该头不是请求 ID、WAL 回执、断电保证或可用于盲重试的幂等凭据；客户端仍需检查状态和版本。
+
 ### 结构化状态查询
 
 只读预留仅隔离处理器层的慢写入：如果底层 32 个连接槽被慢 headers 或其他连接耗尽，

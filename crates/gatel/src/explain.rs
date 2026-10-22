@@ -14,6 +14,12 @@ pub fn explain(plan: &Plan) -> String {
         plan.spec_hash().short(),
         plan.plan_hash().short()
     ));
+    match plan.spec.global.reload_drain {
+        Some(grace) => out.push_str(&format!(
+            "reload connections: graceful retirement, deadline {grace:?}\n"
+        )),
+        None => out.push_str("reload connections: pinned until normal closure\n"),
+    }
 
     for listener in &plan.listeners {
         out.push_str(&format!(
@@ -118,6 +124,12 @@ pub fn diff(before: &Plan, after: &Plan) -> String {
         out.push_str("the configuration is the same; the difference is in the build\n");
     }
     diff_resources(&mut out, &before.spec, &after.spec);
+    if before.spec.global.reload_drain != after.spec.global.reload_drain {
+        out.push_str(&format!(
+            "reload connections\n  {:?} -> {:?} (None keeps connections pinned)\n",
+            before.spec.global.reload_drain, after.spec.global.reload_drain
+        ));
+    }
 
     let listeners = |plan: &Plan| -> Vec<String> {
         plan.listeners

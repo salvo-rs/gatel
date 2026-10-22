@@ -28,12 +28,12 @@ tracing.workspace = true
 
 [dev-dependencies]
 socket2 = "0.6"
-gatel-decode = { path = "../../plugins/decode" }
+gatel-decode = { version = "2.0.0-alpha.1", path = "../../plugins/decode" }
 async-compression.workspace = true
 gatel-cgi-http.workspace = true
-gatel-cgi = { path = "../../plugins/cgi" }
-gatel-scgi = { path = "../../plugins/scgi" }
-gatel-fastcgi = { path = "../../plugins/fastcgi" }
+gatel-cgi = { version = "2.0.0-alpha.1", path = "../../plugins/cgi" }
+gatel-scgi = { version = "2.0.0-alpha.1", path = "../../plugins/scgi" }
+gatel-fastcgi = { version = "2.0.0-alpha.1", path = "../../plugins/fastcgi" }
 bcrypt.workspace = true
 # `start_paused` lets the watchdog tests run in milliseconds rather than minutes.
 tokio = { workspace = true, features = ["test-util"] }

@@ -170,12 +170,20 @@ fn dry_run_validates_root_binds_and_reports_usage_errors() {
 #[cfg(unix)]
 #[test]
 fn static_root_is_a_filesystem_path_not_interpolated_configuration() {
-    use std::os::unix::ffi::OsStringExt;
     let directory = Directory::new();
-    for name in [
-        std::ffi::OsString::from("quotes\" and\nnewlines { }"),
-        std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()),
-    ] {
+    let names = [std::ffi::OsString::from("quotes\" and\nnewlines { }")];
+    // Linux filesystems admit arbitrary non-NUL bytes. macOS filesystems may
+    // reject invalid UTF-8 before Gatel is invoked; test that case on Linux.
+    #[cfg(target_os = "linux")]
+    let names = {
+        use std::os::unix::ffi::OsStringExt;
+        names
+            .into_iter()
+            .chain(std::iter::once(std::ffi::OsString::from_vec(
+                b"non-utf8-\xff".to_vec(),
+            )))
+    };
+    for name in names {
         let root = directory.0.join(name);
         std::fs::create_dir(&root).unwrap();
         let output = command()

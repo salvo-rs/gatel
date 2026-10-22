@@ -34,6 +34,32 @@
 
 ## 尚需逐项展开
 
+### 可执行的共同 HTTP 基线
+
+`scripts/check-v1-compat.py` 使用两份真实二进制、独立 loopback 端口及临时配置比较共同语义：
+精确/前缀路由优先级、状态码、HEAD、method、rewrite 后静态文件/HEAD/Range，以及反向代理
+GET/POST 正文。每项同时与期望结果比较，避免两个版本以同一种错误通过。报告保留版本、路径、
+状态、正文和 Content-Range；Date、Server 等非契约差异不参与比较。启动失败、超时、请求异常均失败，
+子进程在 finally 中终止并回收；这不验收系统服务的优雅停止。
+
+```powershell
+python scripts/check-v1-compat.py --v1 D:/BuildCache/gatel-main/debug/gatel.exe --v2 D:/BuildCache/gatel-v2/debug/gatel.exe --work-dir D:/BuildCache/gatel-compat/run-1
+```
+
+输出目录必须不存在。脚本不会安装二进制、修改当前配置或请求外部服务。构建缓存另设
+`CARGO_TARGET_DIR` 并用 `cargo metadata --no-deps --format-version 1` 核对。
+该基线只覆盖上述共同配置与 HTTP/1 请求，不代表所有 v1 指令、默认值或完整兼容验收。
+
+| 已复核差异 | 迁移处理 |
+|---|---|
+| route 内 `match method="POST"` → `method "POST"` | 差分脚本分别生成两种语法；旧 route 顶层 method 属性并不执行匹配，不能据此建立基线 |
+| `rewrite { strip-prefix "/static" }` → `rewrite strip-prefix="/static"` | 从旧 child 节点改为属性；以实际旧 parser 为准 |
+| route 内 `root "..."; file-server` → `file-server root="..."` | root 成为终端属性，重写发生在读取文件前 |
+| `proxy { upstream "地址" }` → `proxy "地址"` 或命名 upstream | 脚本验证直接目标共同语义；不推导均衡/重试默认值兼容 |
+| main 每请求读取当前服务；v2 默认连接固定代 | 可显式启用 reload-drain；须评估长请求与隧道中断 |
+| Admin v1 资源接口 → 可选 v2 KDL 来源 PUT | 不是兼容 URL；客户端使用 ETag/If-Match，检查写入 durability 和状态 |
+| HTTP/3、TCP/UDP stream、CONNECT、SRV、模板/替换、OTLP | 当前仍未恢复，不用已有 HTTP proxy 代替这些能力 |
+
 - `main:crates/core/src/config/{types,parse}.rs` 的字段、属性、默认值、类型和范围。
 - `main:docs/en` 八份文档与 `main:examples` 全部示例的逐项归属及可运行替代。
 - 环境变量自动配置、日志变量、Admin 资源 API、TLS 与监听参数的行为变化。

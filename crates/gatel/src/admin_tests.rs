@@ -12,7 +12,8 @@ pub(super) const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 #[tokio::test]
 async fn persistence_unknown_is_not_reported_as_unapplied_or_retryable_conflict() {
-    let response = write_reply(Err(SourceWriteError::PersistenceUnknown));
+    let response = write_reply(Err(SourceWriteError::PersistenceUnknown), true);
+    assert_eq!(response.headers()["x-gatel-durability"], "unknown");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     assert!(!response.headers().contains_key(header::ETAG));
@@ -22,7 +23,8 @@ async fn persistence_unknown_is_not_reported_as_unapplied_or_retryable_conflict(
         &body[..],
         b"configuration may be applied; persistence outcome unknown; inspect before retrying"
     );
-    let unavailable = write_reply(Err(SourceWriteError::Unavailable));
+    let unavailable = write_reply(Err(SourceWriteError::Unavailable), true);
+    assert!(!unavailable.headers().contains_key("x-gatel-durability"));
     assert_ne!(unavailable.into_body().collect().await.unwrap().to_bytes(), body);
     assert!(
         SourceWriteError::PersistenceUnknown
@@ -178,6 +180,7 @@ async fn authenticated_version_put_and_conflicts_use_normal_transactions() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.headers().contains_key(header::ETAG));
+    assert_eq!(response.headers()["x-gatel-durability"], "memory");
     assert_eq!(app.published_for_test().unwrap().plan.upstreams.len(), 1);
     assert_eq!(
         api.handle(put(tag, NeverRead)).await.status(),

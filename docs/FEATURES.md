@@ -70,7 +70,7 @@ The metrics terminal exposes a coherent budget sample and fixed-cardinality admi
 | Last known good: a bad edit keeps serving the previous generation | yes | done | `gatel-http/tests/reload.rs` |
 | No-op detection: reformatting a file consumes no generation | yes | done | `gatel-http/tests/reload.rs` |
 | Sockets outlive generations; adding addresses is all-or-nothing | yes | done | `gatel-http/src/bind.rs`, `tests/reload.rs` |
-| A connection keeps the generation it was accepted under | yes | done | `gatel-http/src/serve.rs`, `tests/reload.rs` |
+| Connections pin their accepted generation, with opt-in bounded retirement | yes | done | Default pinning; global reload-drain gracefully closes old H1/H2 connections and bounds unfinished bodies/handshakes/tunnels. tests/reload_drain.rs covers default/opt-in, NoOp/rejection, in-flight completion and tunnel deadline/permit release. |
 | State survives a compatible reload (endpoints, pools, selectors, rate limits, certificates, metrics) | yes | done | `gatel-state/src/registry.rs`, `tests/observe.rs`, `tests/directives.rs` |
 | File watching with a polling fallback, and signals | yes | done | `crates/gatel/src/watch.rs` |
 | Reload stability matrix across every state kind | yes | done | `gatel-http/tests/stability.rs`, one row per cell of the table in `ARCHITECTURE.md` |
@@ -162,7 +162,7 @@ The metrics terminal exposes a coherent budget sample and fixed-cardinality admi
 | `cache` — retirement after an unstoreable new 200 | yes | bounded implementation | `cache_replacement.rs`: private/no-store, missing freshness, invalid Age, oversized and truncated Content-Length/chunked bodies retire the observed copy. Per-copy identity preserves concurrent replacements and other Vary copies; removal advances the bounded global invalidation revision. Non-200 responses and bypassed requests are outside this rule; client-cancellation injection remains pending. |
 | `cache` — H2 reset during a cold fill | yes | bounded implementation | `cache_h2.rs`: cancelling before downstream response headers closes the incomplete HTTP/1 origin connection within 3 seconds, while the H2 connection remains usable for a subsequent complete fill and hit. This does not prove the warm-copy retirement timing or H1 disconnect path. |
 | `cache` — H1 abortive close during a cold fill | yes | bounded implementation | `cache_h1.rs`: SO_LINGER=0 client close releases the incomplete origin within 3 seconds; a new client connection fills and hits a complete response. This is not a FIN/half-close or warm-copy cancellation test. |
-| Argon2, scrypt and PBKDF2 for `basic-auth` | no | not started | bcrypt covers what people have |
+| Argon2id, scrypt and PBKDF2 for `basic-auth` | no | partial | Optional Argon2id is implemented and tested; scrypt/PBKDF2 remain open. See AUTH.md. |
 | The CGI family | no | partial | Optional FastCGI/SCGI and Windows child-process CGI plugins are implemented; other process platforms and further resource policies remain open. See `CGI.md` and `ROADMAP.md` for validation boundaries. |
 
 ## Observability
@@ -185,8 +185,8 @@ The metrics terminal exposes a coherent budget sample and fixed-cardinality admi
 | File length ceilings enforced | yes | done | `cargo run -p xtask` |
 | No configuration that is accepted and then ignored | yes | done | `cargo run -p xtask` fails on a field the compiler carries and nothing above it reads. Added after finding three: `retry`'s mode, per-try, buffer and budget, `timeouts body-idle`, and the whole `admin` block |
 | Every example validated | yes | done | `gatel-http/tests/examples.rs` compiles every one, and refuses a secret written in place |
-| Three-platform CI | yes | **configured, never run** | `.github/workflows/ci.yml` covers Linux, macOS and Windows — but this branch has never been pushed, so none of it has executed. The suite has been run by hand on Linux in a container, and on Windows; macOS has not been tried at all |
-| Fuzzing of the frontend, the compile path, the range parser and the matchers | yes | done | `fuzz/`, four targets, run in CI on every push; found three bugs on its first run |
+| Three-platform CI | yes | partial | Run [34286574542](https://github.com/salvo-rs/gatel/actions/runs/34286574542) at 87d6ffe passed Windows/Linux, MSRV, lint, packaging and interoperability; macOS failed on an invalid-UTF-8 filename fixture, fuzz compilation on a nightly deprecation, and bans on unversioned path dependencies. Current fixes require a new remote run; do not infer it from local checks. |
+| Fuzz targets and deterministic regressions | yes | partial | CI now includes all eight targets, including snapshot_codec. The recorded remote run failed to compile fuzz targets. Local nightly compilation fixes are not evidence of a sustained fuzz campaign. |
 | The same inputs checked on a stable toolchain, everywhere, every time | yes | done | `gatel-http/tests/robustness.rs`, where a fuzzer's finding becomes a permanent test |
 | A soak test | yes | done | `gatel-http/tests/soak.rs`: traffic and reloads in a loop, asserting state slots, metric series, parked connections, log sinks and live tasks are flat. Two minutes per push, half an hour nightly |
 | Interoperability suite against curl, browsers and other proxies | yes | partial | tests speak raw HTTP on the wire, and CI runs the container image and talks to it with curl; there is no browser or CDN suite |
@@ -214,17 +214,11 @@ In order of what a deployment would miss first:
    arranged to run on every push except the two that need a tag — pushing
    artefacts and signing them — so the first tag is a smaller risk than it
    was, but it is not zero.
-4. **Nothing has been run by CI.** The branch has never been pushed, so every
-   workflow in `.github/workflows/` is configuration that has not executed:
-   the three-platform matrix, the fuzzing, the soak, the supply-chain check
-   and the packaging job. Pushing it is the cheapest remaining thing that
-   would tell us something.
-
-   That is not theoretical. Running the suite on Linux by hand, once, found
-   that manual TLS certificates did not work there at all — a certificate
-   chain was being refused for being world-readable, which it is supposed to
-   be. Everything passed on Windows, where that check is a deliberate no-op.
-   macOS is still untried, and is the platform nothing here has ever touched.
+4. **A fully passing remote CI run.** The branch has been pushed and run.
+   The recorded run above passed several important gates but failed macOS,
+   fuzz compilation and the dependency bans check. Re-run the complete matrix
+   after the fixes, then retain the result rather than describing workflows as
+   either unexecuted or proven merely because their YAML exists.
 
 ## Measured against nginx and Caddy
 
@@ -245,7 +239,7 @@ it:
 | Layer-4 TCP/UDP proxying | yes (`stream`) | plugin | no |
 | Response body rewriting (`sub_filter`) | yes | plugin | no |
 | Variables and `map` | yes | yes | no, deliberately — see `ARCHITECTURE.md` |
-| Admin API over HTTP | no | yes | no (2.1) |
+| Admin API over HTTP | no | yes | optional loopback KDL config/version/status API; full legacy resource management remains open |
 
 And what is here that neither has out of the box, so the comparison runs both
 ways: active health checks (nginx Plus only), a reload that is transactional
@@ -269,7 +263,7 @@ consecutive checks reach the authoriser over one pooled connection — which is
 the property the shortcut would have lost.
 
 Everything else marked 2.1 is deliberate: `circuit-breaker`, the other ACME
-challenge types and the Admin API are each large enough to want their own
+challenge types and the full legacy Admin resource API are each large enough to want their own
 release, and none of them is needed to put this in front of a service.
 
 ## HTTP compression interoperability

@@ -93,6 +93,7 @@ pub struct Runtime {
     pub acme: Option<AcmeIntent>,
     pub limits: Limits,
     pub grace_period: Duration,
+    pub reload_drain: Option<Duration>,
     /// Who may speak for somebody else. Read when a PROXY header arrives, by
     /// the same rule that decides whether a forwarding header is believed.
     pub trusted_proxies: Vec<(std::net::IpAddr, u8)>,
@@ -302,6 +303,7 @@ pub fn prepare(
         acme: acme_wanted(plan, resources)?,
         limits: plan.spec.global.limits.clone(),
         grace_period: plan.spec.global.grace_period,
+        reload_drain: plan.spec.global.reload_drain,
         trusted_proxies: plan.spec.global.trusted_proxies.clone(),
     }))
 }

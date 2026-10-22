@@ -24,6 +24,9 @@ mod route_matching;
 #[path = "support/upstream_shape.rs"]
 mod upstream_shape;
 
+#[path = "support/reload_drain.rs"]
+mod reload_drain;
+
 // A stand-in for the standard bundle: enough directives to exercise scopes,
 // phases and terminals without depending on their real implementations.
 struct Stub(DirectiveMeta);

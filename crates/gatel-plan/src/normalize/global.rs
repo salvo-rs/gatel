@@ -52,6 +52,12 @@ struct LimitsNode {
 }
 
 #[derive(Debug, FromNode)]
+struct ReloadDrainNode {
+    #[gatel(arg)]
+    grace: Duration,
+}
+
+#[derive(Debug, FromNode)]
 struct BlockingNode {
     #[gatel(prop)]
     jobs: Option<u32>,
@@ -132,6 +138,26 @@ impl Context<'_> {
                         global.grace_period = duration;
                     }
                 }
+                "reload-drain" => {
+                    if global.reload_drain.is_some() {
+                        self.error(
+                            Code::Duplicate,
+                            &child.origin,
+                            "global reload-drain is declared twice",
+                        );
+                    } else if let Some(decoded) = ReloadDrainNode::from_node(child, self.diagnostics) {
+                        let duration = decoded.grace;
+                        if duration > Duration::from_secs(365 * 24 * 60 * 60) {
+                            self.error(
+                                Code::InvalidValue,
+                                &child.origin,
+                                "reload-drain must not exceed 365 days",
+                            );
+                        } else {
+                            global.reload_drain = Some(duration);
+                        }
+                    }
+                }
                 "trusted-proxy" => {
                     for value in &child.args {
                         let Some(text) = value.as_str() else {
@@ -178,11 +204,12 @@ impl Context<'_> {
                     }
                 }
                 other => {
-                    const KNOWN: [&str; 9] = [
+                    const KNOWN: [&str; 10] = [
                         "blocking",
                         "http",
                         "https",
                         "grace-period",
+                        "reload-drain",
                         "trusted-proxy",
                         "limits",
                         "log",

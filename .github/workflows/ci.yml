@@ -159,6 +159,39 @@ jobs:
         with:
           command: check
 
+  v1-compat:
+    name: common HTTP profile against v1
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the frozen v1 baseline
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/gatel-v1-target
+          # Frozen historical code is a reference, not the current lint target.
+          RUSTFLAGS: ""
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/gatel-v1-source"
+          git archive eaf9bdedd97c2ab24450becfff2a2a341dc5c3e2 | tar -x -C "$RUNNER_TEMP/gatel-v1-source"
+          cargo build --manifest-path "$RUNNER_TEMP/gatel-v1-source/Cargo.toml" -p gatel --locked
+      - name: Build v2 and compare real HTTP responses
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p gatel --locked
+          python3 scripts/check-v1-compat.py --v1 "$RUNNER_TEMP/gatel-v1-target/debug/gatel" --v2 target/debug/gatel --work-dir "$RUNNER_TEMP/gatel-v1-compat"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v1-compat-report
+          path: ${{ runner.temp }}/gatel-v1-compat/
+
   # A few minutes each, on every push. That finds regressions rather than deep
   # bugs; a long run against a growing corpus is what finds those, and there is
   # no substitute for leaving one going. What this does guarantee is that the
@@ -169,7 +202,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [kdl_frontend, configuration, range_header, matchers, cgi_protocol, password_policy, request_decode]
+        target: [kdl_frontend, configuration, range_header, matchers, snapshot_codec, cgi_protocol, password_policy, request_decode]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

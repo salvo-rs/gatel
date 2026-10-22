@@ -3,8 +3,8 @@
 //!
 //! A `Spec` is immutable and frontend-format-agnostic, but retains ownership.
 //! Its fingerprint answers exactly
-//! one question — "did the operator ask for something different?" — which is
-//! what lets an unchanged reload stop before doing any work.
+//! one question — "did the operator ask for something different?". The
+//! transaction still compiles the plan before deciding to skip preparation.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -286,6 +286,9 @@ impl Default for Log {
 pub struct Global {
     pub blocking: Option<crate::blocking::Limits>,
     pub grace_period: Duration,
+    /// Opt-in deadline for connections belonging to older generations.
+    /// None preserves connection-pinned configuration until normal closure.
+    pub reload_drain: Option<Duration>,
     pub limits: Limits,
     /// Peers whose forwarding headers are believed.
     pub trusted_proxies: Vec<(IpAddr, u8)>,
@@ -299,6 +302,7 @@ impl Default for Global {
     fn default() -> Self {
         Self {
             grace_period: Duration::from_secs(30),
+            reload_drain: None,
             blocking: None,
             limits: Limits::default(),
             trusted_proxies: Vec::new(),
@@ -318,6 +322,10 @@ impl Global {
             hasher.update_none();
         }
         hasher.update_duration(self.grace_period);
+        if let Some(duration) = self.reload_drain {
+            hasher.update_str("reload-drain-v1");
+            hasher.update_duration(duration);
+        }
         self.limits.hash_into(hasher);
         // Logging does not change what a request receives, but it does change
         // what the process does, so a reload that only touches it is still a

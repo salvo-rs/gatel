@@ -223,13 +223,21 @@ impl BootId {
 
     pub fn generate() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = NEXT
-            .fetch_update(
+        // A CAS loop works on the MSRV as well as nightly, where fetch_update
+        // has been deprecated. Never wrap: an exhausted identity must fail.
+        let mut sequence = NEXT.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = sequence.checked_add(1).expect("boot identity sequence exhausted");
+            match NEXT.compare_exchange_weak(
+                sequence,
+                next,
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
-                |current| current.checked_add(1),
-            )
-            .expect("boot identity sequence exhausted");
+            ) {
+                Ok(_) => break,
+                Err(current) => sequence = current,
+            }
+        }
         Self::from_components(
             std::process::id(),
             std::time::SystemTime::now()

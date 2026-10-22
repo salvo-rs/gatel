@@ -22,11 +22,11 @@ http-body-util = { workspace = true, optional = true }
 subtle = { version = "2.6.1", optional = true }
 serde_json = { workspace = true, optional = true }
 async-compression.workspace = true
-gatel-decode = { path = "../../plugins/decode", optional = true }
-gatel-cgi = { path = "../../plugins/cgi", optional = true }
-gatel-scgi = { path = "../../plugins/scgi", optional = true }
-gatel-fastcgi = { path = "../../plugins/fastcgi", optional = true }
-gatel-maintenance = { path = "../../plugins/maintenance", optional = true }
+gatel-decode = { version = "2.0.0-alpha.1", path = "../../plugins/decode", optional = true }
+gatel-cgi = { version = "2.0.0-alpha.1", path = "../../plugins/cgi", optional = true }
+gatel-scgi = { version = "2.0.0-alpha.1", path = "../../plugins/scgi", optional = true }
+gatel-fastcgi = { version = "2.0.0-alpha.1", path = "../../plugins/fastcgi", optional = true }
+gatel-maintenance = { version = "2.0.0-alpha.1", path = "../../plugins/maintenance", optional = true }
 gatel-bundle-std.workspace = true
 gatel-http.workspace = true
 gatel-kdl.workspace = true

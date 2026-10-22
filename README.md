@@ -47,10 +47,11 @@ that cannot be built: all of them fail before anything changes, and the previous
 configuration keeps serving. There is no window where half the new configuration
 is live.
 
-**An unchanged configuration costs nothing.** Rewriting a file with the same
-bytes does not advance its revision. Reformatting it, or adding a comment,
-produces the same *spec* fingerprint and stops before compiling. Only a change
-that would behave differently reaches the point of building anything.
+**Cosmetic edits do not rebuild the runtime.** Rewriting a file with the same
+bytes does not advance its revision. Reformatting or adding a comment can still
+parse, normalize and compile, but an unchanged plan skips resource preparation,
+activation and generation advancement. External certificate and secret changes
+can still require a resource refresh.
 
 **Declaration order never decides behaviour.** Middleware runs in a fixed order
 of phases — observe, guard, request, response — so writing `basic-auth` after
@@ -89,7 +90,12 @@ error[unknown-property]: `balance "round-robin"` has no property `header`
 | Limits | request head and body size, TLS handshake and idle-connection timeouts, and a process-wide connection cap — each applied, not just declared |
 | Tooling | `run`, `serve`, `fmt` (stdout / CI check), `validate`, `explain`, `diff`, `capabilities`, `passwd`, `precompress`, `completions`, `man-page`, `trust`, `untrust` |
 
-Not yet: the admin API, distributed tracing, HTTP/3, and Unix-socket listeners.
+The optional `admin-api` host feature adds authenticated loopback configuration
+PUT with version CAS, version/status queries, and optional checkpoint recovery.
+It does not restore the legacy resource API or implement production WAL and
+durable idempotent receipts. See [ADMIN.md](docs/ADMIN.md).
+
+Not yet: distributed tracing, HTTP/3, and Unix-socket listeners.
 What is done, what is missing and what proves each is in
 [docs/FEATURES.md](docs/FEATURES.md), and every event it emits is in
 [docs/EVENTS.md](docs/EVENTS.md). Where the code came from and what may be
@@ -130,7 +136,7 @@ cargo build -p gatel --release --locked --features fastcgi,decode
 ```
 
 Available host features are `maintenance`, `fastcgi`, `scgi`, `cgi`, `decode`,
-and `argon2`. `capabilities` lists the directives in the actual binary;
+`argon2`, and `admin-api`. `capabilities` lists the directives in the actual binary;
 `passwd --help` lists its available password algorithms. For the full feature
 test suite, use `cargo test --workspace --all-features --all-targets --locked`.
 Explicitly ignored interoperability and soak tests require separate execution.

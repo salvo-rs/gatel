@@ -152,6 +152,11 @@ async fn http_checkpoint_receipt_distinguishes_saved_from_published_but_unknown(
         let initial = app.store.status().version().etag();
         let response = put(server.address(), &initial, &body).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("x-gatel-durability: checkpoint\r\n"),
+            "{response}"
+        );
+        assert!(response.ends_with("applied and checkpoint saved"), "{response}");
         let ready = probe(app, "/readyz").await;
         assert!(
             ready.starts_with("HTTP/1.1 200") && ready.ends_with("ready\n"),
@@ -175,6 +180,7 @@ async fn http_checkpoint_receipt_distinguishes_saved_from_published_but_unknown(
         let changed = health_config(3);
         let response = put(server.address(), &app.store.status().version().etag(), &changed).await;
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("x-gatel-durability: unknown\r\n"), "{response}");
         let health = app.telemetry.health.report();
         assert_eq!(health.state, gatel_observe::health::State::NotReady);
         assert!(
