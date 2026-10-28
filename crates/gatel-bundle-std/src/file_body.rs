@@ -1,9 +1,21 @@
 //! A bounded file reader must distinguish early EOF from a complete response.
-use std::io;
+use std::io::{self, Read};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf, Take};
+
+pub(crate) fn read_exact_prefix(reader: impl Read, length: usize) -> io::Result<Vec<u8>> {
+    let mut buffer = Vec::with_capacity(length);
+    reader.take(length as u64).read_to_end(&mut buffer)?;
+    if buffer.len() != length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "file ended before its selected length",
+        ));
+    }
+    Ok(buffer)
+}
 
 pub(crate) struct ExactReader<R> {
     inner: Take<R>,
@@ -40,6 +52,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for ExactReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_read_rejects_short_input_and_ignores_growth() {
+        assert_eq!(
+            read_exact_prefix(b"short".as_slice(), 10).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(read_exact_prefix(b"longer".as_slice(), 4).unwrap(), b"long");
+    }
+
     #[tokio::test]
     async fn exact_reader_rejects_short_input_and_bounds_growth() {
         let mut reader = ExactReader::new(b"short".as_slice(), 10);

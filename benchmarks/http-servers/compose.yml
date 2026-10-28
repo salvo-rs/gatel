@@ -20,6 +20,8 @@ services:
       dockerfile: Runner.Dockerfile
     volumes:
       - ./fixtures/range-64k.lua:/workspace/range-64k.lua:ro
+      - ./fixtures/range-offset-64k.lua:/workspace/range-offset-64k.lua:ro
+      - ./fixtures/range-65k.lua:/workspace/range-65k.lua:ro
 
   # The origin behind every proxy target, so all three proxy the same thing.
   backend:
@@ -30,6 +32,10 @@ services:
 
   gatel-static:
     <<: *gatel-image
+    # Readiness is checked by the harness; image probes would add traffic only
+    # to Gatel and the benchmark configuration has no health endpoint.
+    healthcheck:
+      disable: true
     volumes:
       - ./configs/gatel-static.kdl:/etc/gatel/gatel.kdl:ro
       - ./fixtures/www:/srv/www:ro
@@ -51,6 +57,8 @@ services:
 
   gatel-proxy:
     <<: *gatel-image
+    healthcheck:
+      disable: true
     volumes:
       - ./configs/gatel-proxy.kdl:/etc/gatel/gatel.kdl:ro
     depends_on:

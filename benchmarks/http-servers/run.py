@@ -40,6 +40,8 @@ TARGETS = ("gatel", "nginx", "caddy")
 # not source, and a repository that carries it pays for it on every clone.
 PAYLOADS = {
     "payload-4k.txt": 4 * 1024,
+    "payload-64k.bin": 64 * 1024,
+    "payload-65k.bin": 65 * 1024,
     "payload-1m.bin": 1024 * 1024,
     "payload-10m.bin": 10 * 1024 * 1024,
 }
@@ -51,7 +53,7 @@ SCENARIOS = {
         "path": "/payload-4k.txt",
     },
     "static-1m": {
-        "description": "Static file serving — 1 MiB binary (chunked streaming).",
+        "description": "Static file serving — 1 MiB binary (streamed body).",
         "service": "{target}-static",
         "path": "/payload-1m.bin",
     },
@@ -61,10 +63,11 @@ SCENARIOS = {
         "path": "/payload-10m.bin",
     },
     "range-10m": {
-        "description": "Range request — first 64 KiB of a 10 MiB file (a video seek).",
+        "description": "Range request — first 64 KiB of a 10 MiB file (no seek).",
         "service": "{target}-static",
         "path": "/payload-10m.bin",
         "wrk_script": "/workspace/range-64k.lua",
+        "range": (0, 65535),
     },
     "proxy": {
         "description": "Reverse proxying — 4 KiB response from a shared origin.",
@@ -73,12 +76,34 @@ SCENARIOS = {
     },
 }
 
-COMPOSE_SERVICES = [
-    "bench",
-    "backend",
-    *(f"{target}-static" for target in TARGETS),
-    *(f"{target}-proxy" for target in TARGETS),
-]
+# Opt-in controls preserve the five historical default scenarios.
+DEFAULT_SCENARIOS = tuple(SCENARIOS)
+SCENARIOS.update({
+    "static-64k": {
+        "description": "Complete 64 KiB file — same response length as range-10m.",
+        "service": "{target}-static",
+        "path": "/payload-64k.bin",
+    },
+    "static-65k": {
+        "description": "Complete 65 KiB file — just above Gatel's inline threshold.",
+        "service": "{target}-static",
+        "path": "/payload-65k.bin",
+    },
+    "range-offset-10m": {
+        "description": "64 KiB range starting at 1 MiB — includes positioning.",
+        "service": "{target}-static",
+        "path": "/payload-10m.bin",
+        "wrk_script": "/workspace/range-offset-64k.lua",
+        "range": (1048576, 1114111),
+    },
+    "range-65k": {
+        "description": "65 KiB range — just above Gatel's inline threshold.",
+        "service": "{target}-static",
+        "path": "/payload-10m.bin",
+        "wrk_script": "/workspace/range-65k.lua",
+        "range": (0, 66559),
+    },
+})
 
 
 def url_for(scenario: dict, target: str) -> str:
@@ -113,6 +138,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--connections", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=3, help="seconds per target")
+    parser.add_argument("--target", action="append", choices=TARGETS, help="repeatable; defaults to all three")
+    parser.add_argument("--no-build", action="store_true", help="reuse explicitly prebuilt images for A/B runs")
     parser.add_argument(
         "--scenario",
         action="append",
@@ -165,12 +192,18 @@ def compose(*args: str, check: bool = True, capture_output: bool = False):
 # ------------------------------------------------------------------- parsing
 
 
+TIME_UNIT = r"us|ms|s|m|h"
+TIME_VALUE = rf"[0-9.]+(?:{TIME_UNIT})"
+
+
 def to_milliseconds(value: str) -> float:
-    match = re.fullmatch(r"([0-9.]+)(us|ms|s)", value.strip())
+    match = re.fullmatch(rf"([0-9.]+)({TIME_UNIT})", value.strip())
     if not match:
         raise ValueError(f"unrecognized latency value: {value!r}")
     amount = float(match.group(1))
-    return {"us": amount / 1000.0, "ms": amount, "s": amount * 1000.0}[match.group(2)]
+    if match.group(2) == "us":
+        return amount / 1000.0
+    return amount * {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}[match.group(2)]
 
 
 def to_bytes(value: str) -> float:
@@ -191,18 +224,18 @@ def parse_wrk_output(scenario: str, target: str, round_id: int, text: str) -> Be
         return match
 
     latency = need(
-        r"Latency\s+([0-9.]+(?:us|ms|s))\s+([0-9.]+(?:us|ms|s))\s+([0-9.]+(?:us|ms|s))",
+        rf"Latency\s+({TIME_VALUE})\s+({TIME_VALUE})\s+({TIME_VALUE})",
         "the latency line",
     )
     requests = need(
-        r"(\d+)\s+requests in\s+([0-9.]+)s,\s+([0-9.]+(?:B|KB|MB|GB|TB))\s+read",
+        rf"(\d+)\s+requests in\s+({TIME_VALUE}),\s+([0-9.]+(?:B|KB|MB|GB|TB))\s+read",
         "the request summary",
     )
     per_second = need(r"Requests/sec:\s+([0-9.]+)", "throughput")
     transfer = need(r"Transfer/sec:\s+([0-9.]+(?:B|KB|MB|GB|TB))", "transfer rate")
 
     def percentile(name: str) -> float:
-        return to_milliseconds(need(rf"{name}%\s+([0-9.]+(?:us|ms|s))", f"the {name}th percentile").group(1))
+        return to_milliseconds(need(rf"{name}%\s+({TIME_VALUE})", f"the {name}th percentile").group(1))
 
     non_2xx = re.search(r"Non-2xx or 3xx responses:\s+(\d+)", text)
     sockets = re.search(
@@ -224,7 +257,7 @@ def parse_wrk_output(scenario: str, target: str, round_id: int, text: str) -> Be
         p90_ms=percentile("90"),
         p99_ms=percentile("99"),
         total_requests=int(requests.group(1)),
-        duration_seconds=float(requests.group(2)),
+        duration_seconds=to_milliseconds(requests.group(2)) / 1000.0,
         total_read_bytes=to_bytes(requests.group(3)),
         non_2xx_3xx=int(non_2xx.group(1)) if non_2xx else 0,
         socket_errors=sum(int(value) for value in sockets.groups()) if sockets else 0,
@@ -266,12 +299,40 @@ def benchmark_target(url: str, args: argparse.Namespace, wrk_script: str | None)
     return compose(*cmd, capture_output=True).stdout
 
 
-def warmup_target(url: str, seconds: int) -> None:
-    compose(
-        "exec", "-T", "bench", "wrk", "-t", "2", "-c", "32", "-d", f"{seconds}s",
-        "-H", "Accept-Encoding: identity", url,
-        capture_output=True,
+def warmup_target(url: str, args: argparse.Namespace, wrk_script: str | None) -> None:
+    if args.warmup:
+        warmup = argparse.Namespace(threads=args.threads, connections=args.connections, duration=args.warmup)
+        benchmark_target(url, warmup, wrk_script)
+
+
+def verify_payload(url: str, config: dict) -> dict:
+    """Refuse to measure a fast error page or an ignored Range request."""
+    full = (WWW / config["path"].lstrip("/")).read_bytes()
+    extra = []
+    expected = full
+    status = 200
+    if "range" in config:
+        start, end = config["range"]
+        extra = ["-H", f"Range: bytes={start}-{end}"]
+        expected = full[start:end + 1]
+        status = 206
+    result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "bench", "curl", "-fsS", "-i",
+         "-H", "Accept-Encoding: identity", *extra, url],
+        cwd=HERE, check=True, capture_output=True, timeout=30,
     )
+    head, body = result.stdout.split(b"\r\n\r\n", 1)
+    fields = head.split(b"\r\n")
+    actual_status = int(fields[0].split()[1])
+    headers = {key.strip().lower(): value.strip() for key, value in
+               (field.split(b":", 1) for field in fields[1:])}
+    if actual_status != status or body != expected:
+        raise ValueError(f"wrong status or payload for {url}: {actual_status}, {len(body)} bytes")
+    if headers.get(b"content-encoding", b"identity") != b"identity":
+        raise ValueError(f"unexpected content encoding for {url}")
+    if "range" in config and headers.get(b"content-range") != f"bytes {start}-{end}/{len(full)}".encode():
+        raise ValueError(f"wrong Content-Range for {url}")
+    return {"url": url, "status": actual_status, "bytes": len(body), "range": config.get("range")}
 
 
 # ------------------------------------------------------------------ reporting
@@ -300,7 +361,7 @@ def git_revision() -> str:
     return f"{head}{' (dirty)' if ask('git', 'status', '--short') else ''}"
 
 
-def versions() -> dict[str, str]:
+def versions(targets=TARGETS) -> dict[str, str]:
     """What was compared.
 
     gatel's version is read from the workspace manifest and the commit rather
@@ -316,9 +377,11 @@ def versions() -> dict[str, str]:
         result = compose("exec", "-T", service, *command, check=False, capture_output=True)
         return (result.stdout.strip() or result.stderr.strip() or "unknown").splitlines()[0]
 
-    found["nginx"] = from_container("nginx-static", "nginx", "-v")
-    found["caddy"] = from_container("caddy-static", "caddy", "version")
-    return found
+    if "nginx" in targets:
+        found["nginx"] = from_container("nginx-static", "nginx", "-v")
+    if "caddy" in targets:
+        found["caddy"] = from_container("caddy-static", "caddy", "version")
+    return {target: found[target] for target in targets}
 
 
 def mean(values: list[float]) -> float:
@@ -395,13 +458,13 @@ def generate_report(
             "",
             config["description"],
             "",
-            "| Target | Avg req/s | vs gatel | Avg latency | p90 | p99 | Transfer/sec | Errors |",
+            "| Target | Avg req/s | vs gatel | Avg latency | Mean round p90 | Mean round p99 | Transfer/sec | Errors |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         for row in rows:
-            ratio = row["rps"] / baseline if baseline else 0.0
+            ratio = f"{row['rps'] / baseline:.2f}x" if baseline else "N/A"
             lines.append(
-                f"| {row['target']} | {row['rps']:,.0f} | {ratio:.2f}x | "
+                f"| {row['target']} | {row['rps']:,.0f} | {ratio} | "
                 f"{row['latency']:.2f} ms | {row['p90']:.2f} ms | {row['p99']:.2f} ms | "
                 f"{format_bps(row['bps'])} | {row['errors']} |"
             )
@@ -420,7 +483,8 @@ def generate_report(
 
 def main() -> int:
     args = parse_args()
-    scenarios = {name: SCENARIOS[name] for name in (args.scenario or SCENARIOS)}
+    scenarios = {name: SCENARIOS[name] for name in dict.fromkeys(args.scenario or DEFAULT_SCENARIOS)}
+    targets = tuple(dict.fromkeys(args.target or TARGETS))
 
     output_dir = args.output_dir or (OUTPUT_ROOT / datetime.now().strftime("%Y%m%d-%H%M%S"))
     raw_dir = output_dir / "raw"
@@ -431,20 +495,30 @@ def main() -> int:
     results: list[BenchResult] = []
     compose("down", "--volumes", "--remove-orphans", check=False)
     try:
-        compose("build", "bench", "gatel-static", "caddy-static")
-        compose("up", "-d", *COMPOSE_SERVICES)
+        if not args.no_build:
+            builds = ["bench"] + [f"{target}-static" for target in targets if target != "nginx"]
+            compose("build", *builds)
+        services = ["bench", "backend", *(f"{target}-{kind}" for target in targets for kind in ("static", "proxy"))]
+        up = ["up", "-d"]
+        if args.no_build:
+            up.append("--no-build")
+        compose(*up, *services)
 
+        checks = []
         for config in scenarios.values():
-            for target in TARGETS:
-                wait_ready(url_for(config, target))
+            for target in targets:
+                url = url_for(config, target)
+                wait_ready(url)
+                checks.append(verify_payload(url, config))
+                (output_dir / "payload-checks.json").write_text(json.dumps(checks, indent=2), encoding="utf-8")
 
-        software = versions()
+        software = versions(targets)
 
         for scenario, config in scenarios.items():
-            for target in TARGETS:
+            for target in targets:
                 url = url_for(config, target)
                 print(f"warming up {scenario}/{target}", flush=True)
-                warmup_target(url, args.warmup)
+                warmup_target(url, args, config.get("wrk_script"))
                 for round_id in range(1, args.rounds + 1):
                     print(f"benchmarking {scenario}/{target} round {round_id}/{args.rounds}", flush=True)
                     output = benchmark_target(url, args, config.get("wrk_script"))
@@ -452,6 +526,9 @@ def main() -> int:
                         output, encoding="utf-8"
                     )
                     results.append(parse_wrk_output(scenario, target, round_id, output))
+                    (output_dir / "summary.json").write_text(
+                        json.dumps([asdict(item) for item in results], indent=2), encoding="utf-8"
+                    )
 
         (output_dir / "summary.json").write_text(
             json.dumps([asdict(item) for item in results], indent=2), encoding="utf-8"
@@ -462,7 +539,12 @@ def main() -> int:
         print(f"\nReport written to: {output_dir / 'report.md'}")
         return 0
     finally:
-        compose("down", "--volumes", "--remove-orphans", check=False)
+        try:
+            logs = compose("logs", "--no-color", check=False, capture_output=True)
+            (output_dir / "containers.log").write_text(logs.stdout + logs.stderr, encoding="utf-8")
+        finally:
+            # Logging failures must not leave the benchmark stack running.
+            compose("down", "--volumes", "--remove-orphans", check=False)
 
 
 if __name__ == "__main__":
