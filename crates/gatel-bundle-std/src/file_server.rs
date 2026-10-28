@@ -71,11 +71,11 @@ impl DirectiveConfig for Config {
             return Err(format!("`{}` is not a directory", self.root.display()));
         }
         Ok(Arc::new(FileServer {
-            root,
-            index: self.index.clone(),
+            root: root.into(),
+            index: self.index.as_deref().map(Arc::from),
             browse: self.browse,
             precompressed: self.precompressed,
-            fallback: self.fallback.clone(),
+            fallback: self.fallback.as_deref().map(Arc::from),
         }))
     }
 
@@ -138,11 +138,11 @@ impl Directive for FileServerDirective {
 
 #[derive(Clone)]
 struct FileServer {
-    root: PathBuf,
-    index: Option<String>,
+    root: Arc<Path>,
+    index: Option<Arc<str>>,
     browse: bool,
     precompressed: bool,
-    fallback: Option<String>,
+    fallback: Option<Arc<str>>,
 }
 
 /// What a request resolved to.
@@ -265,7 +265,7 @@ impl FileServer {
             return Target::Redirect(format!("{request_path}/"));
         }
         if let Some(index) = &self.index {
-            let candidate = resolved.join(index);
+            let candidate = resolved.join(index.as_ref());
             if let Some((path, _)) = self.contained_file(&candidate) {
                 return Target::File { path };
             }
@@ -658,8 +658,8 @@ mod tests {
 
         fn server(&self, browse: bool) -> FileServer {
             FileServer {
-                root: std::fs::canonicalize(&self.0).unwrap(),
-                index: Some("index.html".to_string()),
+                root: std::fs::canonicalize(&self.0).unwrap().into(),
+                index: Some("index.html".into()),
                 browse,
                 precompressed: false,
                 fallback: None,
@@ -668,7 +668,7 @@ mod tests {
 
         fn server_with_fallback(&self, fallback: &str) -> FileServer {
             FileServer {
-                fallback: Some(fallback.to_string()),
+                fallback: Some(fallback.into()),
                 ..self.server(false)
             }
         }
@@ -723,7 +723,7 @@ mod tests {
         let outside = Tree::new("index-outside");
         let secret = outside.write("secret.html", "outside secret");
         let mut server = tree.server(false);
-        server.index = Some(secret.to_string_lossy().into_owned());
+        server.index = Some(secret.to_string_lossy().into_owned().into());
         assert!(matches!(server.resolve("/"), Target::NotFound));
         assert!(server.contained_file(&secret).is_none());
         tree.write("safe.html", "safe");
