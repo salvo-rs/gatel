@@ -1,0 +1,61 @@
+name: File boundary and tail diagnostic matrix (one-off)
+on:
+  push:
+    branches: [bench/file-latency-diag-20261029-f7fc25c]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: f7fc25c585983364b583ef67308a2a5c9715f0ef
+          path: source
+          persist-credentials: false
+      - name: Record remote storage and host
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/file-latency-diagnostic"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          {
+            uname -a
+            lscpu
+            free -h
+            docker info
+            docker buildx ls
+            df -h "$(docker info --format '{{.DockerRootDir}}')"
+          } > "$BENCHMARK_OUTPUT/environment.txt"
+          if ! command -v strace; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends strace
+          fi
+      - name: Build production baseline and load generator
+        working-directory: source
+        run: |
+          set -euo pipefail
+          docker build --target build-source -t gatel-latency-builder:base .
+          docker compose -f benchmarks/http-servers/compose.yml build bench
+      - name: Build isolated hypotheses with the same compiler and release profile
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-latency-diag.py build
+      - name: Screen read, frame, threshold and chunk hypotheses
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-latency-diag.py measure
+      - name: Count baseline syscalls separately from performance measurement
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-latency-diag.py trace
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: file-latency-diagnostic
+          path: ${{ runner.temp }}/file-latency-diagnostic
+          if-no-files-found: error
