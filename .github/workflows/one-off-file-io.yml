@@ -1,0 +1,54 @@
+name: Zero-offset file read same-host A/B (one-off)
+
+on:
+  push:
+    branches: [bench/file-io-ab-20261029-v4]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 08eb86eb43fcfc51aed5d77bddf36a569124f2ce
+          path: baseline
+          persist-credentials: false
+      - name: Record remote storage and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/file-io-ab-v4"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          {
+            uname -a
+            lscpu
+            free -h
+            docker version
+            docker info
+            docker buildx ls
+            benchmark_docker_root=$(docker info --format '{{.DockerRootDir}}')
+            df -h "$benchmark_docker_root"
+          } > "$BENCHMARK_OUTPUT/environment.txt" 2>&1
+      - name: Alternate baseline and candidate on this runner
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u .github/scripts/launch-file-io-ab.py 2>&1 | tee "$BENCHMARK_OUTPUT/run.log"
+      - name: Preserve comparison and every raw round
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: file-io-ab-v4
+          path: ${{ runner.temp }}/file-io-ab-v4
+          if-no-files-found: error
