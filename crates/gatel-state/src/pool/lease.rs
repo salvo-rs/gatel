@@ -14,7 +14,6 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use http_body_util::BodyExt;
-use tokio::sync::OwnedSemaphorePermit;
 
 use super::{Body, EndpointPool, Idle, Sender};
 
@@ -79,8 +78,7 @@ struct Exclusive {
     address: Option<SocketAddr>,
     opened: Instant,
     slot: Arc<EndpointPool>,
-    permit: OwnedSemaphorePermit,
-    config: gatel_plan::Pool,
+    permit: super::admission::Permit,
     reusable: bool,
 }
 
@@ -109,8 +107,7 @@ impl Lease {
         address: Option<SocketAddr>,
         opened: Instant,
         slot: Arc<EndpointPool>,
-        permit: OwnedSemaphorePermit,
-        config: gatel_plan::Pool,
+        permit: super::admission::Permit,
     ) -> Self {
         Self {
             exclusive: Some(Exclusive {
@@ -119,7 +116,6 @@ impl Lease {
                 opened,
                 slot,
                 permit,
-                config,
                 reusable: true,
             }),
             multiplexed: None,
@@ -200,8 +196,15 @@ impl Drop for Exclusive {
             Sender::Http2(sender) => sender.is_closed(),
         };
         let now = Instant::now();
-        let expired = now.duration_since(self.opened) >= self.config.max_lifetime;
-        if !self.reusable || closed || expired {
+        let policy = self.slot.admission.policy();
+        let config = policy.config;
+        let expired = now.duration_since(self.opened) >= config.max_lifetime;
+        if !self.reusable
+            || closed
+            || expired
+            || config.idle_timeout.is_zero()
+            || policy.allocated > config.max_per_endpoint
+        {
             return;
         }
         // A connection to an address the name has since stopped resolving to
@@ -218,10 +221,10 @@ impl Drop for Exclusive {
             return;
         }
         let mut idle = self.slot.idle.lock().unwrap_or_else(|p| p.into_inner());
-        if self.slot.permits.is_closed() {
+        if self.slot.admission.is_closed() {
             return;
         }
-        if idle.len() >= self.config.max_idle_per_endpoint as usize {
+        if idle.len() >= config.max_idle_per_endpoint as usize {
             // Keeping more idle sockets than configured wastes file
             // descriptors on the backend as much as here.
             return;

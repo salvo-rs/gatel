@@ -17,20 +17,22 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use gatel_plan::{Timeouts, UpstreamProtocol};
 use http_body_util::combinators::BoxBody;
-use tokio::sync::Semaphore;
 
 use crate::endpoint::Endpoint;
 
+mod admission;
 mod dial;
 mod lease;
 mod multiplex;
+#[cfg(test)]
+mod resize_tests;
 
 pub use dial::Sender;
 pub use lease::{Lease, SendError};
@@ -129,11 +131,7 @@ pub(super) struct Counters {
 pub(super) struct EndpointPool {
     h2: multiplex::Multiplex,
     changed: Arc<tokio::sync::Notify>,
-    pub(super) permits: Arc<Semaphore>,
-    /// How many permits the semaphore has been given. The semaphore itself
-    /// only reports what is *available*, which is not the same number while
-    /// requests are in flight, so the total has to be remembered to resize it.
-    granted: AtomicU32,
+    admission: Arc<admission::Admission>,
     pub(super) idle: Mutex<VecDeque<Idle>>,
     pub(super) waiting: AtomicU64,
     pub(super) counters: Counters,
@@ -179,28 +177,6 @@ struct Policy {
     /// Only used on the on-demand path, when a request arrives before the
     /// resolver task has answered for the first time.
     resolve: gatel_plan::Resolve,
-}
-
-/// Grow or shrink one endpoint's concurrency bound in place.
-///
-/// Growing is immediate. Shrinking can only give back permits nobody is
-/// holding, so a limit lowered while requests are in flight lands as far as it
-/// can now and the rest at the next commit — which is better than the
-/// alternatives: cancelling a request that is already talking to a backend, or
-/// waiting on a lock in the middle of a reload.
-fn resize(slot: &EndpointPool, wanted: u32) {
-    let granted = slot.granted.load(Ordering::Acquire);
-    match wanted.cmp(&granted) {
-        std::cmp::Ordering::Equal => {}
-        std::cmp::Ordering::Greater => {
-            slot.permits.add_permits((wanted - granted) as usize);
-            slot.granted.store(wanted, Ordering::Release);
-        }
-        std::cmp::Ordering::Less => {
-            let forgotten = slot.permits.forget_permits((granted - wanted) as usize);
-            slot.granted.fetch_sub(forgotten as u32, Ordering::AcqRel);
-        }
-    }
 }
 
 /// A snapshot of one endpoint's pool, for metrics and `explain`.
@@ -251,11 +227,26 @@ impl ConnectionPool {
     /// a name is looked up — would be read once at creation and then silently
     /// ignored for as long as the process ran.
     pub fn adopt(&self, config: gatel_plan::Pool, resolve: gatel_plan::Resolve) {
-        *self.policy.lock().unwrap_or_else(|p| p.into_inner()) = Policy { config, resolve };
-
         let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
+        *self.policy.lock().unwrap_or_else(|p| p.into_inner()) = Policy { config, resolve };
         for slot in endpoints.values() {
-            resize(slot, config.max_per_endpoint);
+            {
+                // Publication and lease return share this lock. An old lease
+                // cannot park its socket using a superseded idle policy.
+                let policy = slot.admission.adopt(config);
+                let active = policy.allocated.saturating_sub(slot.admission.available());
+                let keep = config
+                    .max_idle_per_endpoint
+                    .min(config.max_per_endpoint.saturating_sub(active));
+                let mut idle = slot.idle.lock().unwrap_or_else(|p| p.into_inner());
+                let before = idle.len();
+                let now = Instant::now();
+                idle.retain(|entry| entry.is_usable(&config, now));
+                idle.truncate(keep as usize);
+                slot.counters
+                    .discarded
+                    .fetch_add((before - idle.len()) as u64, Ordering::Relaxed);
+            }
             slot.h2.adopt(config, slot);
         }
         self.h2_changed.notify_waiters();
@@ -268,14 +259,7 @@ impl ConnectionPool {
             Arc::new(EndpointPool {
                 h2: multiplex::Multiplex::new(config, self.draining.load(Ordering::Acquire)),
                 changed: self.h2_changed.clone(),
-                permits: {
-                    let permits = Arc::new(Semaphore::new(config.max_per_endpoint as usize));
-                    if self.draining.load(Ordering::Acquire) {
-                        permits.close();
-                    }
-                    permits
-                },
-                granted: AtomicU32::new(config.max_per_endpoint),
+                admission: admission::Admission::new(config, self.draining.load(Ordering::Acquire)),
                 idle: Mutex::new(VecDeque::new()),
                 waiting: AtomicU64::new(0),
                 counters: Counters::default(),
@@ -293,8 +277,8 @@ impl ConnectionPool {
         if self.draining.load(Ordering::Acquire) {
             return Err(CheckoutError::Draining);
         }
-        let Policy { config, .. } = self.policy();
         let slot = self.slot(endpoint);
+        let config = slot.admission.policy().config;
 
         let waiting = slot.waiting.fetch_add(1, Ordering::Relaxed) + 1;
         let _waiting_guard = WaitingGuard {
@@ -312,13 +296,13 @@ impl ConnectionPool {
             return self.checkout_h2(endpoint, slot, timeouts).await;
         }
 
-        let permit =
-            match tokio::time::timeout(timeouts.queue, Arc::clone(&slot.permits).acquire_owned()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => return Err(CheckoutError::Draining),
-                Err(_) => return Err(CheckoutError::QueueTimeout(timeouts.queue)),
-            };
+        let permit = match tokio::time::timeout(timeouts.queue, slot.admission.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(CheckoutError::Draining),
+            Err(_) => return Err(CheckoutError::QueueTimeout(timeouts.queue)),
+        };
         drop(_waiting_guard);
+        let config = slot.admission.policy().config;
 
         // Drop stale idle connections rather than sending a request into a
         // socket the backend has already closed.
@@ -337,7 +321,6 @@ impl ConnectionPool {
                         entry.opened,
                         slot,
                         permit,
-                        config,
                     ));
                 }
                 Some(_) => {
@@ -349,7 +332,7 @@ impl ConnectionPool {
 
         let (sender, address) = self.dial(endpoint, timeouts).await?;
         slot.counters.opened.fetch_add(1, Ordering::Relaxed);
-        Ok(Lease::new(sender, address, Instant::now(), slot, permit, config))
+        Ok(Lease::new(sender, address, Instant::now(), slot, permit))
     }
 
     pub fn stats(&self) -> Vec<PoolStats> {
@@ -360,11 +343,10 @@ impl ConnectionPool {
                 let (idle, in_use, streams_in_use) = if self.protocol == UpstreamProtocol::Http2 {
                     slot.h2.stats()
                 } else {
+                    let policy = slot.admission.policy();
                     (
                         slot.idle.lock().unwrap_or_else(|p| p.into_inner()).len(),
-                        slot.granted
-                            .load(Ordering::Acquire)
-                            .saturating_sub(slot.permits.available_permits() as u32),
+                        policy.allocated.saturating_sub(slot.admission.available()),
                         0,
                     )
                 };
@@ -420,7 +402,7 @@ impl ConnectionPool {
         self.draining.store(true, Ordering::Release);
         for slot in endpoints.values() {
             slot.h2.drain(slot);
-            slot.permits.close();
+            slot.admission.close();
             slot.idle.lock().unwrap_or_else(|p| p.into_inner()).clear();
         }
     }

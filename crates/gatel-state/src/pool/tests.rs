@@ -16,7 +16,7 @@ use super::*;
 use crate::endpoint::EndpointSet;
 
 /// A backend that answers a fixed response and keeps the connection open.
-async fn backend() -> SocketAddr {
+pub(super) async fn backend() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -40,7 +40,7 @@ async fn backend() -> SocketAddr {
     address
 }
 
-fn set(address: SocketAddr, config: gatel_plan::Pool) -> (EndpointSet, ConnectionPool) {
+pub(super) fn set(address: SocketAddr, config: gatel_plan::Pool) -> (EndpointSet, ConnectionPool) {
     let upstream = Upstream {
         id: ResourceId::new(ResourceKind::Upstream, "api"),
         owner: SourceId::file("main"),
