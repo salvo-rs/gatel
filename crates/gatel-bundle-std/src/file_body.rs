@@ -243,6 +243,17 @@ mod tests {
         assert!(idle.iter().all(|buffer| buffer.len() == 64));
     }
 
+    #[test]
+    fn dropping_a_lease_does_not_wait_for_the_pool_lock() {
+        static POOL: BufferPool = BufferPool::new(64);
+        let bytes = POOL.read(&b"ok"[..], 2).unwrap();
+        let idle = POOL.idle.lock().unwrap();
+        // Dropping on this same thread would deadlock if Drop waited for the
+        // lock. A contended pool releases the allocation instead of retaining it.
+        drop(bytes);
+        assert!(idle.is_empty());
+    }
+
     struct Fixture(std::path::PathBuf);
 
     impl Fixture {

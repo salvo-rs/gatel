@@ -465,7 +465,15 @@ mod tests {
         let original: Vec<u8> = (0..(1024 * 1024 + 70 * 1024)).map(|n| (n % 251) as u8).collect();
         let path = write("boundary-offset", &original).await;
         for start in [0, 1024 * 1024 + 13] {
-            for length in [INLINE_LIMIT, INLINE_LIMIT + 1024] {
+            for length in [
+                32 * 1024 - 1,
+                32 * 1024,
+                32 * 1024 + 1,
+                INLINE_LIMIT - 1,
+                INLINE_LIMIT,
+                INLINE_LIMIT + 1,
+                INLINE_LIMIT + 1024,
+            ] {
                 let wanted = Wanted::Part {
                     start,
                     end: start + length - 1,
