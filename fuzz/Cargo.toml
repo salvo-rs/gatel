@@ -30,7 +30,7 @@ gatel-kdl = { version = "2.0.0-alpha.1", path = "../crates/gatel-kdl" }
 gatel-model = { version = "2.0.0-alpha.1", path = "../crates/gatel-model" }
 gatel-plan = { version = "2.0.0-alpha.1", path = "../crates/gatel-plan" }
 gatel-bundle-std = { version = "2.0.0-alpha.1", path = "../crates/gatel-bundle-std" }
-salvo_core = { version = "0.96", default-features = false }
+salvo_core = { version = "1.0", default-features = false }
 http = "1"
 
 [[bin]]
