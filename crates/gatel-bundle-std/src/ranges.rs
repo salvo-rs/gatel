@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use salvo_core::http::{Request, ResBody, Response, StatusCode};
-use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Files up to this size are read in one go. Bigger ones are streamed.
 ///
@@ -213,24 +213,28 @@ pub async fn deliver(
     }
 
     let mut file = opened.file;
-    if length <= INLINE_LIMIT {
+    if length <= INLINE_LIMIT && start == 0 {
         // The idle Tokio file transfers its original handle without reopening
-        // the path. Batch positioning and the bounded read in one worker.
-        let mut file = file.into_std().await;
-        let buffer = tokio::task::spawn_blocking(move || {
-            use std::io::Seek;
-            if start > 0 {
-                file.seek(std::io::SeekFrom::Start(start))?;
-            }
-            crate::file_body::read_exact_prefix(file, length as usize)
-        })
-        .await
-        .map_err(std::io::Error::other)??;
+        // the path. Read directly into the outgoing buffer in one worker.
+        let file = file.into_std().await;
+        let buffer =
+            tokio::task::spawn_blocking(move || crate::file_body::read_exact_prefix(file, length as usize))
+                .await
+                .map_err(std::io::Error::other)??;
         response.body(ResBody::Once(buffer.into()));
         return Ok(());
     }
     if start > 0 {
         file.seek(std::io::SeekFrom::Start(start)).await?;
+    }
+
+    if length <= INLINE_LIMIT {
+        let mut buffer = Vec::with_capacity(length as usize);
+        crate::file_body::ExactReader::new(file, length)
+            .read_to_end(&mut buffer)
+            .await?;
+        response.body(ResBody::Once(buffer.into()));
+        return Ok(());
     }
 
     // Streamed: the memory this costs is one buffer, whatever the file weighs.

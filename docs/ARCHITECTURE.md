@@ -1198,11 +1198,12 @@ Body delivery consumes the same owner instead of reopening its pathname. A
 deployment that replaces the directory entry cannot switch the response body to
 the replacement after its validators have been chosen.
 
-Responses of at most 64 KiB transfer the already-opened idle Tokio file to a
-standard file handle. One blocking task positions a nonzero range and reads
-exactly the selected length into the outgoing buffer, avoiding a separate file
-read buffer. This does not reopen the pathname. Larger responses retain the
-Tokio file reader and 64 KiB response chunks; the eager limit is unchanged.
+Responses of at most 64 KiB starting at offset zero transfer the already-opened
+idle Tokio file to a standard file handle. One blocking task reads exactly the
+selected length into the outgoing buffer, avoiding a separate file read buffer.
+This does not reopen the pathname. Nonzero ranges retain the Tokio seek/read
+path. Larger responses retain the Tokio reader and 64 KiB response chunks; the
+eager limit is unchanged.
 Cancellation does not assume a started blocking read can be aborted.
 
 An exact-length reader bounds growth and reports premature EOF as an error for
