@@ -33,7 +33,7 @@ jobs:
             --scenario static-64k --scenario static-65k --scenario range-10m \
             --scenario range-offset-10m --scenario range-65k \
             --output-dir "$RUNNER_TEMP/http-bench-smoke"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: http-benchmark-smoke
@@ -212,7 +212,7 @@ jobs:
           set -euo pipefail
           cargo build -p gatel --locked
           python3 scripts/check-v1-compat.py --v1 "$RUNNER_TEMP/gatel-v1-target/debug/gatel" --v2 target/debug/gatel --work-dir "$RUNNER_TEMP/gatel-v1-compat"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: v1-compat-report
@@ -240,7 +240,7 @@ jobs:
         working-directory: fuzz
 
       # An input that made it fall over is the whole point of running this.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-${{ matrix.target }}-artifacts
