@@ -22,6 +22,7 @@ pub mod normalize;
 pub mod ordering;
 pub mod plan;
 pub mod publication;
+mod request_path;
 pub mod spec;
 pub mod subrequest;
 pub mod upstream;
@@ -45,6 +46,7 @@ pub use plan::{
     BindingChange, ListenerPlan, Plan, ResetPolicy, RoutePlan, SitePlan, StateBinding, StateKind, compile,
     diff_bindings,
 };
+pub use request_path::routing_path;
 pub use spec::{
     Acme, CertificateSource, ClientAuth, Global, Limits, Listener, ListenerProtocol, Log, Route, Site,
     SiteTls, Spec, Terminal,

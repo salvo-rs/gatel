@@ -70,7 +70,7 @@ async fn render(
         let Ok(resolved) = tokio::fs::canonicalize(entry.path()).await else {
             continue;
         };
-        if !crate::file_path::public_resolved(root, &resolved) {
+        if !crate::file_path::public_target(root, &entry.path(), &resolved) {
             continue;
         }
         let Ok(metadata) = tokio::fs::metadata(&resolved).await else {

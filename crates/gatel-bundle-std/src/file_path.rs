@@ -1,4 +1,28 @@
 //! Public filename policy shared by URL resolution and directory browsing.
+/// Windows lookup can silently resolve case and short-name aliases that the
+/// case-sensitive URL router did not authorize. Require the on-disk spelling,
+/// including for indexes, sidecars and browse entries. The configured root has
+/// already been canonicalized, so its own spelling is not a request alias.
+pub(crate) fn public_target(
+    root: &std::path::Path,
+    candidate: &std::path::Path,
+    resolved: &std::path::Path,
+) -> bool {
+    if !public_resolved(root, resolved) {
+        return false;
+    }
+    if !cfg!(windows) {
+        return true;
+    }
+    let (Ok(candidate), Ok(resolved)) = (candidate.strip_prefix(root), resolved.strip_prefix(root)) else {
+        return false;
+    };
+    candidate
+        .components()
+        .map(|part| part.as_os_str())
+        .eq(resolved.components().map(|part| part.as_os_str()))
+}
+
 /// Both paths must already be canonical. Apply the public-name policy below
 /// the configured root, not to the root itself or its ancestors.
 pub(crate) fn public_resolved(root: &std::path::Path, resolved: &std::path::Path) -> bool {
@@ -57,6 +81,21 @@ fn windows_component(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_targets_require_exact_relative_spelling_including_auxiliary_files() {
+        let root = std::path::Path::new("root");
+        let resolved = root.join("Private/Example.txt");
+        assert!(public_target(root, &resolved, &resolved));
+        assert!(public_target(root, root, root));
+        for alias in [
+            "private/Example.txt",
+            "PRIVAT~1/EXAMPL~1.TXT",
+            "Alias/Example.txt",
+        ] {
+            assert_eq!(public_target(root, &root.join(alias), &resolved), !cfg!(windows));
+        }
+    }
+
     #[test]
     fn resolved_policy_is_scoped_below_the_configured_root() {
         let root = std::path::Path::new(".deployment").join("www");

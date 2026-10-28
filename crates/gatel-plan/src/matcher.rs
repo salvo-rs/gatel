@@ -14,7 +14,7 @@ use gatel_model::{Code, Diagnostics, Hasher, Node, Origin};
 pub struct MatchContext<'a> {
     pub host: &'a str,
     pub method: &'a str,
-    /// Percent-encoded path, without the query string.
+    /// Decoded, normalized routing identity, without the query string.
     pub path: &'a str,
     pub query: Option<&'a str>,
     pub headers: &'a dyn HeaderLookup,
@@ -131,19 +131,17 @@ impl PathMatch {
         if raw.contains('?') || raw.contains('#') {
             return Err(format!("`{raw}` must not contain a query or fragment"));
         }
-        match raw.strip_suffix('*') {
-            Some(prefix) => {
-                if prefix.contains('*') {
-                    return Err(format!("`{raw}` may only use `*` at the end"));
-                }
-                Ok(PathMatch::Prefix(prefix.to_string()))
-            }
-            None => {
-                if raw.contains('*') {
-                    return Err(format!("`{raw}` may only use `*` at the end"));
-                }
-                Ok(PathMatch::Exact(raw.to_string()))
-            }
+        let prefix = raw.ends_with('*');
+        let pattern = raw.strip_suffix('*').unwrap_or(raw);
+        if pattern.contains('*') {
+            return Err(format!("`{raw}` may only use `*` at the end"));
+        }
+        let canonical = crate::routing_path(pattern)
+            .ok_or_else(|| format!("`{raw}` contains invalid path escaping or control characters"))?;
+        if prefix {
+            Ok(PathMatch::Prefix(canonical.into_owned()))
+        } else {
+            Ok(PathMatch::Exact(canonical.into_owned()))
         }
     }
 
@@ -171,14 +169,32 @@ impl PathMatch {
 
     pub fn describe(&self) -> String {
         match self {
-            PathMatch::Exact(path) => path.clone(),
-            PathMatch::Prefix(prefix) => format!("{prefix}*"),
+            PathMatch::Exact(path) => escape_path_pattern(path),
+            PathMatch::Prefix(prefix) => format!("{}*", escape_path_pattern(prefix)),
         }
     }
 
     pub fn hash_into(&self, hasher: &mut Hasher) {
-        hasher.update_str(&self.describe());
+        match self {
+            Self::Exact(path) => {
+                hasher.update_str("exact");
+                hasher.update_str(path);
+            }
+            Self::Prefix(path) => {
+                hasher.update_str("prefix");
+                hasher.update_str(path);
+            }
+        }
     }
+}
+
+// Keep descriptions parseable and unambiguous: they also contribute to derived
+// route identities. A literal encoded star must not become a prefix pattern.
+fn escape_path_pattern(path: &str) -> String {
+    path.replace('%', "%25")
+        .replace('*', "%2A")
+        .replace('?', "%3F")
+        .replace('#', "%23")
 }
 
 /// The methods a route accepts.

@@ -161,7 +161,7 @@ impl FileServer {
     /// containment boundary as a directly requested file.
     fn contained_file(&self, candidate: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
         let resolved = std::fs::canonicalize(candidate).ok()?;
-        if !crate::file_path::public_resolved(&self.root, &resolved) {
+        if !crate::file_path::public_target(&self.root, candidate, &resolved) {
             return None;
         }
         let metadata = std::fs::metadata(&resolved).ok()?;
@@ -210,7 +210,7 @@ impl FileServer {
         let Ok(resolved) = std::fs::canonicalize(&candidate) else {
             return Target::NotFound;
         };
-        if !crate::file_path::public_resolved(&self.root, &resolved) {
+        if !crate::file_path::public_target(&self.root, &candidate, &resolved) {
             return Target::NotFound;
         }
         let Ok(metadata) = std::fs::metadata(&resolved) else {

@@ -108,6 +108,8 @@ pub enum NoRoute {
 /// it.
 #[derive(Debug)]
 pub enum NoMatch<'a> {
+    /// The URI cannot have an unambiguous decoded routing identity.
+    InvalidPath,
     /// No site claims this host, so no site's directives apply.
     Host,
     /// This site claims the host, but none of its routes matched.
@@ -139,7 +141,7 @@ impl Dispatcher {
         let host = request_host(request);
         let method = request.method().as_str();
         let uri = request.uri();
-        let path = uri.path();
+        let path = gatel_plan::routing_path(uri.path()).ok_or(NoMatch::InvalidPath)?;
         let query = uri.query();
         let client_ip = self.client_ip(request);
 
@@ -147,7 +149,7 @@ impl Dispatcher {
         let context = MatchContext {
             host: &host,
             method,
-            path,
+            path: &path,
             query,
             headers: &headers,
             client_ip,
@@ -315,6 +317,13 @@ impl Handler for Dispatcher {
         // No route means no series to attribute a request to, and a path is
         // not a label, so an unmatched request is counted on the listener.
         let (chain, measure) = match self.resolve(request) {
+            Err(NoMatch::InvalidPath) => {
+                self.metrics.unmatched_requests.increment();
+                depot.insert("gatel.generated", true);
+                response.status_code(StatusCode::BAD_REQUEST);
+                let _ = response.write_body("400 invalid request path\n");
+                return;
+            }
             Ok((site, route)) => {
                 depot.insert(gatel_plan::ExecutionIdentity::DEPOT_KEY, route.execution);
                 depot.insert("gatel.site", site.id.name().to_string());
