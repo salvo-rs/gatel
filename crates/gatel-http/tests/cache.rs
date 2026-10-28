@@ -9,7 +9,7 @@ mod support;
 #[tokio::test]
 async fn cache_namespace_changes_when_a_named_upstream_changes_behavior() {
     let gateway = Gateway::new("cache-execution-identity");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (old, old_visits) = counting_backend("cache-control: max-age=300\r\nx-origin: old\r\n").await;
     let (new, new_visits) = counting_backend("cache-control: max-age=300\r\nx-origin: new\r\n").await;
     let config = |backend| {
@@ -35,7 +35,7 @@ async fn cache_namespace_changes_when_a_named_upstream_changes_behavior() {
 #[tokio::test]
 async fn cache_budget_reload_is_effective_and_failed_prepare_preserves_active_cache() {
     let gateway = Gateway::new("cache-budget-reload");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
     let config = |size: u64, extra: &str| {
         format!(
@@ -90,7 +90,7 @@ async fn cache_budget_reload_is_effective_and_failed_prepare_preserves_active_ca
 #[tokio::test]
 async fn successful_writes_invalidate_same_origin_response_links_only() {
     let gateway = Gateway::new("cache-related-invalidation");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\nlocation: ../read\r\ncontent-location: http://other.example/foreign\r\n").await;
     gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ cache; route \"/*\" {{ proxy \"{backend}\"; }} }}")).await;
     get(gateway.address(), "/read").await;
@@ -114,7 +114,7 @@ async fn successful_writes_invalidate_same_origin_response_links_only() {
 #[tokio::test]
 async fn a_successful_write_invalidates_the_cached_request_uri() {
     let gateway = Gateway::new("cache-write-invalidate");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
     gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ cache; route \"/\" {{ proxy \"{backend}\"; }} }}")).await;
     get(gateway.address(), "/").await;
@@ -133,7 +133,7 @@ async fn a_successful_write_invalidates_the_cached_request_uri() {
 #[tokio::test]
 async fn cache_variant_uses_every_line_of_a_repeated_request_header() {
     let gateway = Gateway::new("cache-vary-repeated-header");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\nvary: x-variant\r\n").await;
     gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/\" {{ cache; proxy \"{backend}\"; }} }}")).await;
     for (value, visit) in [("one", 1), ("two", 2), ("one", 1)] {
@@ -146,7 +146,7 @@ async fn cache_variant_uses_every_line_of_a_repeated_request_header() {
 #[tokio::test]
 async fn fresh_cache_evaluates_client_validators_without_contacting_origin() {
     let gateway = Gateway::new("cache-conditional");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend(
         "cache-control: max-age=300\r\netag: \"a,b\"\r\nlast-modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n",
     )
@@ -194,7 +194,7 @@ async fn fresh_cache_evaluates_client_validators_without_contacting_origin() {
 #[tokio::test]
 async fn cache_only_requests_never_contact_origin_on_miss_or_constraint_failure() {
     let gateway = Gateway::new("cache-only");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
     gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ cache; route \"/*\" {{ proxy \"{backend}\"; }} }}")).await;
     for method in ["GET", "HEAD"] {
@@ -256,7 +256,7 @@ async fn cache_age_and_request_freshness_are_enforced() {
         ),
     ] {
         let gateway = Gateway::new(label);
-        let port = free_port();
+        let port = gateway.reserve_http_port();
         let (backend, reached) = counting_backend(headers).await;
         let outcome = gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/\" {{ cache; proxy \"{backend}\"; }} }}")).await;
         assert!(
@@ -291,7 +291,7 @@ async fn cache_control_restrictions_cannot_hide_on_another_line() {
         ),
     ] {
         let gateway = Gateway::new(label);
-        let port = free_port();
+        let port = gateway.reserve_http_port();
         let (backend, reached) = counting_backend(headers).await;
         gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/\" {{ cache; proxy \"{backend}\"; }} }}")).await;
         for _ in 0..2 {
@@ -304,7 +304,7 @@ async fn cache_control_restrictions_cannot_hide_on_another_line() {
 #[tokio::test]
 async fn request_cache_control_checks_all_lines_and_quoted_zero() {
     let gateway = Gateway::new("cache-control-request");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
     gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/\" {{ cache; proxy \"{backend}\"; }} }}")).await;
     get(gateway.address(), "/").await;
@@ -344,7 +344,7 @@ async fn dynamic_encoding_respects_representation_metadata() {
         ),
     ] {
         let gateway = Gateway::new(label);
-        let port = free_port();
+        let port = gateway.reserve_http_port();
         let (backend, _) = counting_backend(headers).await;
         gateway.apply(&format!("global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/\" {{ encode gzip min-size=0; proxy \"{backend}\"; }} }}")).await;
         let response = request(gateway.address(), &format!("GET / HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\n{request_policy}Connection: close\r\n\r\n")).await;
@@ -390,7 +390,7 @@ async fn encoding_preserves_origin_vary_dimensions_and_wildcard() {
         ),
     ] {
         let gateway = Gateway::new(label);
-        let port = free_port();
+        let port = gateway.reserve_http_port();
         let (backend, reached) = counting_backend(headers).await;
         gateway
             .apply(&format!(
@@ -415,7 +415,7 @@ site "*" {{ cache
 #[tokio::test]
 async fn a_site_cache_hit_cannot_bypass_a_route_quota() {
     let gateway = Gateway::new("cache-cross-scope-quota");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
     gateway
         .apply(&format!(
@@ -503,7 +503,7 @@ async fn counting_backend(headers: &'static str) -> (std::net::SocketAddr, Arc<A
 #[tokio::test]
 async fn a_second_request_is_answered_without_reaching_the_origin() {
     let gateway = Gateway::new("cache-hit");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
 
     gateway
@@ -548,9 +548,7 @@ site "*" {{
 async fn a_different_path_is_a_different_entry() {
     let gateway = Gateway::new("cache-key");
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
-    // Bind the backend before choosing a gateway port: otherwise its ephemeral
-    // bind can take the port that free_port has just released.
-    let port = free_port();
+    let port = gateway.reserve_http_port();
 
     let outcome = gateway
         .apply(&format!(
@@ -583,7 +581,7 @@ async fn a_response_that_says_nothing_is_not_stored() {
     // a lifetime for a response that declined to state one is how a cache
     // serves stale pages nobody asked it to.
     let gateway = Gateway::new("cache-no-freshness");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("").await;
 
     gateway
@@ -609,7 +607,7 @@ site "*" {{ route "/*" {{ cache
 #[tokio::test]
 async fn told_to_keep_it_anyway_it_keeps_it() {
     let gateway = Gateway::new("cache-default-ttl");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("").await;
 
     gateway
@@ -635,7 +633,7 @@ async fn a_cached_copy_is_never_a_way_past_a_guard() {
     // everybody — which is the worst thing a cache can do after serving one
     // person's session to another.
     let gateway = Gateway::new("cache-guard");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, _) = counting_backend("cache-control: max-age=300\r\n").await;
 
     let outcome = gateway
@@ -671,7 +669,7 @@ site "*" {{
 async fn a_response_that_sets_a_cookie_is_never_stored() {
     // The one that would be an incident rather than a bug.
     let gateway = Gateway::new("cache-cookie");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) =
         counting_backend("cache-control: public, max-age=300\r\nset-cookie: session=abc\r\n").await;
 
@@ -696,7 +694,7 @@ site "*" {{ route "/*" {{ cache
 #[tokio::test]
 async fn a_client_can_ask_to_go_to_the_origin() {
     let gateway = Gateway::new("cache-no-cache");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
 
     gateway
@@ -723,7 +721,7 @@ site "*" {{ route "/*" {{ cache
 #[tokio::test]
 async fn a_post_is_never_answered_from_the_cache() {
     let gateway = Gateway::new("cache-post");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
 
     gateway
@@ -752,7 +750,7 @@ async fn what_is_stored_survives_a_reload() {
     // A reload emptying the cache would send every request to the origin at
     // once, which is the one moment a gateway can least afford it.
     let gateway = Gateway::new("cache-reload");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, reached) = counting_backend("cache-control: max-age=300\r\n").await;
     let config = |comment: &str| {
         format!(
@@ -787,7 +785,7 @@ async fn age_accumulates_rather_than_restarting_at_this_hop() {
     // `Age`. Reporting only our own resident time tells a browser the response
     // is fresher than it is, and the error grows with every hop.
     let gateway = Gateway::new("cache-age");
-    let port = free_port();
+    let port = gateway.reserve_http_port();
     let (backend, _) = counting_backend("cache-control: max-age=300\r\nage: 120\r\n").await;
 
     gateway

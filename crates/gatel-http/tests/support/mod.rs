@@ -271,6 +271,13 @@ impl Gateway {
         }
     }
 
+    /// Keep an OS-assigned HTTP port bound until the gateway adopts it.
+    /// Releasing a probe socket lets a parallel backend take the same port.
+    pub fn reserve_http_port(&self) -> u16 {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        self.binds.adopt(socket).unwrap().port()
+    }
+
     pub fn address(&self) -> SocketAddr {
         *self
             .store
