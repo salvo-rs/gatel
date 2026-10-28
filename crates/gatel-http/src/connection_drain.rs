@@ -86,11 +86,14 @@ pub(crate) async fn http<C>(
     mut stop: watch::Receiver<bool>,
     retirement: &Retirement,
     work: &ConnectionWork,
+    activity: &crate::connection_activity::Activity,
+    idle: Duration,
 ) -> Result<(), String>
 where
     C: GracefulConnection,
     C::Error: std::fmt::Display,
 {
+    activity.begin_http();
     let close = async {
         if *stop.borrow_and_update() {
             return;
@@ -108,6 +111,7 @@ where
             connection.await
         },
         result = &mut connection => result,
+        _ = activity.expired(idle) => return Err("HTTP connection idle deadline elapsed".into()),
     };
     result.map_err(|error| error.to_string())?;
     work.finish().await;

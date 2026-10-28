@@ -19,7 +19,7 @@ use hyper_util::server::conn::auto;
 use salvo_core::ConnCtrl;
 use salvo_core::http::uri::Scheme;
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 
 use crate::bind::BindTable;
 use crate::prepare::Runtime;
@@ -42,8 +42,7 @@ pub struct Server {
     retiring: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The process-wide connection cap. One count across every listener,
     /// because file descriptors and memory are the process's, not an address's.
-    slots: Arc<Semaphore>,
-    granted: std::sync::atomic::AtomicU32,
+    admission: Arc<crate::connection_admission::Admission>,
     connection_retirements: Arc<crate::connection_drain::Retirements>,
 }
 
@@ -66,8 +65,7 @@ impl Server {
             binds,
             tasks: tokio::sync::Mutex::new(BTreeMap::new()),
             retiring: tokio::sync::Mutex::new(Vec::new()),
-            slots: Arc::new(Semaphore::new(0)),
-            granted: std::sync::atomic::AtomicU32::new(0),
+            admission: crate::connection_admission::Admission::new(),
             connection_retirements: Arc::new(crate::connection_drain::Retirements::default()),
         }
     }
@@ -87,22 +85,7 @@ impl Server {
     /// live request to satisfy a number an operator just typed would be a
     /// worse surprise than being briefly over it.
     fn set_capacity(&self, wanted: u32) {
-        use std::sync::atomic::Ordering;
-        let granted = self.granted.load(Ordering::Relaxed);
-        match wanted.cmp(&granted) {
-            std::cmp::Ordering::Greater => {
-                self.slots.add_permits((wanted - granted) as usize);
-                self.granted.store(wanted, Ordering::Relaxed);
-            }
-            std::cmp::Ordering::Less => {
-                // Only what is free can be taken back; the rest is taken back
-                // as connections close, because a permit is not returned to a
-                // semaphore that has forgotten it.
-                let removed = self.slots.forget_permits((granted - wanted) as usize);
-                self.granted.store(granted - removed as u32, Ordering::Relaxed);
-            }
-            std::cmp::Ordering::Equal => {}
-        }
+        self.admission.resize(wanted);
     }
 
     /// Start serving every address the current generation wants, and stop
@@ -133,9 +116,16 @@ impl Server {
             let (stop, stopped) = watch::channel(false);
             let store = Arc::clone(&self.store);
             let address = *address;
-            let slots = Arc::clone(&self.slots);
+            let admission = Arc::clone(&self.admission);
             let retirements = Arc::clone(&self.connection_retirements);
-            let handle = tokio::spawn(accept_loop(listener, address, store, slots, stopped, retirements));
+            let handle = tokio::spawn(accept_loop(
+                listener,
+                address,
+                store,
+                admission,
+                stopped,
+                retirements,
+            ));
             tasks.insert(address, AcceptTask { stop, handle });
             tracing::info!(target: "gatel::listener", event = "listener_started", %address);
         }
@@ -203,32 +193,19 @@ async fn accept_loop(
     listener: Arc<TcpListener>,
     address: SocketAddr,
     store: Arc<Store>,
-    slots: Arc<Semaphore>,
+    admission: Arc<crate::connection_admission::Admission>,
     mut stop: watch::Receiver<bool>,
     retirements: Arc<crate::connection_drain::Retirements>,
 ) {
     let mut connections = tokio::task::JoinSet::new();
     loop {
-        // The slot is taken before accepting rather than after. A connection
-        // accepted and then closed has already cost a handshake and told the
-        // client it was welcome; leaving it in the backlog costs nothing and
-        // lets a load balancer notice.
-        let slot = tokio::select! {
-            biased;
-            _ = stop.changed() => break,
-            _ = connections.join_next(), if !connections.is_empty() => continue,
-            slot = Arc::clone(&slots).acquire_owned() => match slot {
-                Ok(slot) => slot,
-                // The semaphore is only closed when the process is going down.
-                Err(_) => break,
-            },
-        };
         let accepted = tokio::select! {
             biased;
             _ = stop.changed() => break,
             _ = connections.join_next(), if !connections.is_empty() => continue,
             accepted = listener.accept() => accepted,
         };
+
         let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -238,6 +215,24 @@ async fn accept_loop(
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
             }
+        };
+
+        // An idle listener owns no process permit. At most one accepted socket
+        // per listener waits here, without a task or protocol handshake; the
+        // rest remain in the backlog. Admission's FIFO queue shares available
+        // capacity across the listeners that actually have traffic.
+        let reservation = admission.acquire();
+        tokio::pin!(reservation);
+        let slot = loop {
+            tokio::select! {
+                biased;
+                _ = stop.changed() => break None,
+                _ = connections.join_next(), if !connections.is_empty() => {},
+                slot = &mut reservation => break Some(slot),
+            }
+        };
+        let Some(slot) = slot else {
+            break;
         };
 
         // The generation is pinned here, once, and held for the whole
@@ -342,11 +337,19 @@ async fn serve_connection(
             .hyper_handler(local.into(), peer.into(), scheme, None, ConnCtrl::new(), None);
     let work = crate::connection_work::ConnectionWork::default();
     let request_work = work.clone();
+    let activity = crate::connection_activity::Activity::new();
+    let request_activity = activity.clone();
     let handler = Arc::new(handler);
     let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
         request.extensions_mut().insert(request_work.clone());
+        let active = request_activity.request();
         let handler = handler.clone();
-        async move { handler.call(request).await }
+        async move {
+            handler
+                .call(request)
+                .await
+                .map(|response| response.map(|body| crate::connection_activity::Body::new(body, active)))
+        }
     });
     let mut builder = auto::Builder::new(TokioExecutor::new());
     // What the head may cost, and how long a connection may go without one
@@ -369,7 +372,15 @@ async fn serve_connection(
     let result = match &runtime.tls {
         None => {
             let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), handler);
-            crate::connection_drain::http(connection, stop, retirement, &work).await
+            crate::connection_drain::http(
+                connection,
+                stop,
+                retirement,
+                &work,
+                &activity,
+                limits.idle_timeout,
+            )
+            .await
         }
         Some(config) => {
             let acceptor = TlsAcceptor::from(Arc::clone(config));
@@ -377,7 +388,15 @@ async fn serve_connection(
                 Ok(Ok(stream)) => {
                     metrics.handshakes_ok.increment();
                     let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), handler);
-                    crate::connection_drain::http(connection, stop, retirement, &work).await
+                    crate::connection_drain::http(
+                        connection,
+                        stop,
+                        retirement,
+                        &work,
+                        &activity,
+                        limits.idle_timeout,
+                    )
+                    .await
                 }
                 Ok(Err(error)) => {
                     metrics.handshakes_failed.increment();
