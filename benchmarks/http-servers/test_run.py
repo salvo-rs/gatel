@@ -85,6 +85,51 @@ Transfer/sec: 2.70GB
                         with self.assertRaises(ValueError):
                             bench.verify_payload("http://gatel-static:8080/file.bin", config)
 
+    def test_no_build_refuses_to_start_without_prebuilt_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(
+                scenario=["static-4k"], target=["gatel"], no_build=True,
+                output_dir=Path(directory), rounds=1, duration=1, warmup=0, threads=1, connections=1,
+            )
+
+            def compose(*command, **kwargs):
+                if command[0] == "up":
+                    if "--no-build" not in command:
+                        self.fail("compose up could implicitly build missing images")
+                    raise RuntimeError("prebuilt image is missing")
+                return SimpleNamespace(stdout="", stderr="")
+
+            with patch.object(bench, "parse_args", return_value=args), \
+                 patch.object(bench, "ensure_payloads"), \
+                 patch.object(bench, "compose", side_effect=compose) as commands:
+                with self.assertRaisesRegex(RuntimeError, "prebuilt image is missing"):
+                    bench.main()
+                self.assertFalse(any(call.args[0] == "build" for call in commands.call_args_list))
+
+    def test_cleanup_runs_when_log_capture_or_log_storage_fails(self):
+        for failure in ("capture", "storage"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                args = argparse.Namespace(
+                    scenario=["static-4k"], target=["gatel"], no_build=True,
+                    output_dir=Path(directory), rounds=1, duration=1, warmup=0, threads=1, connections=1,
+                )
+
+                def compose(*command, **kwargs):
+                    if command[0] == "logs" and failure == "capture":
+                        raise OSError("log capture failed")
+                    return SimpleNamespace(stdout="service log", stderr="")
+
+                with patch.object(bench, "parse_args", return_value=args), \
+                     patch.object(bench, "ensure_payloads"), \
+                     patch.object(bench, "wait_ready", side_effect=RuntimeError("not ready")), \
+                     patch.object(bench, "compose", side_effect=compose) as commands, \
+                     patch.object(Path, "write_text",
+                                  side_effect=OSError("log storage full") if failure == "storage" else None):
+                    with self.assertRaises(OSError):
+                        bench.main()
+                    downs = [call for call in commands.call_args_list if call.args[0] == "down"]
+                    self.assertEqual(len(downs), 2, "teardown must run after the initial reset")
+
     def test_warmup_uses_the_measured_range_and_concurrency(self):
         args = argparse.Namespace(warmup=5, threads=4, connections=128)
         with patch.object(bench, "benchmark_target") as load:

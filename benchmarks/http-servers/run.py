@@ -499,7 +499,10 @@ def main() -> int:
             builds = ["bench"] + [f"{target}-static" for target in targets if target != "nginx"]
             compose("build", *builds)
         services = ["bench", "backend", *(f"{target}-{kind}" for target in targets for kind in ("static", "proxy"))]
-        compose("up", "-d", *services)
+        up = ["up", "-d"]
+        if args.no_build:
+            up.append("--no-build")
+        compose(*up, *services)
 
         checks = []
         for config in scenarios.values():
@@ -536,9 +539,12 @@ def main() -> int:
         print(f"\nReport written to: {output_dir / 'report.md'}")
         return 0
     finally:
-        logs = compose("logs", "--no-color", check=False, capture_output=True)
-        (output_dir / "containers.log").write_text(logs.stdout + logs.stderr, encoding="utf-8")
-        compose("down", "--volumes", "--remove-orphans", check=False)
+        try:
+            logs = compose("logs", "--no-color", check=False, capture_output=True)
+            (output_dir / "containers.log").write_text(logs.stdout + logs.stderr, encoding="utf-8")
+        finally:
+            # Logging failures must not leave the benchmark stack running.
+            compose("down", "--volumes", "--remove-orphans", check=False)
 
 
 if __name__ == "__main__":

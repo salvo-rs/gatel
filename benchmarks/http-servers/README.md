@@ -58,7 +58,7 @@ Useful arguments:
 --warmup 3            seconds of warmup per target
 --scenario proxy      run only this scenario (repeatable)
 --target gatel        measure only this target (repeatable)
---no-build            reuse prebuilt images, for controlled same-host A/B runs
+--no-build            reuse prebuilt images; never implicitly build missing images
 --output-dir PATH     write results somewhere other than the default
 ```
 
@@ -69,6 +69,8 @@ Results land in `target/benchmarks/http-servers/<timestamp>/`:
 - `raw/*.txt` — what `wrk` actually printed
 - `payload-checks.json` — status, exact bytes and range headers checked before load
 - `containers.log` — service logs, captured before cleanup even on failure
+
+Container cleanup still runs if collecting or saving the service logs fails.
 
 Each completed round is saved immediately. Reported p90/p99 values are means
 of the individual rounds' percentiles, not percentiles of pooled requests.
