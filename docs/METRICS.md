@@ -30,12 +30,26 @@ upstream_down、certificate_pending、log_io_failed，共 8 条序列，始终�
 | `gatel_log_rotation_errors_total{sink}` | counter | 轮换删除、重命名或新文件打开失败的次数 |
 | `gatel_log_last_success_timestamp_seconds{sink}` | gauge | 最近一次成功写入的 Unix 秒；尚未成功为 0 |
 | `gatel_log_io_failed{sink}` | gauge | 最近失败的操作尚未恢复为 1，否则为 0 |
+| `gatel_log_shutdown_timeouts_total` | counter | 宿主日志排空预算耗尽的次数；固定单序列，无标签 |
+| `gatel_log_pending_writers` | gauge | 尚未完成最终目标关闭的活动或退休 writer 数；固定单序列，无标签 |
 
 失败累计值不会因恢复清零；成功执行对应操作清除当前故障。后续成功写入且无需轮换时，
 旧轮换故障也视为恢复。存在活动 sink 的 I/O 故障时健康报告为 degraded，固定原因
 `log_io_failed` 为 1，仍可服务且 `gatel_ready=1`；该原因不是自动重启授权。
-成功 write/flush 只表示操作系统接受该调用，不承诺 fsync 持久性。关闭最后一个 sink 时
-会等待 writer 排空队列；这些指标不保证进程崩溃或强制结束后的计量。
+成功 write/flush 只表示操作系统接受该调用，不承诺 fsync 持久性。关闭最后一个 sink
+只关闭队列，不在调用线程等待磁盘；注册表继续拥有尚未退出的 writer，指标快照释放
+最后一个 Arc 也不执行 join。宿主关闭时主动关闭所有队列（包括仍被 runtime 持有的
+sink），在原有连接/插件 grace 之后最多额外等待 2 秒日志排空。超时累计
+`gatel_log_shutdown_timeouts_total` 并停止等待，`gatel_log_pending_writers` 继续显示
+剩余 writer；此路径不在调用线程写 tracing 或 stderr。不能强行中断阻塞的操作系统
+I/O，其线程继续持有目标直至调用返回。
+这些指标不保证进程崩溃或强制结束后的计量。
+
+每个 Sinks 注册表最多拥有 128 个活动或退休中的 writer；尚未退出的旧 writer 仍占用
+额度。旧 writer 未退出时不重新打开同一路径，新候选会得到可重试的准备失败；这避免
+磁盘持续阻塞期间反复重载无界创建线程。达到额度、关闭期间的构造失败也适用于 stderr；
+公共 `Sinks::stderr` 因此与 `file` 一样返回 Result。该额度来自宿主注册表，不从请求
+创建路径或标签。
 
 轮换 size/keep 仅在成功配置发布时更新共享 writer，失败或 stale 候选不改变现行策略。
 同一候选中同路径配置不同策略会拒绝发布。keep 缩小时在下一次实际轮换清理多余备份；

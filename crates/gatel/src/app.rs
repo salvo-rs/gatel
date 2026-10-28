@@ -591,6 +591,16 @@ impl App {
             acme.shutdown().await;
         }
         lifecycle.acme = None;
+        drop(lifecycle);
+        // Logging gets a separate, explicit budget after request/plugin drain.
+        // Closing queues works even while retained generations still own Sink
+        // handles. Cancelling the wait cannot interrupt a blocked OS write.
+        if tokio::time::timeout(std::time::Duration::from_secs(2), self.telemetry.sinks.shutdown())
+            .await
+            .is_err()
+        {
+            self.telemetry.sinks.record_shutdown_timeout();
+        }
     }
 
     /// Every file the configuration tree touched, so a watcher knows what to
@@ -625,6 +635,10 @@ mod observation_tests;
 #[cfg(test)]
 #[path = "app_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "app_log_shutdown_tests.rs"]
+mod log_shutdown_tests;
 
 #[cfg(test)]
 #[path = "app_submission_tests.rs"]

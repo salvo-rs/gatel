@@ -23,6 +23,7 @@ pub mod render;
 pub mod series;
 pub mod sink;
 mod sink_io;
+mod sink_lifecycle;
 mod sink_policy;
 pub mod workers;
 

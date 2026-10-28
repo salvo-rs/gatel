@@ -61,6 +61,34 @@ fn health(telemetry: &Telemetry, out: &mut String) {
 fn sinks(telemetry: &Telemetry, out: &mut String) {
     family(
         out,
+        "gatel_log_shutdown_timeouts_total",
+        "Host log-drain deadlines that expired without waiting on stderr.",
+        "counter",
+    );
+    point(
+        out,
+        "gatel_log_shutdown_timeouts_total",
+        &[],
+        &vec![],
+        &[],
+        telemetry.sinks.shutdown_timeouts(),
+    );
+    family(
+        out,
+        "gatel_log_pending_writers",
+        "Active or retiring log writers whose final destination close has not completed.",
+        "gauge",
+    );
+    point(
+        out,
+        "gatel_log_pending_writers",
+        &[],
+        &vec![],
+        &[],
+        telemetry.sinks.pending_writers(),
+    );
+    family(
+        out,
         "gatel_log_lines_dropped_total",
         "Log lines a full queue could not take. A request is never delayed for one.",
         "counter",

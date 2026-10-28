@@ -124,19 +124,22 @@ fn write_flush_failures_are_distinct_visible_and_recover_without_queue_loss() {
     telemetry.health.committed(1);
     let write = Arc::new(AtomicBool::new(true));
     let flush = Arc::new(AtomicBool::new(true));
-    let sink = telemetry.sinks.resolve("injected", |name| {
-        spawn(
-            name,
-            Destination::Injected {
-                writer: Box::new(Faults {
-                    write: write.clone(),
-                    flush: flush.clone(),
-                }),
-                rotation_error: false,
-            },
-            Rotate::NEVER,
-        )
-    });
+    let sink = telemetry
+        .sinks
+        .resolve("injected", |name| {
+            spawn(
+                name,
+                Destination::Injected {
+                    writer: Box::new(Faults {
+                        write: write.clone(),
+                        flush: flush.clone(),
+                    }),
+                    rotation_error: false,
+                },
+                Rotate::NEVER,
+            )
+        })
+        .unwrap();
     sink.write("must not block on a failing disk");
     eventually(|| sink.write_errors() == 1 && sink.flush_errors() > 0);
     assert_eq!(sink.dropped(), 0);

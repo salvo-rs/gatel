@@ -3,16 +3,20 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::instrument::Counter;
 use crate::sink_io::{IoStats, Operation};
+use crate::sink_lifecycle::{Completed, Completion, Queue, Worker};
+pub use crate::sink_lifecycle::{Drain, ShutdownReport};
 pub use crate::sink_policy::{SinkPublication, SinkUpdate, StagedSinks};
 
 const QUEUE: usize = 8192;
 const FLUSH_AFTER: Duration = Duration::from_millis(200);
+/// Active and retiring workers share this bound, including stalled OS writes.
+pub const MAX_WRITERS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rotate {
@@ -26,8 +30,8 @@ impl Rotate {
 #[derive(Debug)]
 pub struct Sink {
     name: String,
-    queue: Option<SyncSender<Vec<u8>>>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    queue: Queue,
+    worker: Arc<Worker>,
     dropped: Counter,
     pub(crate) policy: Arc<Mutex<Rotate>>,
     io: Arc<IoStats>,
@@ -39,7 +43,9 @@ impl Sink {
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
-        let Some(queue) = &self.queue else {
+        let queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(queue) = queue.as_ref() else {
+            self.dropped.increment();
             return;
         };
         match queue.try_send(bytes) {
@@ -71,10 +77,7 @@ impl Sink {
 }
 impl Drop for Sink {
     fn drop(&mut self) {
-        self.queue.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.worker.close();
     }
 }
 
@@ -82,11 +85,51 @@ impl Drop for Sink {
 struct Registered {
     sink: Weak<Sink>,
     io: Weak<IoStats>,
+    worker: Arc<Worker>,
+}
+
+#[derive(Debug)]
+struct Registry {
+    open: HashMap<String, Registered>,
+    closed: bool,
+    limit: usize,
+    shutdown_timeouts: Counter,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            open: HashMap::new(),
+            closed: false,
+            limit: MAX_WRITERS,
+            shutdown_timeouts: Counter::new(),
+        }
+    }
+}
+
+impl Registry {
+    fn reap(&mut self) {
+        self.open
+            .retain(|_, entry| entry.sink.strong_count() != 0 || !entry.worker.finished());
+    }
+
+    fn existing(&self, name: &str) -> Result<Option<Arc<Sink>>, String> {
+        if self.closed {
+            return Err("log writers are shutting down".into());
+        }
+        let Some(entry) = self.open.get(&identity(name)) else {
+            return Ok(None);
+        };
+        if let Some(sink) = entry.sink.upgrade() {
+            return Ok(Some(sink));
+        }
+        Err(format!("log writer `{name}` is still draining"))
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct Sinks {
-    open: Arc<Mutex<HashMap<String, Registered>>>,
+    open: Arc<Mutex<Registry>>,
 }
 
 impl Sinks {
@@ -96,7 +139,7 @@ impl Sinks {
     pub fn stage(&self) -> StagedSinks {
         StagedSinks::new(self.clone())
     }
-    pub fn stderr(&self) -> Arc<Sink> {
+    pub fn stderr(&self) -> Result<Arc<Sink>, String> {
         self.resolve("stderr", |name| spawn(name, Destination::Stderr, Rotate::NEVER))
     }
     /// Immediate construction/policy update for standalone callers. Hosts use a
@@ -107,11 +150,14 @@ impl Sinks {
         Ok(sink)
     }
     pub(crate) fn file_handle(&self, path: &Path, rotate: Rotate) -> Result<Arc<Sink>, String> {
+        if self.open.lock().unwrap_or_else(|p| p.into_inner()).closed {
+            return Err("log writers are shutting down".into());
+        }
         // The file can temporarily be absent while its existing writer rolls
         // it. Resolve the stable parent first, before opening another handle.
         if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
             && let Ok(parent) = std::fs::canonicalize(parent)
-            && let Some(existing) = self.get(&label(&parent.join(name)))
+            && let Some(existing) = self.get(&label(&parent.join(name)))?
         {
             return Ok(existing);
         }
@@ -123,7 +169,7 @@ impl Sinks {
         let path =
             std::fs::canonicalize(path).map_err(|error| format!("cannot resolve log file: {error}"))?;
         let name = label(&path);
-        Ok(self.resolve(&name, move |name| {
+        self.resolve(&name, move |name| {
             spawn(
                 name,
                 Destination::File {
@@ -134,46 +180,99 @@ impl Sinks {
                 },
                 rotate,
             )
-        }))
+        })
     }
-    fn resolve(&self, name: &str, create: impl FnOnce(&str) -> Sink) -> Arc<Sink> {
+    fn resolve(&self, name: &str, create: impl FnOnce(&str) -> Sink) -> Result<Arc<Sink>, String> {
         let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        open.reap();
         let key = identity(name);
-        if let Some(existing) = open.get(&key).and_then(|entry| entry.sink.upgrade()) {
-            return existing;
+        if let Some(existing) = open.existing(name)? {
+            return Ok(existing);
+        }
+        if open.open.len() >= open.limit {
+            return Err(format!(
+                "log writer limit ({}) reached, including retiring writers",
+                open.limit
+            ));
         }
         let sink = Arc::new(create(name));
-        open.insert(
+        open.open.insert(
             key,
             Registered {
                 sink: Arc::downgrade(&sink),
                 io: Arc::downgrade(&sink.io),
+                worker: sink.worker.clone(),
             },
         );
-        sink
+        Ok(sink)
     }
-    fn get(&self, name: &str) -> Option<Arc<Sink>> {
-        self.open
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&identity(name))
-            .and_then(|entry| entry.sink.upgrade())
+    fn get(&self, name: &str) -> Result<Option<Arc<Sink>>, String> {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        open.reap();
+        open.existing(name)
     }
     pub fn snapshot(&self) -> Vec<Arc<Sink>> {
         let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        open.retain(|_, entry| entry.sink.strong_count() != 0);
-        let mut sinks: Vec<_> = open.values().filter_map(|entry| entry.sink.upgrade()).collect();
+        open.reap();
+        let mut sinks: Vec<_> = open
+            .open
+            .values()
+            .filter_map(|entry| entry.sink.upgrade())
+            .collect();
         sinks.sort_by(|left, right| left.name.cmp(&right.name));
         sinks
+    }
+
+    /// Close even writers still referenced by a serving runtime, then wait
+    /// asynchronously for queue drain, final flush and destination close.
+    /// The host must impose a deadline; timeout cannot interrupt OS disk I/O.
+    pub fn shutdown(&self) -> Drain {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        open.closed = true;
+        open.reap();
+        let workers: Vec<_> = open.open.values().map(|entry| entry.worker.clone()).collect();
+        for worker in &workers {
+            worker.close();
+        }
+        Drain::new(workers)
+    }
+
+    /// Includes closed queues whose OS writer or final flush is still pending.
+    pub fn pending_writers(&self) -> usize {
+        self.open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .open
+            .values()
+            .filter(|entry| !entry.worker.finished())
+            .count()
+    }
+
+    /// The host calls this when its drain deadline expires. No diagnostic I/O
+    /// runs on that shutdown path, including when stderr itself is stalled.
+    pub fn record_shutdown_timeout(&self) {
+        self.open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_timeouts
+            .increment();
+    }
+
+    pub fn shutdown_timeouts(&self) -> u64 {
+        self.open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_timeouts
+            .get()
     }
 }
 
 impl crate::health::LogStatus for Sinks {
     fn failures(&self) -> Vec<String> {
-        // Do not upgrade Sink here: dropping the last writer may join an I/O
-        // thread. Health samples only lightweight atomic status ownership.
+        // Health samples only lightweight atomic status ownership.
         let open = self.open.lock().unwrap_or_else(|p| p.into_inner());
         let mut failures: Vec<_> = open
+            .open
             .iter()
             .filter(|(_, entry)| {
                 entry.sink.strong_count() != 0 && entry.io.upgrade().is_some_and(|io| io.failed())
@@ -319,8 +418,15 @@ fn roll(path: &Path, rotate: Rotate, previous_keep: usize) -> io::Result<File> {
 #[path = "sink_policy_tests.rs"]
 mod policy_tests;
 
-fn spawn(name: &str, mut destination: Destination, initial: Rotate) -> Sink {
+#[cfg(test)]
+#[path = "sink_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+fn spawn(name: &str, destination: Destination, initial: Rotate) -> Sink {
     let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE);
+    let queue = Arc::new(Mutex::new(Some(sender)));
+    let completion = Arc::new(Completion::default());
+    let finished = completion.clone();
     let label = name.to_owned();
     let policy = Arc::new(Mutex::new(initial));
     let worker_policy = policy.clone();
@@ -329,6 +435,10 @@ fn spawn(name: &str, mut destination: Destination, initial: Rotate) -> Sink {
     let worker = std::thread::Builder::new()
         .name(format!("gatel-log-{label}"))
         .spawn(move || {
+            // Locals drop in reverse order, including during panic: closing
+            // the destination precedes publishing completion to async waiters.
+            let _completed = Completed(finished);
+            let mut destination = destination;
             let mut last_report = None;
             loop {
                 let (operation, result, stop) = match receiver.recv_timeout(FLUSH_AFTER) {
@@ -378,8 +488,8 @@ fn spawn(name: &str, mut destination: Destination, initial: Rotate) -> Sink {
         .expect("a log writer thread");
     Sink {
         name: name.to_owned(),
-        queue: Some(sender),
-        worker: Some(worker),
+        worker: Arc::new(Worker::new(worker, completion, queue.clone())),
+        queue,
         dropped: Counter::new(),
         policy,
         io,
@@ -475,7 +585,7 @@ mod tests {
             sink.write(&format!("line-{index:02}"));
         }
         drop(sink);
-
+        assert!(eventually(|| sinks.pending_writers() == 0));
         assert!(path.exists(), "a new file is always open");
         assert!(path.with_extension("log.1").exists(), "the previous one is kept");
         assert!(path.with_extension("log.2").exists());

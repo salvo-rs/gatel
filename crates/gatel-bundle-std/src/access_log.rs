@@ -85,7 +85,7 @@ impl DirectiveConfig for Config {
         // Opened here rather than at the first request, so a path that cannot
         // be written stops the reload while the previous one still serves.
         let sink = match &self.output {
-            Output::Stderr => cx.telemetry.sinks.stderr(),
+            Output::Stderr => cx.telemetry.sinks.stderr()?,
             Output::File { path, rotate } => match cx.log_sinks {
                 Some(sinks) => sinks.file(&cx.root.join(path), *rotate)?,
                 None => cx.telemetry.sinks.file(&cx.root.join(path), *rotate)?,
