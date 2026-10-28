@@ -28,6 +28,7 @@ use http_body_util::combinators::BoxBody;
 use crate::endpoint::Endpoint;
 
 mod admission;
+mod demand;
 mod dial;
 mod lease;
 mod multiplex;
@@ -158,6 +159,7 @@ pub struct ConnectionPool {
     endpoints: Mutex<HashMap<String, Arc<EndpointPool>>>,
     draining: AtomicBool,
     h2_changed: Arc<tokio::sync::Notify>,
+    h2_demand: Arc<demand::Demand>,
 }
 
 impl std::fmt::Debug for ConnectionPool {
@@ -212,6 +214,7 @@ impl ConnectionPool {
             endpoints: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
             h2_changed: Arc::new(tokio::sync::Notify::new()),
+            h2_demand: Arc::new(demand::Demand::default()),
         }
     }
 

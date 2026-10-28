@@ -308,6 +308,10 @@ impl ConnectionPool {
                     dial.finish(sender, address);
                 }
                 Next::Wait => {
+                    // Do not leave every idle H2 driver on a periodic timer.
+                    // A queued checkout owns observation demand until this
+                    // wait completes, times out or is cancelled.
+                    let _demand = self.h2_demand.wait();
                     if tokio::time::Instant::now() >= queue_deadline {
                         return Err(CheckoutError::QueueTimeout(timeouts.queue));
                     }

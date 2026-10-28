@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use gatel_plan::{Timeouts, UpstreamProtocol};
 use hyper::client::conn::{http1, http2};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
 use super::{Body, CheckoutError, ConnectionPool};
@@ -34,6 +34,8 @@ pub enum Sender {
 pub struct Http2Sender {
     inner: http2::SendRequest<Body>,
     remote_limit: Arc<dyn Fn() -> usize + Send + Sync>,
+    #[cfg(test)]
+    driver_polls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct Observation<T> {
@@ -73,6 +75,32 @@ impl std::ops::Deref for Http2Sender {
 impl std::ops::DerefMut for Http2Sender {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+/// Hyper's I/O task can process GOAWAY without waking its dispatcher. Forward
+/// its actual task polls, coalesced into one notification, instead of keeping
+/// every idle dispatcher on a timer. Hyper also executes request body tasks
+/// here; their progress may likewise change the dispatcher's work.
+#[derive(Clone)]
+struct DriverExecutor(Arc<tokio::sync::Notify>);
+
+impl<F> hyper::rt::Executor<F> for DriverExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        let changed = self.0.clone();
+        tokio::spawn(async move {
+            tokio::pin!(future);
+            std::future::poll_fn(|cx| {
+                let result = future.as_mut().poll(cx);
+                changed.notify_one();
+                result
+            })
+            .await
+        });
     }
 }
 
@@ -233,7 +261,8 @@ impl ConnectionPool {
                 Ok(Sender::Http1(sender))
             }
             UpstreamProtocol::Http2 => {
-                let (sender, connection) = http2::handshake(TokioExecutor::new(), io)
+                let io_events = Arc::new(tokio::sync::Notify::new());
+                let (sender, connection) = http2::handshake(DriverExecutor(io_events.clone()), io)
                     .await
                     .map_err(|error| CheckoutError::Handshake(error.to_string()))?;
                 // Hyper's IO task processes SETTINGS independently of this
@@ -251,52 +280,53 @@ impl ConnectionPool {
                         .sample(|connection| connection.current_max_send_streams())
                 });
                 let changed = self.h2_changed.clone();
+                let observer = self.h2_demand.observer();
+                #[cfg(test)]
+                let driver_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                #[cfg(test)]
+                let polled = driver_polls.clone();
                 tokio::spawn(async move {
                     let mut observed = 0;
-                    let mut refresh = Box::pin(tokio::time::sleep(Duration::from_millis(50)));
-                    let result = std::future::poll_fn(|cx| {
-                        // A zero-to-positive SETTINGS change need not wake the
-                        // dispatch future when no requests are queued. Bound
-                        // that wakeup delay, including an otherwise idle pool.
-                        if refresh.as_mut().poll(cx).is_ready() {
-                            refresh
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + Duration::from_millis(50));
-                            let _ = refresh.as_mut().poll(cx);
-                        }
-                        // Poll outside the mutex: polling/dropping Hyper can
-                        // release a request-body reservation into the pool.
-                        let mut connection = shared
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .value
-                            .take()
-                            .expect("one driver owns the connection");
-                        let result = connection.as_mut().poll(cx);
-                        let limit = if result.is_ready() {
-                            0
-                        } else {
-                            connection.current_max_send_streams()
-                        };
-                        let missed = if result.is_pending() {
-                            shared
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .restore(connection)
-                        } else {
-                            // Close the dispatcher before waking pool waiters.
-                            drop(connection);
-                            false
-                        };
-                        // A checkout sampling during poll saw a conservative
-                        // zero; it needs a wake even if SETTINGS did not change.
-                        if missed || observed != limit || result.is_ready() {
-                            observed = limit;
-                            changed.notify_waiters();
-                        }
-                        result
-                    })
-                    .await;
+                    let result = observer
+                        .drive(
+                            std::future::poll_fn(|cx| {
+                                #[cfg(test)]
+                                polled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // Poll outside the mutex: polling/dropping Hyper can
+                                // release a request-body reservation into the pool.
+                                let mut connection = shared
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .value
+                                    .take()
+                                    .expect("one driver owns the connection");
+                                let result = connection.as_mut().poll(cx);
+                                let limit = if result.is_ready() {
+                                    0
+                                } else {
+                                    connection.current_max_send_streams()
+                                };
+                                let missed = if result.is_pending() {
+                                    shared
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .restore(connection)
+                                } else {
+                                    // Close the dispatcher before waking pool waiters.
+                                    drop(connection);
+                                    false
+                                };
+                                // A checkout sampling during poll saw a conservative
+                                // zero; it needs a wake even if SETTINGS did not change.
+                                if missed || observed != limit || result.is_ready() {
+                                    observed = limit;
+                                    changed.notify_waiters();
+                                }
+                                result
+                            }),
+                            io_events,
+                        )
+                        .await;
                     if let Err(error) = result {
                         tracing::debug!(target: "gatel::upstream", %error, "connection closed");
                     }
@@ -304,6 +334,8 @@ impl ConnectionPool {
                 Ok(Sender::Http2(Http2Sender {
                     inner: sender,
                     remote_limit,
+                    #[cfg(test)]
+                    driver_polls,
                 }))
             }
         }
@@ -322,6 +354,52 @@ async fn connect_with_budget<T>(
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_h2_connection_has_no_timer_or_executor_notification_feedback() {
+        use http_body_util::{BodyExt, Empty};
+        use hyper_util::rt::TokioExecutor;
+
+        let (client, server) = tokio::io::duplex(8192);
+        let peer = tokio::spawn(async move {
+            let service = hyper::service::service_fn(|_: http::Request<hyper::body::Incoming>| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(
+                    Empty::<bytes::Bytes>::new()
+                        .map_err(|never| match never {})
+                        .boxed(),
+                ))
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(server), service)
+                .await;
+        });
+        let pool = ConnectionPool::new(
+            Default::default(),
+            UpstreamProtocol::Http2,
+            Default::default(),
+            None,
+        );
+        let Sender::Http2(sender) = pool.handshake(TokioIo::new(client)).await.unwrap() else {
+            unreachable!()
+        };
+        // Allow both drivers to consume the initial preface and SETTINGS/ACKs.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let polls = sender.driver_polls.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sender.driver_polls.load(std::sync::atomic::Ordering::Relaxed),
+            polls,
+            "a real idle Hyper connection must not have periodic or feedback wakeups"
+        );
+        drop(sender);
+        peer.abort();
+        let _ = peer.await;
+    }
 
     #[test]
     fn observation_during_driver_poll_requires_a_wake_after_restore() {
