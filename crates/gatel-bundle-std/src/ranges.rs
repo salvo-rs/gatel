@@ -10,6 +10,7 @@
 use std::path::Path;
 
 use salvo_core::http::{Request, ResBody, Response, StatusCode};
+use tokio::io::AsyncSeekExt;
 
 /// Files up to this size are read in one go. Bigger ones are streamed.
 ///
@@ -18,24 +19,31 @@ use salvo_core::http::{Request, ResBody, Response, StatusCode};
 /// and one buffer.
 const INLINE_LIMIT: u64 = 64 * 1024;
 
+/// How much is read from disk at a time once a file is streamed.
+///
+/// `ReaderStream`'s own default is 4 KiB, which turns a 10 MiB file into two
+/// and a half thousand frames — a read, an allocation and a write apiece. The
+/// cost of that is not subtle: it was the difference between finishing a large
+/// download and not finishing one at all while other clients waited.
+///
+/// 64 KiB rather than something larger because this is per in-flight response,
+/// and a gateway serving a thousand of them should not be holding sixty
+/// megabytes of read buffer. It is deliberately the same number as
+/// [`INLINE_LIMIT`]: below that a file is read whole, above it the file is read
+/// in pieces of exactly that size.
+const CHUNK: usize = INLINE_LIMIT as usize;
+
 /// One opened representation owns both the metadata and the eventual reader.
 /// A path replacement after opening cannot select another file for its body.
 pub struct OpenedFile {
-    file: std::fs::File,
+    file: tokio::fs::File,
     metadata: std::fs::Metadata,
 }
 
 impl OpenedFile {
     pub async fn open(path: &Path) -> Result<Self, std::io::Error> {
-        let path = path.to_owned();
-        tokio::task::spawn_blocking(move || Self::open_blocking(&path))
-            .await
-            .map_err(std::io::Error::other)?
-    }
-
-    pub(crate) fn open_blocking(path: &Path) -> Result<Self, std::io::Error> {
-        let file = std::fs::File::open(path)?;
-        let metadata = file.metadata()?;
+        let file = tokio::fs::File::open(path).await?;
+        let metadata = file.metadata().await?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -206,8 +214,9 @@ pub async fn deliver(
 
     let mut file = opened.file;
     if length <= INLINE_LIMIT {
-        // One owned, bounded read, including positioning. Avoid Tokio File's
-        // intermediate buffer and separate blocking jobs for seek and read.
+        // The idle Tokio file transfers its original handle without reopening
+        // the path. Batch positioning and the bounded read in one worker.
+        let mut file = file.into_std().await;
         let buffer = tokio::task::spawn_blocking(move || {
             use std::io::Seek;
             if start > 0 {
@@ -220,19 +229,18 @@ pub async fn deliver(
         response.body(ResBody::Once(buffer.into()));
         return Ok(());
     }
-
     if start > 0 {
-        file = tokio::task::spawn_blocking(move || {
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::Start(start))?;
-            Ok::<_, std::io::Error>(file)
-        })
-        .await
-        .map_err(std::io::Error::other)??;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
     }
-    response.body(ResBody::Boxed(Box::pin(crate::file_body::FileBody::new(
-        file, length,
-    ))));
+
+    // Streamed: the memory this costs is one buffer, whatever the file weighs.
+    let stream =
+        tokio_util::io::ReaderStream::with_capacity(crate::file_body::ExactReader::new(file, length), CHUNK);
+    let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
+        Ok(bytes) => Ok(http_body::Frame::data(bytes)),
+        Err(error) => Err(Box::new(error) as salvo_core::BoxedError),
+    });
+    response.body(ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames))));
     Ok(())
 }
 

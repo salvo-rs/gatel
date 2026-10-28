@@ -1198,17 +1198,12 @@ Body delivery consumes the same owner instead of reopening its pathname. A
 deployment that replaces the directory entry cannot switch the response body to
 the replacement after its validators have been chosen.
 
-Immutable root/index/fallback settings are shared across request tasks. Each
-request resolves its path, opens the identity file, reads its handle
-metadata and discovers precompressed siblings in one blocking task. These
-filesystem calls do not run on an async request worker. A response of at most
-64 KiB uses a separate bounded blocking read directly into its outgoing buffer;
-nonzero range positioning is part of that same task. Larger responses use a
-demand-driven file body with at most one 128 KiB read in flight. Each read
-produces its outgoing buffer directly; there is no separate Tokio file buffer
-or unbounded producer queue. The eager threshold remains 64 KiB independently
-of the streamed chunk size. Cancellation drops the task's eventual owned
-result; it does not assume a started blocking filesystem operation can be aborted.
+Responses of at most 64 KiB transfer the already-opened idle Tokio file to a
+standard file handle. One blocking task positions a nonzero range and reads
+exactly the selected length into the outgoing buffer, avoiding a separate file
+read buffer. This does not reopen the pathname. Larger responses retain the
+Tokio file reader and 64 KiB response chunks; the eager limit is unchanged.
+Cancellation does not assume a started blocking read can be aborted.
 
 An exact-length reader bounds growth and reports premature EOF as an error for
 both buffered and streaming bodies. This prevents a truncated stream from looking

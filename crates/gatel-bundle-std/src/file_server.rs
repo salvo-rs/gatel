@@ -71,11 +71,11 @@ impl DirectiveConfig for Config {
             return Err(format!("`{}` is not a directory", self.root.display()));
         }
         Ok(Arc::new(FileServer {
-            root: root.into(),
-            index: self.index.as_deref().map(Arc::from),
+            root,
+            index: self.index.clone(),
             browse: self.browse,
             precompressed: self.precompressed,
-            fallback: self.fallback.as_deref().map(Arc::from),
+            fallback: self.fallback.clone(),
         }))
     }
 
@@ -136,13 +136,12 @@ impl Directive for FileServerDirective {
     }
 }
 
-#[derive(Clone)]
 struct FileServer {
-    root: Arc<Path>,
-    index: Option<Arc<str>>,
+    root: PathBuf,
+    index: Option<String>,
     browse: bool,
     precompressed: bool,
-    fallback: Option<Arc<str>>,
+    fallback: Option<String>,
 }
 
 /// What a request resolved to.
@@ -157,42 +156,7 @@ enum Target {
     NotFound,
 }
 
-#[allow(
-    clippy::large_enum_variant,
-    reason = "This short-lived result normally contains an opened file; boxing its platform-sized metadata adds an allocation to every successful file request."
-)]
-enum PreparedTarget {
-    File {
-        path: PathBuf,
-        opened: crate::ranges::OpenedFile,
-        variants: Vec<(PathBuf, &'static str)>,
-    },
-    Listing(PathBuf),
-    Redirect(String),
-    NotFound,
-}
-
 impl FileServer {
-    /// Resolve, open, and inspect one representation in a single blocking job.
-    /// The final metadata still belongs to the actual reader, not the path.
-    fn prepare(&self, path: &str) -> Result<PreparedTarget, (PathBuf, std::io::Error)> {
-        match self.serve(path) {
-            Target::File { path } => {
-                let opened =
-                    crate::ranges::OpenedFile::open_blocking(&path).map_err(|error| (path.clone(), error))?;
-                let variants = self.precompressed_variants(&path, opened.metadata());
-                Ok(PreparedTarget::File {
-                    path,
-                    opened,
-                    variants,
-                })
-            }
-            Target::Listing(path) => Ok(PreparedTarget::Listing(path)),
-            Target::Redirect(location) => Ok(PreparedTarget::Redirect(location)),
-            Target::NotFound => Ok(PreparedTarget::NotFound),
-        }
-    }
-
     /// Auxiliary files (index and encoded siblings) obey the same resolved
     /// containment boundary as a directly requested file.
     fn contained_file(&self, candidate: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
@@ -265,7 +229,7 @@ impl FileServer {
             return Target::Redirect(format!("{request_path}/"));
         }
         if let Some(index) = &self.index {
-            let candidate = resolved.join(index.as_ref());
+            let candidate = resolved.join(index);
             if let Some((path, _)) = self.contained_file(&candidate) {
                 return Target::File { path };
             }
@@ -334,39 +298,34 @@ impl Handler for FileServer {
             return;
         }
         let path = request.uri().path().to_string();
-        let server = self.clone();
-        let requested = path.clone();
-        let prepared = match tokio::task::spawn_blocking(move || server.prepare(&requested)).await {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err((source, error))) => return unreadable(&source, &error, depot, response),
-            Err(error) => return unreadable(&self.root, &std::io::Error::other(error), depot, response),
-        };
-        let (file, mut opened, variants) = match prepared {
-            PreparedTarget::File {
-                path,
-                opened,
-                variants,
-            } => (path, opened, variants),
-            PreparedTarget::Redirect(location) => {
+        let file = match self.serve(&path) {
+            Target::File { path, .. } => path,
+            Target::Redirect(location) => {
                 response.status_code(StatusCode::MOVED_PERMANENTLY);
                 if let Some(value) = crate::local_redirect::location(&location, request.uri().query()) {
                     response.headers_mut().insert(http::header::LOCATION, value);
                 }
                 return;
             }
-            PreparedTarget::Listing(directory) => {
+            Target::Listing(directory) => {
                 crate::file_listing::write(response, depot, &self.root, &directory, &path).await;
                 return;
             }
             // One answer for "no such file", "outside the root" and "not a
             // regular file": the difference is not the client's business.
-            PreparedTarget::NotFound => {
+            Target::NotFound => {
                 crate::generated(depot);
                 response.status_code(StatusCode::NOT_FOUND);
                 let _ = response.write_body("404 not found\n");
                 return;
             }
         };
+
+        let mut opened = match crate::ranges::OpenedFile::open(&file).await {
+            Ok(opened) => opened,
+            Err(error) => return unreadable(&file, &error, depot, response),
+        };
+        let variants = self.precompressed_variants(&file, opened.metadata());
         let dynamic =
             crate::file_encoding::available(depot, request, opened.metadata().len(), content_type(&file));
         let selection = crate::encoding_accept::select(
@@ -658,8 +617,8 @@ mod tests {
 
         fn server(&self, browse: bool) -> FileServer {
             FileServer {
-                root: std::fs::canonicalize(&self.0).unwrap().into(),
-                index: Some("index.html".into()),
+                root: std::fs::canonicalize(&self.0).unwrap(),
+                index: Some("index.html".to_string()),
                 browse,
                 precompressed: false,
                 fallback: None,
@@ -668,7 +627,7 @@ mod tests {
 
         fn server_with_fallback(&self, fallback: &str) -> FileServer {
             FileServer {
-                fallback: Some(fallback.into()),
+                fallback: Some(fallback.to_string()),
                 ..self.server(false)
             }
         }
@@ -678,33 +637,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
-    }
-
-    #[tokio::test]
-    async fn prepared_file_keeps_the_handle_selected_with_its_metadata() {
-        let tree = Tree::new("prepared-handle");
-        let path = tree.write("page.txt", "original");
-        let PreparedTarget::File { opened, .. } = tree
-            .server(false)
-            .prepare("/page.txt")
-            .unwrap_or_else(|(_, e)| panic!("{e}"))
-        else {
-            panic!("expected a prepared file");
-        };
-        std::fs::rename(&path, path.with_extension("old")).unwrap();
-        std::fs::write(&path, b"replacement").unwrap();
-        assert_eq!(opened.metadata().len(), 8);
-        let mut response = Response::new();
-        crate::ranges::deliver(&mut response, opened, crate::ranges::Wanted::Whole)
-            .await
-            .unwrap();
-        use http_body_util::BodyExt;
-        let bytes = std::mem::take(response.body_mut())
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
-        assert_eq!(bytes, b"original".as_slice());
     }
 
     #[test]
@@ -723,7 +655,7 @@ mod tests {
         let outside = Tree::new("index-outside");
         let secret = outside.write("secret.html", "outside secret");
         let mut server = tree.server(false);
-        server.index = Some(secret.to_string_lossy().into_owned().into());
+        server.index = Some(secret.to_string_lossy().into_owned());
         assert!(matches!(server.resolve("/"), Target::NotFound));
         assert!(server.contained_file(&secret).is_none());
         tree.write("safe.html", "safe");
