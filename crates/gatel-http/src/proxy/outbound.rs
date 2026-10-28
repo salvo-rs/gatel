@@ -168,17 +168,18 @@ pub(super) fn connection_tokens(request: &Request) -> Vec<String> {
 
 /// Whether the request carries a body the upstream would have to read.
 pub(super) fn has_body(request: &Request) -> bool {
+    use http_body::Body as _;
     if request.headers().contains_key(http::header::TRANSFER_ENCODING) {
         return true;
     }
-    declared_length(request).is_some_and(|length| length > 0)
+    declared_length(request).map_or_else(|| !request.body().is_end_stream(), |length| length > 0)
 }
 
 /// How long the client said its body is, if it said.
 ///
-/// `None` means chunked, or no body at all — the two cases the caller has to
-/// tell apart with [`has_body`], and the two that cannot be checked against a
-/// buffer budget before reading them.
+/// `None` means unknown length, including HTTP/2 DATA without Content-Length,
+/// or no body at all. The caller distinguishes these using [`has_body`]; an
+/// unknown length cannot be checked against a replay buffer budget in advance.
 pub(super) fn declared_length(request: &Request) -> Option<u64> {
     if request.headers().contains_key(http::header::TRANSFER_ENCODING) {
         return None;
