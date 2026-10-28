@@ -18,17 +18,6 @@ use salvo_core::http::{Request, ResBody, Response, StatusCode};
 /// and one buffer.
 const INLINE_LIMIT: u64 = 64 * 1024;
 
-/// How much is read from disk at a time once a file is streamed.
-///
-/// `ReaderStream`'s own default is 4 KiB, which turns a 10 MiB file into two
-/// and a half thousand frames — a read, an allocation and a write apiece. The
-/// cost of that is not subtle: it was the difference between finishing a large
-/// download and not finishing one at all while other clients waited.
-///
-/// Keep this independent of the inline threshold: tuning streamed reads must
-/// not silently increase the maximum size of an entirely buffered response.
-const CHUNK: usize = 64 * 1024;
-
 /// One opened representation owns both the metadata and the eventual reader.
 /// A path replacement after opening cannot select another file for its body.
 pub struct OpenedFile {
@@ -220,19 +209,11 @@ pub async fn deliver(
         // One owned, bounded read, including positioning. Avoid Tokio File's
         // intermediate buffer and separate blocking jobs for seek and read.
         let buffer = tokio::task::spawn_blocking(move || {
-            use std::io::{Read, Seek};
+            use std::io::Seek;
             if start > 0 {
                 file.seek(std::io::SeekFrom::Start(start))?;
             }
-            let mut buffer = Vec::with_capacity(length as usize);
-            file.take(length).read_to_end(&mut buffer)?;
-            if buffer.len() as u64 != length {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "file ended before its selected length",
-                ));
-            }
-            Ok(buffer)
+            crate::file_body::read_exact_prefix(file, length as usize)
         })
         .await
         .map_err(std::io::Error::other)??;
@@ -249,15 +230,9 @@ pub async fn deliver(
         .await
         .map_err(std::io::Error::other)??;
     }
-    let file = tokio::fs::File::from_std(file);
-    // Streamed: bounded read buffers, independent of the selected file length.
-    let stream =
-        tokio_util::io::ReaderStream::with_capacity(crate::file_body::ExactReader::new(file, length), CHUNK);
-    let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
-        Ok(bytes) => Ok(http_body::Frame::data(bytes)),
-        Err(error) => Err(Box::new(error) as salvo_core::BoxedError),
-    });
-    response.body(ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames))));
+    response.body(ResBody::Boxed(Box::pin(crate::file_body::FileBody::new(
+        file, length,
+    ))));
     Ok(())
 }
 
