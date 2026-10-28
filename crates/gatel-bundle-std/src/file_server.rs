@@ -136,6 +136,7 @@ impl Directive for FileServerDirective {
     }
 }
 
+#[derive(Clone)]
 struct FileServer {
     root: PathBuf,
     index: Option<String>,
@@ -156,7 +157,38 @@ enum Target {
     NotFound,
 }
 
+enum PreparedTarget {
+    File {
+        path: PathBuf,
+        opened: crate::ranges::OpenedFile,
+        variants: Vec<(PathBuf, &'static str)>,
+    },
+    Listing(PathBuf),
+    Redirect(String),
+    NotFound,
+}
+
 impl FileServer {
+    /// Resolve, open, and inspect one representation in a single blocking job.
+    /// The final metadata still belongs to the actual reader, not the path.
+    fn prepare(&self, path: &str) -> Result<PreparedTarget, (PathBuf, std::io::Error)> {
+        match self.serve(path) {
+            Target::File { path } => {
+                let opened =
+                    crate::ranges::OpenedFile::open_blocking(&path).map_err(|error| (path.clone(), error))?;
+                let variants = self.precompressed_variants(&path, opened.metadata());
+                Ok(PreparedTarget::File {
+                    path,
+                    opened,
+                    variants,
+                })
+            }
+            Target::Listing(path) => Ok(PreparedTarget::Listing(path)),
+            Target::Redirect(location) => Ok(PreparedTarget::Redirect(location)),
+            Target::NotFound => Ok(PreparedTarget::NotFound),
+        }
+    }
+
     /// Auxiliary files (index and encoded siblings) obey the same resolved
     /// containment boundary as a directly requested file.
     fn contained_file(&self, candidate: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
@@ -298,34 +330,39 @@ impl Handler for FileServer {
             return;
         }
         let path = request.uri().path().to_string();
-        let file = match self.serve(&path) {
-            Target::File { path, .. } => path,
-            Target::Redirect(location) => {
+        let server = self.clone();
+        let requested = path.clone();
+        let prepared = match tokio::task::spawn_blocking(move || server.prepare(&requested)).await {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err((source, error))) => return unreadable(&source, &error, depot, response),
+            Err(error) => return unreadable(&self.root, &std::io::Error::other(error), depot, response),
+        };
+        let (file, mut opened, variants) = match prepared {
+            PreparedTarget::File {
+                path,
+                opened,
+                variants,
+            } => (path, opened, variants),
+            PreparedTarget::Redirect(location) => {
                 response.status_code(StatusCode::MOVED_PERMANENTLY);
                 if let Some(value) = crate::local_redirect::location(&location, request.uri().query()) {
                     response.headers_mut().insert(http::header::LOCATION, value);
                 }
                 return;
             }
-            Target::Listing(directory) => {
+            PreparedTarget::Listing(directory) => {
                 crate::file_listing::write(response, depot, &self.root, &directory, &path).await;
                 return;
             }
             // One answer for "no such file", "outside the root" and "not a
             // regular file": the difference is not the client's business.
-            Target::NotFound => {
+            PreparedTarget::NotFound => {
                 crate::generated(depot);
                 response.status_code(StatusCode::NOT_FOUND);
                 let _ = response.write_body("404 not found\n");
                 return;
             }
         };
-
-        let mut opened = match crate::ranges::OpenedFile::open(&file).await {
-            Ok(opened) => opened,
-            Err(error) => return unreadable(&file, &error, depot, response),
-        };
-        let variants = self.precompressed_variants(&file, opened.metadata());
         let dynamic =
             crate::file_encoding::available(depot, request, opened.metadata().len(), content_type(&file));
         let selection = crate::encoding_accept::select(
@@ -637,6 +674,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_file_keeps_the_handle_selected_with_its_metadata() {
+        let tree = Tree::new("prepared-handle");
+        let path = tree.write("page.txt", "original");
+        let PreparedTarget::File { opened, .. } = tree
+            .server(false)
+            .prepare("/page.txt")
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+        else {
+            panic!("expected a prepared file");
+        };
+        std::fs::rename(&path, path.with_extension("old")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(opened.metadata().len(), 8);
+        let mut response = Response::new();
+        crate::ranges::deliver(&mut response, opened, crate::ranges::Wanted::Whole)
+            .await
+            .unwrap();
+        use http_body_util::BodyExt;
+        let bytes = std::mem::take(response.body_mut())
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(bytes, b"original".as_slice());
     }
 
     #[test]

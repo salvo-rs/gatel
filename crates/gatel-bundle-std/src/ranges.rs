@@ -10,7 +10,6 @@
 use std::path::Path;
 
 use salvo_core::http::{Request, ResBody, Response, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Files up to this size are read in one go. Bigger ones are streamed.
 ///
@@ -26,24 +25,28 @@ const INLINE_LIMIT: u64 = 64 * 1024;
 /// cost of that is not subtle: it was the difference between finishing a large
 /// download and not finishing one at all while other clients waited.
 ///
-/// 64 KiB rather than something larger because this is per in-flight response,
-/// and a gateway serving a thousand of them should not be holding sixty
-/// megabytes of read buffer. It is deliberately the same number as
-/// [`INLINE_LIMIT`]: below that a file is read whole, above it the file is read
-/// in pieces of exactly that size.
-const CHUNK: usize = INLINE_LIMIT as usize;
+/// Keep this independent of the inline threshold: tuning streamed reads must
+/// not silently increase the maximum size of an entirely buffered response.
+const CHUNK: usize = 64 * 1024;
 
 /// One opened representation owns both the metadata and the eventual reader.
 /// A path replacement after opening cannot select another file for its body.
 pub struct OpenedFile {
-    file: tokio::fs::File,
+    file: std::fs::File,
     metadata: std::fs::Metadata,
 }
 
 impl OpenedFile {
     pub async fn open(path: &Path) -> Result<Self, std::io::Error> {
-        let file = tokio::fs::File::open(path).await?;
-        let metadata = file.metadata().await?;
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || Self::open_blocking(&path))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
+    pub(crate) fn open_blocking(path: &Path) -> Result<Self, std::io::Error> {
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -213,20 +216,41 @@ pub async fn deliver(
     }
 
     let mut file = opened.file;
-    if start > 0 {
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-    }
-
     if length <= INLINE_LIMIT {
-        let mut buffer = Vec::with_capacity(length as usize);
-        crate::file_body::ExactReader::new(file, length)
-            .read_to_end(&mut buffer)
-            .await?;
+        // One owned, bounded read, including positioning. Avoid Tokio File's
+        // intermediate buffer and separate blocking jobs for seek and read.
+        let buffer = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek};
+            if start > 0 {
+                file.seek(std::io::SeekFrom::Start(start))?;
+            }
+            let mut buffer = Vec::with_capacity(length as usize);
+            file.take(length).read_to_end(&mut buffer)?;
+            if buffer.len() as u64 != length {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file ended before its selected length",
+                ));
+            }
+            Ok(buffer)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         response.body(ResBody::Once(buffer.into()));
         return Ok(());
     }
 
-    // Streamed: the memory this costs is one buffer, whatever the file weighs.
+    if start > 0 {
+        file = tokio::task::spawn_blocking(move || {
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(start))?;
+            Ok::<_, std::io::Error>(file)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+    }
+    let file = tokio::fs::File::from_std(file);
+    // Streamed: bounded read buffers, independent of the selected file length.
     let stream =
         tokio_util::io::ReaderStream::with_capacity(crate::file_body::ExactReader::new(file, length), CHUNK);
     let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
@@ -452,6 +476,66 @@ mod tests {
             ResBody::None => Vec::new(),
             other => other.collect().await.map(|got| got.to_bytes().to_vec()).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn range_delivery_preserves_bytes_at_inline_boundary_and_nonzero_offsets() {
+        let original: Vec<u8> = (0..(1024 * 1024 + 70 * 1024)).map(|n| (n % 251) as u8).collect();
+        let path = write("boundary-offset", &original).await;
+        for start in [0, 1024 * 1024 + 13] {
+            for length in [INLINE_LIMIT, INLINE_LIMIT + 1024] {
+                let wanted = Wanted::Part {
+                    start,
+                    end: start + length - 1,
+                };
+                let mut response = Response::new();
+                deliver(&mut response, &path, original.len() as u64, wanted)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status_code, Some(StatusCode::PARTIAL_CONTENT));
+                assert_eq!(
+                    response.headers()[http::header::CONTENT_LENGTH],
+                    length.to_string()
+                );
+                assert_eq!(
+                    matches!(response.body_mut(), ResBody::Once(_)),
+                    length <= INLINE_LIMIT
+                );
+                assert_eq!(
+                    body_of(&mut response).await,
+                    original[start as usize..(start + length) as usize]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_read_does_not_include_bytes_appended_after_metadata() {
+        let path = write("inline-growth", b"original").await;
+        let opened = OpenedFile::open(&path).await.unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"new tail")
+            .unwrap();
+        let mut response = Response::new();
+        super::deliver(&mut response, opened, Wanted::Whole)
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "8");
+        assert_eq!(body_of(&mut response).await, b"original");
+    }
+
+    #[tokio::test]
+    async fn empty_file_delivers_an_empty_inline_body() {
+        let path = write("empty-inline", b"").await;
+        let mut response = Response::new();
+        deliver(&mut response, &path, 0, Wanted::Whole).await.unwrap();
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "0");
+        assert!(matches!(response.body_mut(), ResBody::Once(_)));
+        assert!(body_of(&mut response).await.is_empty());
     }
 
     #[tokio::test]

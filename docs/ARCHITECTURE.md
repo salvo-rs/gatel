@@ -1198,6 +1198,15 @@ Body delivery consumes the same owner instead of reopening its pathname. A
 deployment that replaces the directory entry cannot switch the response body to
 the replacement after its validators have been chosen.
 
+Each request resolves its path, opens the identity file, reads its handle
+metadata and discovers precompressed siblings in one blocking task. These
+filesystem calls do not run on an async request worker. A response of at most
+64 KiB uses a separate bounded blocking read directly into its outgoing buffer;
+nonzero range positioning is part of that same task. Larger responses retain
+the streamed reader. The inline threshold and stream chunk size are independent
+constants, currently both 64 KiB. Cancellation drops the task's eventual owned
+result; it does not assume a started blocking filesystem operation can be aborted.
+
 An exact-length reader bounds growth and reports premature EOF as an error for
 both buffered and streaming bodies. This prevents a truncated stream from looking
 like a successfully completed cache fill. A read failure before body delivery
