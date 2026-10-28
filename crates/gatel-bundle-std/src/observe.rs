@@ -123,7 +123,7 @@ pub struct Health;
 
 impl Directive for Health {
     fn meta(&self) -> &DirectiveMeta {
-        static META: DirectiveMeta = DirectiveMeta::terminal("health");
+        static META: DirectiveMeta = DirectiveMeta::terminal("health").with_version("2");
         &META
     }
 
@@ -177,6 +177,9 @@ impl Handler for HealthHandler {
         // probe at all.
         response
             .add_header(http::header::CACHE_CONTROL, "no-store", true)
+            .ok();
+        response
+            .add_header("x-gatel-health", self.probe.as_str(), true)
             .ok();
 
         match self.probe {

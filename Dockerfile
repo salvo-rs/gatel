@@ -54,10 +54,10 @@ USER 65532:65532
 
 EXPOSE 8080 8443
 
-# `validate` exits non-zero on a configuration the gateway would refuse, and
-# binds nothing, so it is safe to run against a live container.
+# Configure /readyz with `health "ready"` on the local HTTP listener.
+# Query the serving runtime, including when a rejected edit leaves it degraded.
 HEALTHCHECK --interval=30s --timeout=3s \
-    CMD ["/usr/local/bin/gatel", "validate", "/etc/gatel/gatel.kdl"]
+    CMD ["/usr/local/bin/gatel", "probe"]
 
 ENTRYPOINT ["/usr/local/bin/gatel"]
 CMD ["run", "/etc/gatel/gatel.kdl"]

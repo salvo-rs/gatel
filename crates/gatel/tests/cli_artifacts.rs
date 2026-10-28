@@ -24,6 +24,7 @@ fn every_supported_shell_has_current_commands_and_run_flags() {
         for name in [
             "gatel",
             "validate",
+            "probe",
             "fmt",
             "explain",
             "capabilities",
@@ -52,6 +53,7 @@ fn root_and_subcommand_manuals_follow_actual_parser() {
         "passwd",
         "precompress",
         "validate",
+        "probe",
         "fmt",
         "explain",
         "diff",

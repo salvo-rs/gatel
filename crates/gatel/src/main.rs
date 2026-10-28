@@ -17,6 +17,7 @@ mod file_sources;
 mod passwd;
 mod plugins;
 mod precompress;
+mod probe;
 mod serve;
 mod trust;
 mod watch;
@@ -106,6 +107,8 @@ enum Command {
         #[arg(long = "source", value_name = "NAME=PATH")]
         sources: Vec<file_sources::NamedFile>,
     },
+    /// Query a running local health endpoint, without reading configuration.
+    Probe(probe::Options),
     /// Print what a configuration compiles to, in execution order.
     Explain {
         #[arg(default_value = "gatel.kdl")]
@@ -210,6 +213,7 @@ fn main() -> ExitCode {
             dry_run,
         ),
         Command::Validate { config, sources } => validate(config, sources),
+        Command::Probe(options) => probe::run(options),
         Command::Explain { config, sources } => explain(config, sources),
         Command::Diff {
             before,

@@ -288,12 +288,13 @@ jobs:
           mkdir -p /tmp/conf
           cat > /tmp/conf/gatel.kdl <<'KDL'
           global { http ":8080" }
-          site "*" { route "/" { respond "ok" } }
+          site "*" { route "/" { respond "ok" }; route "/readyz" { health "ready"; } }
           KDL
           docker run -d --name gatel-ci -p 18080:8080 \
             -v /tmp/conf:/etc/gatel:ro gatel:ci
           for _ in $(seq 30); do
             if curl -fsS http://127.0.0.1:18080/ | grep -q ok; then
+              docker exec gatel-ci /usr/local/bin/gatel probe
               docker rm -f gatel-ci
               exit 0
             fi

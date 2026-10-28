@@ -2,6 +2,36 @@
 
 命令结构以 `crates/gatel/src/main.rs` 的 Clap 定义为唯一来源。`--help`、Shell 补全和 roff 手册使用同一命令树；它们描述当前 v2，不包含尚未恢复的旧命令。帮助/补全/手册生成不读取配置、不绑定端口、不修改信任库，也不自动安装生成物。`serve` 则会实际启动 HTTP 监听，见下文。
 
+## 运行时健康探测
+
+```kdl
+global { http "127.0.0.1:8080"; }
+site "*" {
+    route "/readyz" { health "ready"; }
+    route "/livez" { health "live"; }
+}
+```
+
+```sh
+gatel probe
+gatel probe --address 127.0.0.1:8080 --host localhost --path /livez --kind live --timeout-ms 2000
+```
+
+`probe` 不读取 KDL，也不创建端口；它请求显式配置的本地明文 HTTP 健康路由。
+网络目标必须为 loopback IP 和非零端口；`--host` 仅选择站点，不参与 DNS 或目标地址解析。
+连接、写入和响应头共用一个期限（默认 2 秒，上限 60 秒），响应头最多 8 KiB，不跟随重定向。
+只有 200 且带对应 `health` 终端标识的响应才返回 0；未就绪、不响应、错误路由和连接失败返回 3，
+参数错误返回 2。成功只输出 `ready` 或 `live`，不输出服务器诊断正文。
+
+readiness 在拒绝热更新但旧代继续服务、或所有上游不可用时仍允许流量并报告 degraded；
+启动未完成、排空及本地持久化状态未知则拒绝 readiness。liveness 检查运行时是否还能回答，
+不会因上游故障建议重启。`validate` 继续用于部署前的磁盘配置检查。
+
+容器内置 HEALTHCHECK 运行 `gatel probe`，因此挂载的配置需在 HTTP 8080 上提供 `/readyz`。
+监听地址、端口、Host 或路径不同的部署须覆盖 `--health-cmd`，例如
+`/usr/local/bin/gatel probe --address 127.0.0.1:8081 --host gateway.internal --path /health/ready`。
+TLS-only 部署可显式配置独立 loopback HTTP 健康监听；该命令不替操作者开放诊断端口。
+
 ## 热更新时排空旧连接
 
 ```kdl
