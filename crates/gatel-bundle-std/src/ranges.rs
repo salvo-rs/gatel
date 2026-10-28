@@ -21,16 +21,9 @@ const INLINE_LIMIT: u64 = 64 * 1024;
 
 /// How much is read from disk at a time once a file is streamed.
 ///
-/// `ReaderStream`'s own default is 4 KiB, which turns a 10 MiB file into two
-/// and a half thousand frames — a read, an allocation and a write apiece. The
-/// cost of that is not subtle: it was the difference between finishing a large
-/// download and not finishing one at all while other clients waited.
-///
-/// 64 KiB rather than something larger because this is per in-flight response,
-/// and a gateway serving a thousand of them should not be holding sixty
-/// megabytes of read buffer. It is deliberately the same number as
-/// [`INLINE_LIMIT`]: below that a file is read whole, above it the file is read
-/// in pieces of exactly that size.
+/// Bound each read and outgoing frame to 64 KiB. The body schedules one read
+/// when polled; consumers may retain previously delivered frames. Buffer reuse
+/// does not change this frame limit or the eager-response threshold.
 const CHUNK: usize = INLINE_LIMIT as usize;
 
 /// One opened representation owns both the metadata and the eventual reader.

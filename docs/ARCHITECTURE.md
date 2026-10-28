@@ -1201,9 +1201,20 @@ the replacement after its validators have been chosen.
 Responses of at most 64 KiB starting at offset zero transfer the already-opened
 idle Tokio file to a standard file handle. One blocking task reads exactly the
 selected length into the outgoing buffer, avoiding a separate file read buffer.
-This does not reopen the pathname. Nonzero ranges retain the Tokio seek/read
-path. Larger responses retain the Tokio reader and 64 KiB response chunks; the
-eager limit is unchanged.
+This does not reopen the pathname. Small responses at nonzero offsets retain
+the Tokio seek/read path. Larger responses complete any seek on the Tokio
+handle, then transfer it to a demand-driven body with one blocking read in
+flight and at most 64 KiB per outgoing frame. The selected length and remaining
+size hint bound every read; the eager limit is unchanged.
+
+Direct reads of 32–64 KiB use initialized buffers from two process-wide size
+classes, 32 and 64 KiB. Each outgoing `Bytes` owns a lease until its last clone
+is released, including clones retained by cache or transport consumers. Only
+the newly read prefix is exposed. Pool acquisition and return use `try_lock`;
+contention falls back to allocation or releases the buffer. Each class retains
+at most 32 idle buffers (3 MiB total). Live frames and cached bodies hold their
+own leases outside this idle bound, and a short frame can retain a full size
+class. Reads below 32 KiB keep the existing exact-prefix allocation path.
 Cancellation does not assume a started blocking read can be aborted.
 
 An exact-length reader bounds growth and reports premature EOF as an error for
