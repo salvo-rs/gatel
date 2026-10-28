@@ -56,7 +56,7 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(20), verify())
+            tokio::time::timeout(std::time::Duration::from_secs(60), verify())
                 .await
                 .unwrap();
         });
@@ -80,7 +80,7 @@ async fn verify() {
     let config = |program: &str| {
         format!(
             r#"global {{ http "127.0.0.1:{port}"; }}
-site "*" {{ route "/*" {{ cgi "{program}" root="." script="app.marker" script-name="/app" concurrency=1 process-limit=2 timeout=1; }} }}"#
+site "*" {{ route "/*" {{ cgi "{program}" root="." script="app.marker" script-name="/app" concurrency=1 process-limit=2 timeout=5; }} }}"#
         )
     };
     let result = gateway.apply(&config(&executable)).await;
@@ -101,7 +101,24 @@ site "*" {{ route "/*" {{ cgi "{program}" root="." script="app.marker" script-na
     .into_iter()
     .enumerate()
     {
-        let response = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        // Successful cases include cold Windows process creation and, for the
+        // Job limit case, a second spawn. Give those their own startup budget;
+        // keep the deliberate hanging case on the original one-second limit.
+        // Reusing the route also keeps cleanup/admission shared across reloads.
+        if index == 6 || index == 7 {
+            let config = config(&executable);
+            let config = if index == 6 {
+                config.replace("timeout=5", "timeout=1")
+            } else {
+                config
+            };
+            let outcome = gateway.apply(&config).await;
+            assert!(
+                matches!(outcome, gatel_plan::Outcome::Reloaded { .. }),
+                "{outcome:?}"
+            );
+        }
+        let response = tokio::time::timeout(std::time::Duration::from_secs(8), async {
             loop {
                 let response = request(gateway.address(), &format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())).await;
                 // Timeout can return before process cleanup: admission must
