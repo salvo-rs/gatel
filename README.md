@@ -141,6 +141,23 @@ Available host features are `maintenance`, `fastcgi`, `scgi`, `cgi`, `decode`,
 test suite, use `cargo test --workspace --all-features --all-targets --locked`.
 Explicitly ignored interoperability and soak tests require separate execution.
 
+## Release planning
+
+`cargo run -p xtask --locked -- publish-plan` prints the complete crates.io
+publication order, one package per line; `publish-plan --json` includes versions
+and manifests. Cargo metadata supplies the graph, including optional,
+platform-specific, build and versioned development dependencies. Packages with
+`publish = false` or a different registry policy are excluded; missing or
+unpublishable prerequisites and cycles fail before any upload. The release
+workflow consumes this plan instead of maintaining a second package list.
+
+`cargo package --workspace --exclude xtask --all-features --locked` checks the
+source archives and builds their extracted contents without uploading anything.
+Use `--allow-dirty` only for local checks of uncommitted work. Packaging multiple
+workspace members lets Cargo resolve their not-yet-published versions together;
+it does not prove registry credentials or permission to publish. The xtask tests
+also package and compile a small isolated workspace with no external dependencies.
+
 ## Layout
 
 ```

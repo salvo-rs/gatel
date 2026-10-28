@@ -1,6 +1,6 @@
 //! Repository checks that `cargo` cannot express.
 //!
-//! Four rules, all from the architecture rather than from taste:
+//! Repository rules, all from the architecture rather than from taste:
 //!
 //! - A crate may only depend on the layers below it. The layering is what makes "the compiler cannot touch a
 //!   socket" a fact rather than a convention.
@@ -18,6 +18,7 @@ use std::process::ExitCode;
 
 mod dependencies;
 mod layers;
+mod publish;
 use layers::ALLOWED;
 
 const TARGET_LINES: usize = 600;
@@ -34,6 +35,9 @@ fn main() -> ExitCode {
     };
 
     let task = std::env::args().nth(1).unwrap_or_else(|| "check".to_string());
+    if task == "publish-plan" {
+        return publish::run(&root, &std::env::args().skip(2).collect::<Vec<_>>());
+    }
     let failures = match task.as_str() {
         "deps" => check_dependencies(&root),
         "loc" => check_file_sizes(&root),
@@ -47,7 +51,9 @@ fn main() -> ExitCode {
             failures
         }
         other => {
-            eprintln!("xtask: unknown task `{other}`; try deps, loc, events, inert or check");
+            eprintln!(
+                "xtask: unknown task `{other}`; try deps, loc, events, inert, check or publish-plan"
+            );
             return ExitCode::from(2);
         }
     };
