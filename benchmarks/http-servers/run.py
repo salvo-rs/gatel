@@ -53,7 +53,7 @@ SCENARIOS = {
         "path": "/payload-4k.txt",
     },
     "static-1m": {
-        "description": "Static file serving — 1 MiB binary (chunked streaming).",
+        "description": "Static file serving — 1 MiB binary (streamed body).",
         "service": "{target}-static",
         "path": "/payload-1m.bin",
     },

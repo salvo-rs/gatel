@@ -20,11 +20,14 @@ slower than it was, and for noticing when it is wildly out of line with the
 other two. It is not a claim about anybody else's deployment, and nothing in
 this repository quotes a number from it.
 
-It is deliberately not in CI. A shared runner's throughput moves by tens of
+Performance comparisons and throughput thresholds are deliberately not CI
+gates. A shared runner's throughput moves by tens of
 percent between runs for reasons that have nothing to do with the commit, so a
 threshold there would either never fire or fire constantly — and both teach
 people to ignore it. Run this on a machine that is otherwise idle, twice, and
-believe it only if the two runs agree.
+believe it only if the two runs agree. CI runs only harness regressions and a
+short nginx/Caddy smoke check of payloads, range controls and result parsing;
+it does not compare performance numbers against a threshold.
 
 The gateway is built from the repository's own `Dockerfile` — the image that
 would actually be published — rather than from a benchmark-only build. Measuring
@@ -70,6 +73,9 @@ Results land in `target/benchmarks/http-servers/<timestamp>/`:
 Each completed round is saved immediately. Reported p90/p99 values are means
 of the individual rounds' percentiles, not percentiles of pooled requests.
 Warmup uses the measured concurrency and Range script, including nonzero offsets.
+Ratios are `N/A` when Gatel is not among the measured targets. These small
+fixtures fit in memory, and preflight checks read them before load, so the
+comparison exercises warm files rather than cold-storage latency.
 
 ## Scenarios
 
