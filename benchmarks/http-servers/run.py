@@ -192,12 +192,18 @@ def compose(*args: str, check: bool = True, capture_output: bool = False):
 # ------------------------------------------------------------------- parsing
 
 
+TIME_UNIT = r"us|ms|s|m|h"
+TIME_VALUE = rf"[0-9.]+(?:{TIME_UNIT})"
+
+
 def to_milliseconds(value: str) -> float:
-    match = re.fullmatch(r"([0-9.]+)(us|ms|s)", value.strip())
+    match = re.fullmatch(rf"([0-9.]+)({TIME_UNIT})", value.strip())
     if not match:
         raise ValueError(f"unrecognized latency value: {value!r}")
     amount = float(match.group(1))
-    return {"us": amount / 1000.0, "ms": amount, "s": amount * 1000.0}[match.group(2)]
+    if match.group(2) == "us":
+        return amount / 1000.0
+    return amount * {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}[match.group(2)]
 
 
 def to_bytes(value: str) -> float:
@@ -218,18 +224,18 @@ def parse_wrk_output(scenario: str, target: str, round_id: int, text: str) -> Be
         return match
 
     latency = need(
-        r"Latency\s+([0-9.]+(?:us|ms|s))\s+([0-9.]+(?:us|ms|s))\s+([0-9.]+(?:us|ms|s))",
+        rf"Latency\s+({TIME_VALUE})\s+({TIME_VALUE})\s+({TIME_VALUE})",
         "the latency line",
     )
     requests = need(
-        r"(\d+)\s+requests in\s+([0-9.]+)s,\s+([0-9.]+(?:B|KB|MB|GB|TB))\s+read",
+        rf"(\d+)\s+requests in\s+({TIME_VALUE}),\s+([0-9.]+(?:B|KB|MB|GB|TB))\s+read",
         "the request summary",
     )
     per_second = need(r"Requests/sec:\s+([0-9.]+)", "throughput")
     transfer = need(r"Transfer/sec:\s+([0-9.]+(?:B|KB|MB|GB|TB))", "transfer rate")
 
     def percentile(name: str) -> float:
-        return to_milliseconds(need(rf"{name}%\s+([0-9.]+(?:us|ms|s))", f"the {name}th percentile").group(1))
+        return to_milliseconds(need(rf"{name}%\s+({TIME_VALUE})", f"the {name}th percentile").group(1))
 
     non_2xx = re.search(r"Non-2xx or 3xx responses:\s+(\d+)", text)
     sockets = re.search(
@@ -251,7 +257,7 @@ def parse_wrk_output(scenario: str, target: str, round_id: int, text: str) -> Be
         p90_ms=percentile("90"),
         p99_ms=percentile("99"),
         total_requests=int(requests.group(1)),
-        duration_seconds=float(requests.group(2)),
+        duration_seconds=to_milliseconds(requests.group(2)) / 1000.0,
         total_read_bytes=to_bytes(requests.group(3)),
         non_2xx_3xx=int(non_2xx.group(1)) if non_2xx else 0,
         socket_errors=sum(int(value) for value in sockets.groups()) if sockets else 0,

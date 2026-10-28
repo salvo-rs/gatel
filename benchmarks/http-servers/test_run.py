@@ -40,6 +40,28 @@ Transfer/sec: 255.75KB
         with self.assertRaises(RuntimeError):
             bench.parse_wrk_output("proxy", "gatel", 1, raw.replace("Requests/sec:", "Missing:"))
 
+    def test_wrk_minutes_and_hours_keep_duration_and_tail_units(self):
+        raw = """Latency 410.75ms 147.85ms 1.36s 71.31%
+  50% 435.66ms
+  75% 508.69ms
+  90% 559.81ms
+  99% 789.83ms
+16549 requests in 1.00m, 162.33GB read
+Requests/sec: 275.38
+Transfer/sec: 2.70GB
+"""
+        minute = bench.parse_wrk_output("static-10m", "gatel", 1, raw)
+        self.assertEqual(minute.duration_seconds, 60)
+        self.assertEqual(minute.total_requests, 16549)
+        self.assertEqual(minute.p99_ms, 789.83)
+        hour = bench.parse_wrk_output(
+            "static-10m", "gatel", 1,
+            raw.replace("1.00m,", "1.50h,").replace("1.36s", "1.36h").replace("789.83ms", "1.00m"),
+        )
+        self.assertEqual(hour.duration_seconds, 5400)
+        self.assertEqual(hour.latency_max_ms, 1.36 * 3600000)
+        self.assertEqual(hour.p99_ms, 60000)
+
     def test_preflight_rejects_wrong_range_encoding_status_and_bytes(self):
         payload = b"0123456789"
         config = {"path": "/file.bin", "range": (2, 5)}
