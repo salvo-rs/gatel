@@ -419,6 +419,7 @@ impl App {
                 .runtime
                 .upstreams
                 .tls_material_changed(self.root_directory())
+                || current.runtime.server_tls.changed()
                 || current.runtime.secrets.changed(self.root_directory())
         });
         let build =
@@ -639,6 +640,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "app_log_shutdown_tests.rs"]
 mod log_shutdown_tests;
+
+#[cfg(test)]
+#[path = "app_server_tls_tests.rs"]
+mod server_tls_tests;
 
 #[cfg(test)]
 #[path = "app_submission_tests.rs"]

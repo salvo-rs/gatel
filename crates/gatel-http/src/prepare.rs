@@ -85,6 +85,8 @@ pub struct Runtime {
     certificate_change: gatel_tls::store::CertificateUpdates,
     state_change: gatel_state::registry::StateUpdate,
     pub secrets: Arc<gatel_plan::SecretDependencies>,
+    /// Exact manual server identity and inbound client-CA observations.
+    pub server_tls: Arc<gatel_tls::ServerMaterial>,
     blocking_change: Option<gatel_plan::blocking::PreparedChange>,
     pub plugin_tasks: crate::plugin_tasks::PluginTasks,
     pub listeners: BTreeMap<SocketAddr, Arc<ListenerRuntime>>,
@@ -213,12 +215,13 @@ pub fn prepare(
     let internal_ca_directory = resources.internal_ca.clone();
     let internal = move || InternalCa::load_or_create(&internal_ca_directory).map(Arc::new);
 
+    let server_tls = Arc::new(gatel_tls::ServerMaterial::default());
     let mut listeners = BTreeMap::new();
     for listener_plan in &plan.listeners {
         let listener_metrics = resources.telemetry.metrics.listener(&listener_plan.listener.name);
         // Certificates load here, so a bad one stops the reload rather than
         // breaking the first handshake after it.
-        let tls = gatel_tls::prepare_listener(
+        let tls = gatel_tls::prepare_listener_observed(
             listener_plan,
             plan.spec.global.acme.as_ref(),
             &TlsPreparation {
@@ -228,6 +231,7 @@ pub fn prepare(
                 acme: resources.acme,
                 root: resources.root,
             },
+            &server_tls,
         )?;
 
         let mut sites = Vec::with_capacity(listener_plan.sites.len());
@@ -309,6 +313,7 @@ pub fn prepare(
         state_change: state_owner.update_from(&staged_state),
         blocking_change,
         secrets: Arc::clone(&plugins.secrets),
+        server_tls,
         plugin_tasks: plugins.tasks(resources)?,
         listeners,
         upstreams,

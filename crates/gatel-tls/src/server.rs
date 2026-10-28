@@ -57,6 +57,26 @@ pub fn prepare_listener(
     acme_config: Option<&gatel_plan::Acme>,
     preparation: &TlsPreparation<'_>,
 ) -> Result<Option<Arc<ServerConfig>>, String> {
+    prepare(listener, acme_config, preparation, None)
+}
+
+/// Prepare TLS while recording exactly the manual identity and client-CA bytes
+/// consumed, so a host can refresh unchanged configuration after file rotation.
+pub fn prepare_listener_observed(
+    listener: &ListenerPlan,
+    acme_config: Option<&gatel_plan::Acme>,
+    preparation: &TlsPreparation<'_>,
+    material: &crate::ServerMaterial,
+) -> Result<Option<Arc<ServerConfig>>, String> {
+    prepare(listener, acme_config, preparation, Some(material))
+}
+
+fn prepare(
+    listener: &ListenerPlan,
+    acme_config: Option<&gatel_plan::Acme>,
+    preparation: &TlsPreparation<'_>,
+    material: Option<&crate::ServerMaterial>,
+) -> Result<Option<Arc<ServerConfig>>, String> {
     if !listener.listener.protocol.is_tls() {
         return Ok(None);
     }
@@ -74,7 +94,14 @@ pub fn prepare_listener(
                 listener.listener.name
             ));
         };
-        load_certificate(site.id.clone(), &site.host, tls, acme_config, preparation)?;
+        load_certificate(
+            site.id.clone(),
+            &site.host,
+            tls,
+            acme_config,
+            preparation,
+            material,
+        )?;
         sites.push((site.host.clone(), site.id.clone()));
 
         if let Some(auth) = &tls.client_auth {
@@ -103,7 +130,7 @@ pub fn prepare_listener(
     let mut config = match client_auth {
         None => builder.with_no_client_auth().with_cert_resolver(resolver),
         Some((_, ca, required)) => {
-            let roots = load_roots(&ca, preparation.root)?;
+            let roots = load_roots(&ca, preparation.root, material)?;
             let verifier = if required {
                 WebPkiClientVerifier::builder(Arc::new(roots))
             } else {
@@ -131,6 +158,7 @@ fn load_certificate(
     tls: &SiteTls,
     acme_config: Option<&gatel_plan::Acme>,
     preparation: &TlsPreparation<'_>,
+    material: Option<&crate::ServerMaterial>,
 ) -> Result<(), String> {
     if let Some(updates) = preparation.updates {
         let identity = match &tls.source {
@@ -162,8 +190,15 @@ fn load_certificate(
         CertificateSource::Manual { cert, key } => {
             let cert_path = cert.resolve_path(preparation.root)?;
             let key_path = key.resolve_path(preparation.root)?;
-            let certificate = Certificate::from_pem_files(&cert_path, &key_path)
-                .map_err(|error| format!("site `{}`: {error}", host.describe()))?;
+            let certificate = (|| match material {
+                Some(material) => {
+                    let chain = material.read(&cert_path, crate::certificate::Secrecy::Public)?;
+                    let key = material.read(&key_path, crate::certificate::Secrecy::Private)?;
+                    Certificate::from_pem(&chain, &key, &crate::certificate::describe(&cert_path))
+                }
+                None => Certificate::from_pem_files(&cert_path, &key_path),
+            })()
+            .map_err(|error| format!("site `{}`: {error}", host.describe()))?;
             if preparation.put(site, certificate, false) {
                 tracing::info!(
                     target: "gatel::certificate",
@@ -248,9 +283,16 @@ fn load_certificate(
     Ok(())
 }
 
-fn load_roots(ca: &SecretRef, root: &Path) -> Result<rustls::RootCertStore, String> {
+fn load_roots(
+    ca: &SecretRef,
+    root: &Path,
+    material: Option<&crate::ServerMaterial>,
+) -> Result<rustls::RootCertStore, String> {
     let path = ca.resolve_path(root)?;
-    let bytes = std::fs::read(&path).map_err(|error| format!("cannot read the client CA: {error}"))?;
+    let bytes = match material {
+        Some(material) => material.read(&path, crate::certificate::Secrecy::Public)?,
+        None => crate::certificate::read_bounded(&path, crate::certificate::Secrecy::Public)?,
+    };
     let certificates = crate::certificate::read_chain(&bytes, "client CA")?;
     let mut roots = rustls::RootCertStore::empty();
     for certificate in certificates {

@@ -108,7 +108,7 @@ pub(crate) enum Secrecy {
     Private,
 }
 
-fn read_bounded(path: &Path, secrecy: Secrecy) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(path: &Path, secrecy: Secrecy) -> Result<Vec<u8>, String> {
     read_optional(path, secrecy)?.ok_or_else(|| format!("cannot read `{}`: file not found", describe(path)))
 }
 
@@ -175,7 +175,7 @@ fn check_permissions(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), 
     Ok(())
 }
 
-fn describe(path: &Path) -> String {
+pub(crate) fn describe(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
