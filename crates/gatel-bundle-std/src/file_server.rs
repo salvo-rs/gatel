@@ -571,6 +571,7 @@ mod tests {
     /// A context with nothing in it, for a directive that needs nothing.
     fn empty_context() -> gatel_plan::BuildContext<'static> {
         gatel_plan::BuildContext {
+            log_sinks: None,
             secrets: Default::default(),
             blocking: gatel_plan::blocking::Executor::process_default(),
             telemetry: crate::testing::telemetry(),
@@ -899,6 +900,7 @@ mod tests {
         assert!(
             config
                 .build(gatel_plan::BuildContext {
+                    log_sinks: None,
                     secrets: Default::default(),
                     blocking: gatel_plan::blocking::Executor::process_default(),
                     root: &directory,

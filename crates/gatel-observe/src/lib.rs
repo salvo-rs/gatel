@@ -20,6 +20,8 @@ pub mod metrics;
 pub mod render;
 pub mod series;
 pub mod sink;
+mod sink_io;
+mod sink_policy;
 pub mod workers;
 
 use std::sync::Arc;
@@ -37,13 +39,27 @@ pub use sink::{Rotate, Sink, Sinks};
 /// One value rather than three arguments, because what records something
 /// usually records more than one kind: a probe round moves a gauge *and*
 /// changes what readiness says.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Telemetry {
     pub workers: workers::Workers,
     pub metrics: Metrics,
     pub health: Health,
     /// Open log destinations, shared across generations the way sockets are.
     pub sinks: Sinks,
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        let sinks = Sinks::new();
+        let health = Health::new();
+        health.set_log_status(Arc::new(sinks.clone()));
+        Self {
+            workers: Default::default(),
+            metrics: Default::default(),
+            health,
+            sinks,
+        }
+    }
 }
 
 impl Telemetry {

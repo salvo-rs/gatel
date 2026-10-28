@@ -65,6 +65,31 @@ fn sinks(telemetry: &Telemetry, out: &mut String) {
         "Log lines a full queue could not take. A request is never delayed for one.",
         "counter",
     );
+    for (name, help, kind) in [
+        (
+            "gatel_log_write_errors_total",
+            "Log line write failures, separate from queue drops.",
+            "counter",
+        ),
+        ("gatel_log_flush_errors_total", "Log flush failures.", "counter"),
+        (
+            "gatel_log_rotation_errors_total",
+            "Log rotation failures.",
+            "counter",
+        ),
+        (
+            "gatel_log_last_success_timestamp_seconds",
+            "Most recent successful log line write; zero before the first.",
+            "gauge",
+        ),
+        (
+            "gatel_log_io_failed",
+            "Whether this sink currently has an unrecovered I/O failure.",
+            "gauge",
+        ),
+    ] {
+        family(out, name, help, kind);
+    }
     for sink in telemetry.sinks.snapshot() {
         point(
             out,
@@ -74,6 +99,15 @@ fn sinks(telemetry: &Telemetry, out: &mut String) {
             &[],
             sink.dropped(),
         );
+        for (name, value) in [
+            ("gatel_log_write_errors_total", sink.write_errors()),
+            ("gatel_log_flush_errors_total", sink.flush_errors()),
+            ("gatel_log_rotation_errors_total", sink.rotation_errors()),
+            ("gatel_log_last_success_timestamp_seconds", sink.last_success()),
+            ("gatel_log_io_failed", u64::from(sink.io_failed())),
+        ] {
+            point(out, name, SINK, &vec![sink.name().to_string()], &[], value);
+        }
     }
 }
 
@@ -485,7 +519,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("gatel_health_reason{"))
                 .count(),
-            7
+            crate::health::Reason::CODES.len()
         );
         assert!(!failed.contains("private-config-value"));
     }

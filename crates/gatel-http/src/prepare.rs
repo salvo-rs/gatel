@@ -80,6 +80,7 @@ impl std::fmt::Debug for ListenerRuntime {
 /// Everything one generation needs to serve traffic.
 #[derive(Debug)]
 pub struct Runtime {
+    sink_change: gatel_observe::sink::SinkUpdate,
     certificate_change: gatel_tls::store::CertificateUpdates,
     state_change: gatel_state::registry::StateUpdate,
     pub secrets: Arc<gatel_plan::SecretDependencies>,
@@ -106,6 +107,7 @@ impl Runtime {
 }
 
 pub struct RuntimePublication<'a> {
+    sinks: gatel_observe::sink::SinkPublication<'a>,
     certificates: gatel_tls::store::CertificatePublication<'a>,
     state: gatel_state::registry::StatePublication<'a>,
     blocking: Option<gatel_plan::blocking::Publication<'a>>,
@@ -118,6 +120,7 @@ impl gatel_plan::publication::PublishGuard for RuntimePublication<'_> {
         // candidate must not stage/publish newer state and then have an older
         // publication overwrite its pool policies.
         self.upstreams.adopt_policies();
+        self.sinks.publish();
         self.certificates.publish();
         self.state.publish();
         if let Some(blocking) = self.blocking {
@@ -134,6 +137,7 @@ impl gatel_plan::publication::PublishRuntime for Runtime {
     }
     fn begin_publication(&self) -> Self::Guard<'_> {
         RuntimePublication {
+            sinks: self.sink_change.begin(),
             state: self.state_change.begin(),
             certificates: self.certificate_change.begin(),
             blocking: self
@@ -185,7 +189,8 @@ pub fn prepare(
     // built with. It is a generation's worth of backends, so a directive holds
     // the set its own generation had rather than whatever is current later.
     let reachable: gatel_plan::SharedUpstreams = Arc::clone(&upstreams) as _;
-    let plugins = crate::plugin_prepare::PreparedPlugins::prepare(plan, resources, &reachable)?;
+    let sinks = resources.telemetry.sinks.stage();
+    let plugins = crate::plugin_prepare::PreparedPlugins::prepare(plan, resources, &reachable, &sinks)?;
     for (id, resolution) in &resolutions {
         if !resolution.all_reused() {
             tracing::debug!(
@@ -293,6 +298,7 @@ pub fn prepare(
             .flat_map(|listener| listener.sites.iter().map(|site| site.id.clone())),
     );
     Ok(Arc::new(Runtime {
+        sink_change: sinks.finish(),
         certificate_change,
         state_change: state_owner.update_from(&staged_state),
         blocking_change,

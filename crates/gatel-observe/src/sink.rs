@@ -1,62 +1,40 @@
-//! Where a log line goes.
-//!
-//! An open file is a process resource, like a socket: two generations that both
-//! log to the same path must share one appender, or they would interleave
-//! half-written lines and rotate out from under each other. So sinks live in a
-//! table keyed by path, and a reload that keeps a destination keeps the handle,
-//! the file and the rotation state.
-//!
-//! Writing happens on a thread of its own, behind a bounded queue. Nothing on
-//! the request path may block on a disk — a gateway that stops serving because
-//! a log volume is slow is worse than one that serves without a log line — so a
-//! full queue drops, and says how often it had to.
-
+//! Process-owned log writers with bounded request-side queues.
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::instrument::Counter;
+use crate::sink_io::{IoStats, Operation};
+pub use crate::sink_policy::{SinkPublication, SinkUpdate, StagedSinks};
 
-/// How many lines may be waiting to be written.
-///
-/// Enough to ride out a slow flush at a few thousand requests a second, small
-/// enough that the memory is bounded and obvious.
 const QUEUE: usize = 8192;
-
-/// How long the writer waits for more before flushing what it has.
 const FLUSH_AFTER: Duration = Duration::from_millis(200);
 
-/// When to start a new file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rotate {
-    /// Bytes, or zero for never — which means something else is managing the
-    /// file, and an operator has said so rather than found out later.
     pub size: u64,
-    /// How many previous files to keep, `access.log.1` through `.keep`.
     pub keep: usize,
 }
-
 impl Rotate {
     pub const NEVER: Self = Self { size: 0, keep: 0 };
 }
 
-/// Somewhere lines are written.
 #[derive(Debug)]
 pub struct Sink {
     name: String,
-    /// `None` only while dropping, so the writer thread can be joined after the
-    /// queue closes.
     queue: Option<SyncSender<Vec<u8>>>,
     worker: Option<std::thread::JoinHandle<()>>,
     dropped: Counter,
+    pub(crate) policy: Arc<Mutex<Rotate>>,
+    io: Arc<IoStats>,
 }
 
 impl Sink {
-    /// Queue one line. Never blocks, never fails visibly.
+    /// Enqueue without waiting for the writer or its disk.
     pub fn write(&self, line: &str) {
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
@@ -66,27 +44,33 @@ impl Sink {
         };
         match queue.try_send(bytes) {
             Ok(()) => {}
-            // A dropped line is a line, not a request. The count is exported so
-            // the loss is visible rather than silent.
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                self.dropped.increment();
-            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => self.dropped.increment(),
         }
     }
-
     pub fn name(&self) -> &str {
         &self.name
     }
-
     pub fn dropped(&self) -> u64 {
         self.dropped.get()
     }
+    pub fn write_errors(&self) -> u64 {
+        self.io.write.get()
+    }
+    pub fn flush_errors(&self) -> u64 {
+        self.io.flush.get()
+    }
+    pub fn rotation_errors(&self) -> u64 {
+        self.io.rotate.get()
+    }
+    pub fn last_success(&self) -> u64 {
+        self.io.last_write()
+    }
+    pub fn io_failed(&self) -> bool {
+        self.io.failed()
+    }
 }
-
 impl Drop for Sink {
     fn drop(&mut self) {
-        // Closing the queue is what tells the writer to flush and stop; joining
-        // is what stops the process exiting with lines still in memory.
         self.queue.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -94,126 +78,201 @@ impl Drop for Sink {
     }
 }
 
-/// Every sink the process has open, keyed by where it writes.
-///
-/// Weak references: a sink lives exactly as long as the generations using it.
-/// When the last one is dropped the writer flushes and stops, and the entry is
-/// cleared the next time the table is touched.
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct Registered {
+    sink: Weak<Sink>,
+    io: Weak<IoStats>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Sinks {
-    open: Mutex<HashMap<String, Weak<Sink>>>,
+    open: Arc<Mutex<HashMap<String, Registered>>>,
 }
 
 impl Sinks {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Lines go to standard error, which is where a container reads them.
-    pub fn stderr(&self) -> Arc<Sink> {
-        self.resolve("stderr", |name| Ok(spawn(name, Destination::Stderr)))
+    pub fn stage(&self) -> StagedSinks {
+        StagedSinks::new(self.clone())
     }
-
-    /// Lines go to a file, appended and rotated by size.
-    ///
-    /// The file is opened here, during prepare, so a path that cannot be
-    /// written stops the reload rather than failing at the first request.
+    pub fn stderr(&self) -> Arc<Sink> {
+        self.resolve("stderr", |name| spawn(name, Destination::Stderr, Rotate::NEVER))
+    }
+    /// Immediate construction/policy update for standalone callers. Hosts use a
+    /// candidate's StagedSinks so existing writers change only at publication.
     pub fn file(&self, path: &Path, rotate: Rotate) -> Result<Arc<Sink>, String> {
-        let path = path.to_path_buf();
-        let name = label(&path);
-        if let Some(existing) = self.get(&name) {
+        let sink = self.file_handle(path, rotate)?;
+        *sink.policy.lock().unwrap_or_else(|p| p.into_inner()) = rotate;
+        Ok(sink)
+    }
+    pub(crate) fn file_handle(&self, path: &Path, rotate: Rotate) -> Result<Arc<Sink>, String> {
+        // The file can temporarily be absent while its existing writer rolls
+        // it. Resolve the stable parent first, before opening another handle.
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Ok(parent) = std::fs::canonicalize(parent)
+            && let Some(existing) = self.get(&label(&parent.join(name)))
+        {
             return Ok(existing);
         }
-        let file = open(&path)?;
+        let file = open(path)?;
+        let written = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect log file: {error}"))?
+            .len();
+        let path =
+            std::fs::canonicalize(path).map_err(|error| format!("cannot resolve log file: {error}"))?;
+        let name = label(&path);
         Ok(self.resolve(&name, move |name| {
-            Ok(spawn(
+            spawn(
                 name,
                 Destination::File {
-                    file,
-                    path: path.clone(),
-                    rotate,
-                    written: 0,
+                    file: Some(file),
+                    path,
+                    written,
+                    kept: rotate.keep,
                 },
-            ))
+                rotate,
+            )
         }))
     }
-
+    fn resolve(&self, name: &str, create: impl FnOnce(&str) -> Sink) -> Arc<Sink> {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let key = identity(name);
+        if let Some(existing) = open.get(&key).and_then(|entry| entry.sink.upgrade()) {
+            return existing;
+        }
+        let sink = Arc::new(create(name));
+        open.insert(
+            key,
+            Registered {
+                sink: Arc::downgrade(&sink),
+                io: Arc::downgrade(&sink.io),
+            },
+        );
+        sink
+    }
     fn get(&self, name: &str) -> Option<Arc<Sink>> {
         self.open
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(name)
-            .and_then(Weak::upgrade)
+            .get(&identity(name))
+            .and_then(|entry| entry.sink.upgrade())
     }
-
-    fn resolve(&self, name: &str, create: impl FnOnce(&str) -> Result<Sink, String>) -> Arc<Sink> {
-        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = open.get(name).and_then(Weak::upgrade) {
-            return existing;
-        }
-        let sink = Arc::new(create(name).expect("stderr cannot fail to open"));
-        open.insert(name.to_string(), Arc::downgrade(&sink));
-        sink
-    }
-
-    /// Every sink still in use, for reporting.
     pub fn snapshot(&self) -> Vec<Arc<Sink>> {
         let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        open.retain(|_, sink| sink.strong_count() > 0);
-        let mut sinks: Vec<Arc<Sink>> = open.values().filter_map(Weak::upgrade).collect();
+        open.retain(|_, entry| entry.sink.strong_count() != 0);
+        let mut sinks: Vec<_> = open.values().filter_map(|entry| entry.sink.upgrade()).collect();
         sinks.sort_by(|left, right| left.name.cmp(&right.name));
         sinks
+    }
+}
+
+impl crate::health::LogStatus for Sinks {
+    fn failures(&self) -> Vec<String> {
+        // Do not upgrade Sink here: dropping the last writer may join an I/O
+        // thread. Health samples only lightweight atomic status ownership.
+        let open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let mut failures: Vec<_> = open
+            .iter()
+            .filter(|(_, entry)| {
+                entry.sink.strong_count() != 0 && entry.io.upgrade().is_some_and(|io| io.failed())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        failures.sort();
+        failures
     }
 }
 
 enum Destination {
     Stderr,
     File {
-        file: File,
+        file: Option<File>,
         path: PathBuf,
-        rotate: Rotate,
         written: u64,
+        kept: usize,
+    },
+    #[cfg(test)]
+    Injected {
+        writer: Box<dyn Write + Send>,
+        rotation_error: bool,
     },
 }
 
 impl Destination {
-    fn write(&mut self, line: &[u8]) -> std::io::Result<()> {
+    fn write(&mut self, line: &[u8], rotate: Rotate) -> Result<(), (Operation, io::Error)> {
         match self {
-            Destination::Stderr => std::io::stderr().write_all(line),
-            Destination::File {
+            Self::Stderr => std::io::stderr()
+                .write_all(line)
+                .map_err(|error| (Operation::Write, error)),
+            Self::File {
                 file,
                 path,
-                rotate,
                 written,
+                kept,
             } => {
-                file.write_all(line)?;
-                *written += line.len() as u64;
+                if file.is_none() {
+                    let reopened = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&*path)
+                        .map_err(|error| (Operation::Write, error))?;
+                    *written = reopened
+                        .metadata()
+                        .map_err(|error| (Operation::Write, error))?
+                        .len();
+                    *file = Some(reopened);
+                }
+                file.as_mut()
+                    .unwrap()
+                    .write_all(line)
+                    .map_err(|error| (Operation::Write, error))?;
+                *written = written.saturating_add(line.len() as u64);
                 if rotate.size > 0 && *written >= rotate.size {
-                    *file = roll(path, *rotate)?;
+                    file.take();
+                    *file = Some(roll(path, rotate, *kept).map_err(|error| (Operation::Rotate, error))?);
                     *written = 0;
+                    *kept = rotate.keep;
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Injected {
+                writer,
+                rotation_error,
+            } => {
+                writer
+                    .write_all(line)
+                    .map_err(|error| (Operation::Write, error))?;
+                if *rotation_error {
+                    return Err((Operation::Rotate, io::Error::other("injected rotation failure")));
                 }
                 Ok(())
             }
         }
     }
-
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         match self {
-            Destination::Stderr => std::io::stderr().flush(),
-            Destination::File { file, .. } => file.flush(),
+            Self::Stderr => std::io::stderr().flush(),
+            Self::File { file: Some(file), .. } => file.flush(),
+            Self::File { file: None, .. } => Ok(()),
+            #[cfg(test)]
+            Self::Injected { writer, .. } => writer.flush(),
         }
     }
 }
 
-/// How a path is named in a metric label and in the table.
-///
-/// One separator, whichever platform this is: a dashboard written against a
-/// deployment should not have to know, and two spellings of one path are one
-/// file however it was typed.
 fn label(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
-
+fn identity(name: &str) -> String {
+    if cfg!(windows) {
+        name.to_lowercase()
+    } else {
+        name.to_owned()
+    }
+}
 fn open(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -227,65 +286,103 @@ fn open(path: &Path) -> Result<File, String> {
         .open(path)
         .map_err(|error| format!("cannot write `{}`: {error}", path.display()))
 }
-
-/// Shift the kept files along and start a new one.
-fn roll(path: &Path, rotate: Rotate) -> std::io::Result<File> {
+fn missing_is_ok(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+fn roll(path: &Path, rotate: Rotate, previous_keep: usize) -> io::Result<File> {
     let numbered = |index: usize| {
         let mut name = path.as_os_str().to_os_string();
         name.push(format!(".{index}"));
         PathBuf::from(name)
     };
-    // Backwards, so nothing is overwritten before it has been moved.
-    if rotate.keep > 0 {
-        let _ = std::fs::remove_file(numbered(rotate.keep));
-        for index in (1..rotate.keep).rev() {
-            let _ = std::fs::rename(numbered(index), numbered(index + 1));
+    if rotate.keep < previous_keep {
+        for index in (rotate.keep + 1)..=previous_keep {
+            missing_is_ok(std::fs::remove_file(numbered(index)))?;
         }
-        let _ = std::fs::rename(path, numbered(1));
+    }
+    if rotate.keep > 0 {
+        missing_is_ok(std::fs::remove_file(numbered(rotate.keep)))?;
+        for index in (1..rotate.keep).rev() {
+            missing_is_ok(std::fs::rename(numbered(index), numbered(index + 1)))?;
+        }
+        std::fs::rename(path, numbered(1))?;
     } else {
-        // Keeping nothing means the file starts again, which is the only way
-        // `rotate` with `keep=0` can bound the disk.
-        let _ = std::fs::remove_file(path);
+        missing_is_ok(std::fs::remove_file(path))?;
     }
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-fn spawn(name: &str, mut destination: Destination) -> Sink {
+#[cfg(test)]
+#[path = "sink_policy_tests.rs"]
+mod policy_tests;
+
+fn spawn(name: &str, mut destination: Destination, initial: Rotate) -> Sink {
     let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE);
-    let label = name.to_string();
+    let label = name.to_owned();
+    let policy = Arc::new(Mutex::new(initial));
+    let worker_policy = policy.clone();
+    let io = Arc::new(IoStats::default());
+    let worker_io = io.clone();
     let worker = std::thread::Builder::new()
         .name(format!("gatel-log-{label}"))
         .spawn(move || {
+            let mut last_report = None;
             loop {
-                match receiver.recv_timeout(FLUSH_AFTER) {
+                let (operation, result, stop) = match receiver.recv_timeout(FLUSH_AFTER) {
                     Ok(line) => {
-                        if destination.write(&line).is_err() {
-                            // A disk that will not take a line is not something
-                            // this thread can fix, and reporting it into the
-                            // same log would be a loop.
-                            continue;
+                        let rotate = *worker_policy.lock().unwrap_or_else(|p| p.into_inner());
+                        // The policy lock is never held across disk I/O.
+                        let result = destination.write(&line, rotate);
+                        match result {
+                            Ok(()) => {
+                                worker_io.success(Operation::Write);
+                                worker_io.success(Operation::Rotate);
+                                continue;
+                            }
+                            Err((Operation::Rotate, error)) => {
+                                worker_io.success(Operation::Write);
+                                (Operation::Rotate, Err(error), false)
+                            }
+                            Err((operation, error)) => (operation, Err(error), false),
                         }
                     }
-                    // Nothing arrived: flush, so an idle gateway does not sit on
-                    // an unwritten line.
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = destination.flush();
+                    Err(error) => (
+                        Operation::Flush,
+                        destination.flush(),
+                        matches!(error, std::sync::mpsc::RecvTimeoutError::Disconnected),
+                    ),
+                };
+                match result {
+                    Ok(()) => worker_io.success(operation),
+                    Err(error) => {
+                        worker_io.error(operation);
+                        if last_report.is_none_or(|at: Instant| at.elapsed() >= Duration::from_secs(30)) {
+                            // Independent diagnostic stream, never enqueue into the
+                            // failed sink and never panic if stderr is also broken.
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "gatel log {operation:?} failed for {label}: {error}"
+                            );
+                            last_report = Some(Instant::now());
+                        }
                     }
-                    // Every handle is gone. Flush what is left and stop.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        let _ = destination.flush();
-                        return;
-                    }
+                }
+                if stop {
+                    return;
                 }
             }
         })
         .expect("a log writer thread");
-
     Sink {
-        name: name.to_string(),
+        name: name.to_owned(),
         queue: Some(sender),
         worker: Some(worker),
         dropped: Counter::new(),
+        policy,
+        io,
     }
 }
 

@@ -220,6 +220,7 @@ mod tests {
         let handler = config
             .unwrap()
             .build(BuildContext {
+                log_sinks: None,
                 secrets: Default::default(),
                 blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),

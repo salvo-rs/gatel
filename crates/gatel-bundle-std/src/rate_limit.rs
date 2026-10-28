@@ -106,11 +106,13 @@ impl DirectiveConfig for Config {
     }
 
     fn state(&self) -> Option<DirectiveState> {
-        // Changing what is counted, or over how long, makes existing counts
-        // meaningless. Changing only the table size does not.
+        // A table-capacity change explicitly resets this state. The ordinary
+        // binding diff reports an incompatible restart; a failed candidate cannot change the
+        // live table. Raising only the token allowance still preserves counts.
         let mut compatibility = Hasher::new();
         compatibility.update_str(&self.key.describe());
         compatibility.update_duration(self.window);
+        compatibility.update_u64(self.max_keys as u64);
         let max_keys = self.max_keys as usize;
         Some(DirectiveState {
             compatibility: compatibility.finish(),
@@ -130,10 +132,11 @@ impl DirectiveConfig for Config {
 
     fn describe(&self) -> String {
         format!(
-            "rate-limit {} per {:?} by {}",
+            "rate-limit {} per {:?} by {} (max-keys={}, capacity changes reset counts)",
             self.max,
             self.window,
-            self.key.describe()
+            self.key.describe(),
+            self.max_keys
         )
     }
 }
@@ -170,6 +173,14 @@ impl Directive for RateLimit {
             );
             return None;
         }
+        if fields.max_keys == 0 {
+            diagnostics.error(
+                Code::InvalidValue,
+                node.origin.clone(),
+                "`max-keys` must be at least 1",
+            );
+            return None;
+        }
         let key = match Key::parse(&fields.key) {
             Ok(key) => key,
             Err(message) => {
@@ -181,7 +192,7 @@ impl Directive for RateLimit {
             max: fields.max,
             window: fields.window,
             key,
-            max_keys: fields.max_keys.max(1),
+            max_keys: fields.max_keys,
         }))
     }
 }
@@ -333,6 +344,7 @@ mod tests {
     /// A context with nothing in it, for a directive that needs nothing.
     fn empty_context() -> gatel_plan::BuildContext<'static> {
         gatel_plan::BuildContext {
+            log_sinks: None,
             secrets: Default::default(),
             blocking: gatel_plan::blocking::Executor::process_default(),
             telemetry: crate::testing::telemetry(),
@@ -381,6 +393,13 @@ mod tests {
                 .unwrap()
                 .contains("respond")
         );
+    }
+
+    #[test]
+    fn a_key_capacity_of_zero_is_rejected_instead_of_silently_clamped() {
+        let (config, diagnostics) = decode(node(10, "1m").with_prop("max-keys", Value::int(0, origin())));
+        assert!(config.is_none());
+        assert!(diagnostics.to_string().contains("`max-keys` must be at least 1"));
     }
 
     #[test]

@@ -26,6 +26,12 @@ pub trait ReloadStatus: std::fmt::Debug + Send + Sync {
     fn failure(&self) -> Option<ReloadFailure>;
 }
 
+/// Atomic log-writer status only; implementations must not do I/O or acquire
+/// writer ownership whose destructor joins a logging thread.
+pub trait LogStatus: std::fmt::Debug + Send + Sync {
+    fn failures(&self) -> Vec<String>;
+}
+
 /// Something worth telling an operator about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Reason {
@@ -45,12 +51,15 @@ pub enum Reason {
     UpstreamDown { upstream: String },
     /// A site asked for an automatic certificate and does not have one yet.
     CertificatePending { site: String },
+    /// Logging remains fail-open; expose storage failure without evicting an
+    /// otherwise serving gateway from its load balancer.
+    LogIoFailed { sink: String },
 }
 
 impl Reason {
     /// Fixed, low-cardinality reason labels. Never use diagnostic text or
     /// individual resource identities as labels for aggregate health metrics.
-    pub const CODES: [&'static str; 7] = [
+    pub const CODES: [&'static str; 8] = [
         "starting",
         "no_listeners",
         "draining",
@@ -58,6 +67,7 @@ impl Reason {
         "reload_failing",
         "upstream_down",
         "certificate_pending",
+        "log_io_failed",
     ];
 
     /// Whether this instance should be taken out of rotation.
@@ -68,7 +78,8 @@ impl Reason {
             Reason::Starting | Reason::NoListeners | Reason::Draining | Reason::PersistenceUnknown => true,
             Reason::ReloadFailing { .. }
             | Reason::UpstreamDown { .. }
-            | Reason::CertificatePending { .. } => false,
+            | Reason::CertificatePending { .. }
+            | Reason::LogIoFailed { .. } => false,
         }
     }
 
@@ -89,6 +100,7 @@ impl Reason {
             Reason::CertificatePending { site } => {
                 format!("site `{site}` has no certificate yet")
             }
+            Reason::LogIoFailed { sink } => format!("log sink `{sink}` has an I/O failure"),
         }
     }
 
@@ -102,6 +114,7 @@ impl Reason {
             Reason::ReloadFailing { .. } => "reload_failing",
             Reason::UpstreamDown { .. } => "upstream_down",
             Reason::CertificatePending { .. } => "certificate_pending",
+            Reason::LogIoFailed { .. } => "log_io_failed",
         }
     }
 }
@@ -166,6 +179,7 @@ impl Report {
 pub struct Health {
     inner: RwLock<Inner>,
     reload_status: OnceLock<Arc<dyn ReloadStatus>>,
+    log_status: OnceLock<Arc<dyn LogStatus>>,
 }
 
 #[derive(Debug, Default)]
@@ -181,6 +195,9 @@ struct Inner {
 }
 
 impl Health {
+    pub fn set_log_status(&self, source: Arc<dyn LogStatus>) -> bool {
+        self.log_status.set(source).is_ok()
+    }
     /// Local durability failure is latched for this host lifetime. A subsequent
     /// in-memory commit cannot establish that disk and memory are reconciled.
     /// Do not fail liveness: automatic restart is not a reconciliation protocol.
@@ -264,6 +281,11 @@ impl Health {
 
     pub fn report(&self) -> Report {
         let configuration = self.reload_status.get().map(|source| source.failure());
+        let log_failures = self
+            .log_status
+            .get()
+            .map(|source| source.failures())
+            .unwrap_or_default();
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let mut reasons = Vec::new();
         if inner.persistence_unknown {
@@ -296,6 +318,7 @@ impl Health {
         for site in &inner.uncertified {
             reasons.push(Reason::CertificatePending { site: site.clone() });
         }
+        reasons.extend(log_failures.into_iter().map(|sink| Reason::LogIoFailed { sink }));
 
         let state = if reasons.iter().any(Reason::blocks) {
             State::NotReady
@@ -530,6 +553,7 @@ mod tests {
                 upstream: String::new(),
             },
             Reason::CertificatePending { site: String::new() },
+            Reason::LogIoFailed { sink: String::new() },
         ];
         let codes: BTreeSet<_> = reasons.iter().map(|reason| reason.code()).collect();
         assert_eq!(codes.len(), reasons.len());

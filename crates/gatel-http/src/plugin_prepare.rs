@@ -20,6 +20,7 @@ impl PreparedPlugins {
         plan: &Plan,
         resources: &Resources<'_>,
         reachable: &SharedUpstreams,
+        sinks: &gatel_observe::sink::StagedSinks,
     ) -> Result<Self, String> {
         let mut prepared = Self {
             secrets: Arc::default(),
@@ -58,6 +59,7 @@ impl PreparedPlugins {
                         root: resources.root,
                         state: crate::prepare::resolve_state(directive, resources.state),
                         telemetry: resources.telemetry,
+                        log_sinks: Some(sinks),
                         upstreams: &scoped,
                     };
                     let bundle = directive.config.prepare(cx).map_err(|error| {

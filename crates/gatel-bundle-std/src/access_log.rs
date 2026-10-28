@@ -86,7 +86,10 @@ impl DirectiveConfig for Config {
         // be written stops the reload while the previous one still serves.
         let sink = match &self.output {
             Output::Stderr => cx.telemetry.sinks.stderr(),
-            Output::File { path, rotate } => cx.telemetry.sinks.file(&cx.root.join(path), *rotate)?,
+            Output::File { path, rotate } => match cx.log_sinks {
+                Some(sinks) => sinks.file(&cx.root.join(path), *rotate)?,
+                None => cx.telemetry.sinks.file(&cx.root.join(path), *rotate)?,
+            },
         };
         Ok(Arc::new(AccessLogHandler {
             format: self.format,
@@ -476,6 +479,7 @@ mod tests {
         let error = config
             .unwrap()
             .build(BuildContext {
+                log_sinks: None,
                 secrets: Default::default(),
                 blocking: gatel_plan::blocking::Executor::process_default(),
                 root: &directory,

@@ -65,6 +65,9 @@ pub struct BuildContext<'a> {
     /// older than any generation, like a socket: a directive that exposes it
     /// captures the handle, it is never rebuilt for a reload.
     pub telemetry: &'a Arc<gatel_observe::Telemetry>,
+    /// Host-owned candidate log policies, published only with the generation.
+    /// Standalone handler builders may omit this and use immediate sinks.
+    pub log_sinks: Option<&'a gatel_observe::sink::StagedSinks>,
     /// The backends this generation can reach, for a directive that has to ask
     /// one something. Handed over here and nowhere else, so the set a directive
     /// can reach is fixed when it is built.

@@ -395,6 +395,7 @@ mod tests {
             .0
             .expect("the configuration is valid")
             .build(BuildContext {
+                log_sinks: None,
                 secrets: Default::default(),
                 blocking: gatel_plan::blocking::Executor::process_default(),
                 root: std::path::Path::new("."),

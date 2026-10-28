@@ -532,6 +532,7 @@ mod tests {
         let (config, diagnostics) = decode(node);
         assert!(!diagnostics.has_errors(), "{diagnostics}");
         let error = match config.unwrap().build(BuildContext {
+            log_sinks: None,
             secrets: Default::default(),
             blocking: gatel_plan::blocking::Executor::process_default(),
             telemetry: crate::testing::telemetry(),
