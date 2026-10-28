@@ -1,0 +1,52 @@
+name: HTTP server benchmark (one-off)
+
+on:
+  push:
+    branches: [bench/http-servers-20261028-1237]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record remote storage and host
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/http-benchmark-results"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          {
+            uname -a
+            lscpu
+            free -h
+            docker version
+            docker info
+            docker buildx ls
+            benchmark_docker_root=$(docker info --format '{{.DockerRootDir}}')
+            df -h "$benchmark_docker_root"
+            cat /sys/fs/cgroup/cpu.max || true
+            cat /sys/fs/cgroup/cpuset.cpus.effective || true
+          } > "$BENCHMARK_OUTPUT/environment.txt" 2>&1
+      - name: Run the five existing scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/launch-benchmark.py \
+            --rounds 3 --duration 10 --warmup 3 --threads 4 --connections 128 \
+            --output-dir "$BENCHMARK_OUTPUT" \
+            2>&1 | tee "$BENCHMARK_OUTPUT/run.log"
+      - name: Preserve reports and raw measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-server-benchmark
+          path: ${{ runner.temp }}/http-benchmark-results
+          if-no-files-found: error
