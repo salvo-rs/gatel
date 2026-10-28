@@ -3,6 +3,7 @@ use std::io;
 use std::sync::Mutex;
 use std::task::Poll;
 
+use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use super::*;

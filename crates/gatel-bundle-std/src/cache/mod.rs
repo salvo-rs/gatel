@@ -33,14 +33,18 @@
 //!
 //! It is per-process and in memory. Two gateways behind a balancer keep two
 //! caches, and a restart starts empty. Two routes that each write `cache` get
-//! a store each, so the memory a configuration can use is the sum of every
-//! `max-size` in it.
+//! a store each. Each store has a retained-data budget of `max-size` and a
+//! separate unfinished-fill budget of `max-size` logical payload bytes, with
+//! at most 64 fills. Unknown-length fills reserve `max-entry` before reading;
+//! when no reservation fits the response streams uncached. These bounds do
+//! not include transport buffers or allocator overhead.
 
 mod age;
 #[cfg(test)]
 mod cancellation;
 mod conditional;
 mod control;
+mod fill;
 mod invalidation;
 mod policy;
 mod revalidate;
@@ -50,7 +54,7 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use fill::{Collected, collect};
 use gatel_macros::FromNode;
 use gatel_model::{ByteSize, Code, Diagnostic, Diagnostics, FromNode as _, Hasher, Node};
 use gatel_plan::{Directive, DirectiveConfig, DirectiveMeta, DirectiveState, Phase, Scopes};
@@ -135,7 +139,7 @@ impl Directive for Cache {
         // store.
         static META: DirectiveMeta = DirectiveMeta::middleware("cache", Phase::Request, Scopes::BOTH)
             .with_effects(&[gatel_plan::Effect::CacheLookup])
-            .with_version("16");
+            .with_version("17");
         &META
     }
 
@@ -353,9 +357,31 @@ impl Handler for CacheHandler {
         // The body has to be in hand to be stored, and it may be a stream. Read
         // it up to the limit; anything larger is forwarded untouched rather
         // than held, because one response is not worth the whole budget.
+        use http_body::Body as _;
+        let declared = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let hint = response.body_mut().size_hint();
+        if declared.is_some_and(|length| length > self.max_entry) || hint.lower() > self.max_entry {
+            status_header(response, "fwd=miss; detail=too-large");
+            return;
+        }
+        let reserve = hint
+            .exact()
+            .or(declared)
+            .unwrap_or(self.max_entry)
+            .min(self.max_entry);
+        // Reserve before touching the stream. Budget exhaustion falls through
+        // to ordinary streaming rather than parking or creating a fill task.
+        let Some(fill) = self.store.fills.reserve(reserve) else {
+            status_header(response, "fwd=miss; detail=fill-budget");
+            return;
+        };
         let body = std::mem::take(response.body_mut());
-        let collected = match collect(body, self.max_entry).await {
-            Collected::Whole(bytes) => bytes,
+        let (collected, _fill) = match collect(body, reserve, Some(fill)).await {
+            Collected::Whole(bytes, fill) => (bytes, fill),
             Collected::TooLarge(body) => {
                 *response.body_mut() = body;
                 status_header(
@@ -364,9 +390,8 @@ impl Handler for CacheHandler {
                 );
                 return;
             }
-            Collected::Failed(body) => {
-                // Reading it failed part way. Hand back what there is and store
-                // nothing: half a response is not a response.
+            Collected::Uncacheable(body) => {
+                // Preserve trailers/errors and the bytes read before them.
                 *response.body_mut() = body;
                 status_header(response, "fwd=miss; detail=body-error");
                 return;
@@ -424,48 +449,9 @@ fn cache_only_miss(request: &Request, depot: &mut Depot, response: &mut Response
     ctrl.skip_rest();
 }
 
-enum Collected {
-    Whole(Bytes),
-    TooLarge(ResBody),
-    Failed(ResBody),
-}
-
-/// Read a body into memory, giving up if it passes `limit`.
-///
-/// A body that is too large is handed back whole rather than truncated: the
-/// client is owed the response either way, and only the caching is abandoned.
-async fn collect(body: ResBody, limit: u64) -> Collected {
-    use http_body_util::BodyExt;
-
-    // Already in memory, and cheap to measure.
-    if let ResBody::Once(bytes) = &body {
-        return if bytes.len() as u64 > limit {
-            Collected::TooLarge(body)
-        } else {
-            Collected::Whole(bytes.clone())
-        };
-    }
-    if matches!(body, ResBody::None) {
-        return Collected::Whole(Bytes::new());
-    }
-
-    match body.collect().await {
-        Ok(collected) => {
-            let bytes = collected.to_bytes();
-            if bytes.len() as u64 > limit {
-                // Read, and too big after all — a stream that declared nothing.
-                // The client still gets it; it is simply not kept.
-                Collected::TooLarge(ResBody::Once(bytes))
-            } else {
-                Collected::Whole(bytes)
-            }
-        }
-        Err(_) => Collected::Failed(ResBody::None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use gatel_model::{Origin, Value};
 
     use super::*;
@@ -521,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_already_in_memory_is_taken_as_it_is() {
         let body = ResBody::Once(Bytes::from_static(b"hello"));
-        assert!(matches!(collect(body, 1024).await, Collected::Whole(bytes) if bytes == "hello"));
+        assert!(matches!(collect(body, 1024, None).await, Collected::Whole(bytes, _) if bytes == "hello"));
     }
 
     #[tokio::test]
@@ -529,15 +515,15 @@ mod tests {
         // The client is owed the whole response either way; only the caching
         // is abandoned.
         let body = ResBody::Once(Bytes::from(vec![b'x'; 100]));
-        assert!(matches!(collect(body, 10).await, Collected::TooLarge(_)));
+        assert!(matches!(collect(body, 10, None).await, Collected::TooLarge(_)));
     }
 
     #[tokio::test]
     async fn an_empty_body_is_a_body() {
         // A 204 has nothing in it and is still worth storing.
         assert!(matches!(
-            collect(ResBody::None, 1024).await,
-            Collected::Whole(bytes) if bytes.is_empty()
+            collect(ResBody::None, 1024, None).await,
+            Collected::Whole(bytes, _) if bytes.is_empty()
         ));
     }
 }

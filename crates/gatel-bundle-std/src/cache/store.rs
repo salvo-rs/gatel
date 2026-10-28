@@ -9,7 +9,7 @@
 //! file, or changing a header somewhere else, would otherwise send every
 //! request to the origin at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -128,6 +128,7 @@ struct Contents {
 /// The shared store, which outlives any generation that uses it.
 #[derive(Debug)]
 pub struct Store {
+    pub(super) fills: Arc<super::fill::Budget>,
     /// Every copy of a resource, by base key and then by `Vary` signature.
     ///
     /// Two levels because `Vary` is a property of the *response*: the headers
@@ -188,6 +189,7 @@ impl Store {
 
     pub fn new(max_bytes: u64) -> Self {
         Self {
+            fills: Arc::new(super::fill::Budget::new(max_bytes)),
             contents: Mutex::new(Contents::default()),
             bytes: AtomicU64::new(0),
             max_bytes,
@@ -406,36 +408,57 @@ impl Store {
 
     /// Throw away least-recently-used copies until the budget is met.
     ///
-    /// A scan rather than an index: eviction happens only when the cache is
-    /// full, the number of entries is bounded by the budget, and a scan of a
-    /// few thousand is measured in microseconds. An index would be a second
-    /// structure to keep in step with this one, which is a bug waiting to be
-    /// written.
+    /// Collect candidates once, then remove the oldest sufficient set in one
+    /// pass per resource. Re-scanning for each victim made one large insertion
+    /// quadratic, including when many `Vary` copies shared a base key. The
+    /// temporary ordering exists only while over budget, so ordinary hits and
+    /// writes do not maintain a second, potentially stale identity index.
     fn evict_down_to_budget(&self, contents: &mut Contents) {
+        let excess = self.bytes.load(Ordering::Relaxed).saturating_sub(self.max_bytes);
+        if excess == 0 {
+            return;
+        }
         let Contents { held, vary, .. } = contents;
-        while self.bytes.load(Ordering::Relaxed) > self.max_bytes {
-            let Some((key, signature, weight)) = held
+        let victims = {
+            let mut candidates: Vec<_> = held
                 .iter()
                 .flat_map(|(key, copies)| copies.iter().map(move |copy| (key, copy)))
-                .min_by_key(|(_, copy)| copy.used)
-                .map(|(key, copy)| (key.clone(), copy.signature.clone(), copy.weight))
-            else {
-                // Nothing left to drop, which means the accounting is wrong
-                // rather than the cache being full. Stop rather than spin.
-                self.bytes.store(0, Ordering::Relaxed);
-                return;
-            };
-
+                .collect();
+            candidates.sort_unstable_by_key(|(_, copy)| copy.used);
+            let mut victims: HashMap<Key, HashSet<String>> = HashMap::new();
+            let mut selected = 0u64;
+            for (key, copy) in candidates {
+                victims
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(copy.signature.clone());
+                selected = selected.saturating_add(copy.weight);
+                if selected >= excess {
+                    break;
+                }
+            }
+            victims
+        };
+        let mut freed = 0u64;
+        let mut removed = 0u64;
+        for (key, signatures) in victims {
             if let Some(copies) = held.get_mut(&key) {
-                copies.retain(|copy| copy.signature != signature);
+                copies.retain(|copy| {
+                    if !signatures.contains(&copy.signature) {
+                        return true;
+                    }
+                    freed += copy.weight;
+                    removed += 1;
+                    false
+                });
                 if copies.is_empty() {
                     held.remove(&key);
                     vary.remove(&key);
                 }
             }
-            self.bytes.fetch_sub(weight, Ordering::Relaxed);
-            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
+        self.bytes.fetch_sub(freed, Ordering::Relaxed);
+        self.evictions.fetch_add(removed, Ordering::Relaxed);
     }
 
     pub fn held_bytes(&self) -> u64 {
@@ -464,6 +487,10 @@ impl Store {
         self.contents.lock().unwrap_or_else(|p| p.into_inner()).vary.len()
     }
 }
+
+#[cfg(test)]
+#[path = "eviction_tests.rs"]
+mod eviction_tests;
 
 /// The signature a request has for a given `Vary` list.
 ///
