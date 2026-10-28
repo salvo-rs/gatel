@@ -613,9 +613,16 @@ version captured before resource observation, so an intervening commit makes
 the observation stale. The existing filesystem watcher and five-second fallback
 poll call this path, including for resources outside the watched directory via
 polling. Invalid material fails preparation and leaves the serving generation
-intact. This currently covers upstream CA/client certificate/key material, not
-every plugin secret or server certificate source; it is not cross-file atomic
-rotation or emergency revocation. Fixed-snapshot serve mode does not start a
+intact. This covers upstream CA/client certificate/key material, manual server
+certificate/key files, inbound mTLS CA files, and declared plugin secrets. Server
+TLS preparation records the exact bounded bytes it parsed in a candidate-owned
+observation set (up to 4096 distinct files), and rejects inconsistent duplicate
+reads. Those observations publish only with the runtime; file-only edits select
+the same conditional refresh path without changing source revisions or plan
+hashes. Missing, malformed or permission-invalid replacements retain the last
+serving generation. This is not cross-file atomic rotation or emergency
+revocation: an already established connection retains its original TLS policy.
+Fixed-snapshot serve mode does not start a
 configuration watcher.
 
 Prepared plugins now share generation-owned SecretDependencies through
@@ -917,9 +924,13 @@ identity. An endpoint's stream bound spans all its physical connections. Each
 connection is further constrained by the remote SETTINGS already received and
 observed; before receiving it, Hyper's initial estimate is 100. Hyper applies
 the updated remote limit to actual wire sends. A SETTINGS value of zero admits
-no new requests; a 50-ms observation timer wakes pool waiters on capacity changes, so a
-waiting request can proceed when the peer raises the limit without another
-request having to trigger progress.
+no new requests. Actual Hyper I/O/body task progress wakes the dispatch driver,
+including GOAWAY while no requests are queued. While any checkout in that
+upstream pool waits, a 50-ms observation timer also samples capacity, so a peer
+raising a zero limit does not need another request to trigger progress. With no
+queued checkouts the timer stops; demand is aggregated per upstream, rather
+than per endpoint. This avoids periodic idle polling, without claiming a
+measured CPU or throughput improvement.
 
 One HTTP/2 lease admits one request, and its stream reservation remains occupied until
 both request upload and response body finish or are cancelled. A successful
@@ -929,6 +940,13 @@ the connection for new requests while retaining its physical slot until older
 streams finish. With `max-per-endpoint=1`, a replacement waits for those streams
 instead of opening a second physical connection. Physical connection gauges and
 reserved-stream gauges therefore measure different resources.
+
+HTTP/1 admission records both allocated and target capacity. Returning leases
+pay down shrink debt before waking new work; a cancelled waiter with an
+already-assigned semaphore permit cannot evade the debt. Pool publication and
+lease return share the current idle/lifetime policy lock: a lease created under
+an older generation cannot repopulate a newly disabled idle pool. Publication
+also trims existing idle sockets, retaining active requests until they finish.
 
 Directives take part in the same table. A directive declares what it needs to
 keep between requests, and its state is owned by the site or route it was
