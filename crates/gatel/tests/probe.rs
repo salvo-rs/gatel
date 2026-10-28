@@ -18,12 +18,14 @@ impl Drop for Fixture {
 }
 
 fn command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_gatel"));
+    let command = Command::new(env!("CARGO_BIN_EXE_gatel"));
     #[cfg(windows)]
-    {
+    let command = {
         use std::os::windows::process::CommandExt;
+        let mut command = command;
         command.creation_flags(0x08000000);
-    }
+        command
+    };
     command
 }
 
