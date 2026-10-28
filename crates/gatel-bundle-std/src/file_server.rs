@@ -157,6 +157,10 @@ enum Target {
     NotFound,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "This short-lived result normally contains an opened file; boxing its platform-sized metadata adds an allocation to every successful file request."
+)]
 enum PreparedTarget {
     File {
         path: PathBuf,
