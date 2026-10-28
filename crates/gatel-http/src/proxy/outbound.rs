@@ -49,8 +49,9 @@ impl ProxyTerminal {
         // header cannot survive by being spelled unusually.
         let connection_tokens = connection_tokens(request);
         for (name, value) in request.headers() {
-            let lower = name.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&lower.as_str()) || connection_tokens.contains(&lower) {
+            // HeaderName already stores its normalized lowercase spelling.
+            let lower = name.as_str();
+            if HOP_BY_HOP.contains(&lower) || connection_tokens.iter().any(|token| token == lower) {
                 continue;
             }
             headers.append(name.clone(), value.clone());
@@ -127,8 +128,8 @@ impl ProxyTerminal {
             .flat_map(|value| value.split(',').map(|token| token.trim().to_ascii_lowercase()))
             .collect();
         for (name, value) in &parts.headers {
-            let lower = name.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&lower.as_str()) || connection_tokens.contains(&lower) {
+            let lower = name.as_str();
+            if HOP_BY_HOP.contains(&lower) || connection_tokens.iter().any(|token| token == lower) {
                 continue;
             }
             response.headers_mut().append(name.clone(), value.clone());
