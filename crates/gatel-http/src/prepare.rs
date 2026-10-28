@@ -81,6 +81,7 @@ impl std::fmt::Debug for ListenerRuntime {
 #[derive(Debug)]
 pub struct Runtime {
     sink_change: gatel_observe::sink::SinkUpdate,
+    bind_change: crate::bind::BindUpdate,
     certificate_change: gatel_tls::store::CertificateUpdates,
     state_change: gatel_state::registry::StateUpdate,
     pub secrets: Arc<gatel_plan::SecretDependencies>,
@@ -108,6 +109,7 @@ impl Runtime {
 
 pub struct RuntimePublication<'a> {
     sinks: gatel_observe::sink::SinkPublication<'a>,
+    bindings: crate::bind::BindPublication<'a>,
     certificates: gatel_tls::store::CertificatePublication<'a>,
     state: gatel_state::registry::StatePublication<'a>,
     blocking: Option<gatel_plan::blocking::Publication<'a>>,
@@ -121,6 +123,7 @@ impl gatel_plan::publication::PublishGuard for RuntimePublication<'_> {
         // publication overwrite its pool policies.
         self.upstreams.adopt_policies();
         self.sinks.publish();
+        self.bindings.publish();
         self.certificates.publish();
         self.state.publish();
         if let Some(blocking) = self.blocking {
@@ -132,12 +135,14 @@ impl gatel_plan::publication::PublishGuard for RuntimePublication<'_> {
 impl gatel_plan::publication::PublishRuntime for Runtime {
     type Guard<'a> = RuntimePublication<'a>;
     fn finish_publication(&self) {
+        self.bind_change.finish();
         self.certificate_change.finish();
         self.state_change.finish();
     }
     fn begin_publication(&self) -> Self::Guard<'_> {
         RuntimePublication {
             sinks: self.sink_change.begin(),
+            bindings: self.bind_change.begin(),
             state: self.state_change.begin(),
             certificates: self.certificate_change.begin(),
             blocking: self
@@ -181,7 +186,7 @@ pub fn prepare(
         .iter()
         .map(|listener| listener.listener.bind)
         .collect();
-    resources.binds.ensure(&wanted)?;
+    let bind_change = resources.binds.stage(&wanted)?;
 
     let (upstreams, resolutions) = UpstreamRuntimes::prepare(plan, resources.state, resources.root)?;
     let upstreams = Arc::new(upstreams);
@@ -299,6 +304,7 @@ pub fn prepare(
     );
     Ok(Arc::new(Runtime {
         sink_change: sinks.finish(),
+        bind_change,
         certificate_change,
         state_change: state_owner.update_from(&staged_state),
         blocking_change,
