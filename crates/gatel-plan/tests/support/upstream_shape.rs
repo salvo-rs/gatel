@@ -12,6 +12,8 @@ fn invalid_policy_bounds_are_rejected_instead_of_clamped() {
         r#"health "http" path="/" status=99"#,
         r#"health "http" path="/" status=600"#,
         r#"passive-health max-fails=0"#,
+        r#"pool max-h2-streams-per-connection=0"#,
+        r#"pool max-h2-streams-per-endpoint=0"#,
     ] {
         let errors = normalize(
             &snapshot(&format!(
@@ -24,6 +26,27 @@ fn invalid_policy_bounds_are_rejected_instead_of_clamped() {
             errors.iter().any(|error| error.code == Code::InvalidValue),
             "{policy}: {errors}"
         );
+    }
+}
+
+#[test]
+fn h2_stream_limits_have_typed_defaults_and_preserve_positive_u32_values() {
+    for policy in ["", "pool;"] {
+        let result = spec(&format!(
+            r#"global {{ http ":8080"; }}; upstream "pool" {{ endpoint "127.0.0.1:9000"; {policy} }}"#
+        ));
+        let pool = result.upstreams[0].pool;
+        assert_eq!(pool.max_h2_streams_per_connection, 128);
+        assert_eq!(pool.max_h2_streams_per_endpoint, 128);
+    }
+    for (connection, endpoint) in [(1, 2), (257, 1025), (u32::MAX, u32::MAX)] {
+        let result = spec(&format!(
+            r#"global {{ http ":8080"; }}; upstream "pool" {{ endpoint "127.0.0.1:9000";
+            pool max-h2-streams-per-connection={connection} max-h2-streams-per-endpoint={endpoint}; }}"#
+        ));
+        let pool = result.upstreams[0].pool;
+        assert_eq!(pool.max_h2_streams_per_connection, connection);
+        assert_eq!(pool.max_h2_streams_per_endpoint, endpoint);
     }
 }
 

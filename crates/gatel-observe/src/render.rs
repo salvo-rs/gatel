@@ -366,7 +366,7 @@ fn upstreams(metrics: &Metrics, out: &mut String) {
     family(
         out,
         "gatel_upstream_pool_connections",
-        "Pooled backend connections, by whether one is carrying a request.",
+        "Physical pooled backend connections, by whether one is carrying requests.",
         "gauge",
     );
     for (labels, upstream) in &series {
@@ -386,6 +386,23 @@ fn upstreams(metrics: &Metrics, out: &mut String) {
             labels,
             &[("state", "in_use")],
             upstream.pool_in_use.get(),
+        );
+    }
+
+    family(
+        out,
+        "gatel_upstream_pool_streams_in_use",
+        "Reserved HTTP/2 backend streams, including requests awaiting a response.",
+        "gauge",
+    );
+    for (labels, upstream) in &series {
+        point(
+            out,
+            "gatel_upstream_pool_streams_in_use",
+            UPSTREAM,
+            labels,
+            &[],
+            upstream.pool_streams_in_use.get(),
         );
     }
 
@@ -550,6 +567,17 @@ mod tests {
             1,
             "two series, one declaration"
         );
+    }
+
+    #[test]
+    fn multiplexed_streams_are_distinct_from_physical_busy_connections() {
+        let telemetry = telemetry();
+        let upstream = telemetry.metrics.upstream("api");
+        upstream.pool_in_use.set(1);
+        upstream.pool_streams_in_use.set(7);
+        let text = prometheus(&telemetry);
+        assert!(text.contains("gatel_upstream_pool_connections{upstream=\"api\",state=\"in_use\"} 1\n"));
+        assert!(text.contains("gatel_upstream_pool_streams_in_use{upstream=\"api\"} 7\n"));
     }
 
     #[test]

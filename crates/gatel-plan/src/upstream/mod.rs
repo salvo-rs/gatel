@@ -278,6 +278,9 @@ pub struct Pool {
     pub idle_timeout: Duration,
     pub max_lifetime: Duration,
     pub max_waiters: u32,
+    /// Local stream reservations; remote SETTINGS can impose a smaller bound.
+    pub max_h2_streams_per_connection: u32,
+    pub max_h2_streams_per_endpoint: u32,
 }
 
 impl Default for Pool {
@@ -288,6 +291,8 @@ impl Default for Pool {
             idle_timeout: Duration::from_secs(30),
             max_lifetime: Duration::from_secs(300),
             max_waiters: 256,
+            max_h2_streams_per_connection: 128,
+            max_h2_streams_per_endpoint: 128,
         }
     }
 }
@@ -299,6 +304,8 @@ impl Pool {
         hasher.update_duration(self.idle_timeout);
         hasher.update_duration(self.max_lifetime);
         hasher.update_u64(self.max_waiters as u64);
+        hasher.update_u64(self.max_h2_streams_per_connection as u64);
+        hasher.update_u64(self.max_h2_streams_per_endpoint as u64);
     }
 }
 
@@ -314,6 +321,10 @@ pub(super) struct PoolNode {
     max_lifetime: Option<Duration>,
     #[gatel(prop)]
     max_waiters: Option<u32>,
+    #[gatel(prop)]
+    max_h2_streams_per_connection: Option<u32>,
+    #[gatel(prop)]
+    max_h2_streams_per_endpoint: Option<u32>,
 }
 
 /// How aggressively a failed attempt may be tried elsewhere.

@@ -125,6 +125,12 @@ pub fn decode_upstream_body(
                 idle_timeout: decoded.idle_timeout.unwrap_or(base.idle_timeout),
                 max_lifetime: decoded.max_lifetime.unwrap_or(base.max_lifetime),
                 max_waiters: decoded.max_waiters.unwrap_or(base.max_waiters),
+                max_h2_streams_per_connection: decoded
+                    .max_h2_streams_per_connection
+                    .unwrap_or(base.max_h2_streams_per_connection),
+                max_h2_streams_per_endpoint: decoded
+                    .max_h2_streams_per_endpoint
+                    .unwrap_or(base.max_h2_streams_per_endpoint),
             };
             if pool.max_per_endpoint == 0 {
                 diagnostics.error(
@@ -138,6 +144,13 @@ pub fn decode_upstream_body(
                     Code::InvalidValue,
                     child.origin.clone(),
                     "`max-idle-per-endpoint` cannot exceed `max-per-endpoint`",
+                );
+            }
+            if pool.max_h2_streams_per_connection == 0 || pool.max_h2_streams_per_endpoint == 0 {
+                diagnostics.error(
+                    Code::InvalidValue,
+                    child.origin.clone(),
+                    "HTTP/2 stream limits must be at least 1",
                 );
             }
             pool

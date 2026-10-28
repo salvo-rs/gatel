@@ -8,7 +8,9 @@
 //! as well as every address tried, because a budget spent per attempt would
 //! multiply by however many replicas somebody happened to deploy.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gatel_plan::{Timeouts, UpstreamProtocol};
@@ -24,7 +26,54 @@ pub enum Sender {
     Http1(http1::SendRequest<Body>),
     /// HTTP/2 multiplexes, so one sender serves many concurrent requests and
     /// is cloned rather than checked out exclusively.
-    Http2(http2::SendRequest<Body>),
+    Http2(Http2Sender),
+}
+
+/// A cloneable H2 dispatcher plus the driver's latest remote stream setting.
+#[derive(Clone)]
+pub struct Http2Sender {
+    inner: http2::SendRequest<Body>,
+    remote_limit: Arc<dyn Fn() -> usize + Send + Sync>,
+}
+
+struct Observation<T> {
+    value: Option<T>,
+    skipped: bool,
+}
+
+impl<T> Observation<T> {
+    fn sample(&mut self, read: impl FnOnce(&T) -> usize) -> usize {
+        match &self.value {
+            Some(value) => read(value),
+            None => {
+                self.skipped = true;
+                0
+            }
+        }
+    }
+
+    fn restore(&mut self, value: T) -> bool {
+        self.value = Some(value);
+        std::mem::take(&mut self.skipped)
+    }
+}
+
+impl Http2Sender {
+    pub(super) fn stream_limit(&self) -> usize {
+        (self.remote_limit)()
+    }
+}
+
+impl std::ops::Deref for Http2Sender {
+    type Target = http2::SendRequest<Body>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for Http2Sender {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
 impl ConnectionPool {
@@ -187,12 +236,75 @@ impl ConnectionPool {
                 let (sender, connection) = http2::handshake(TokioExecutor::new(), io)
                     .await
                     .map_err(|error| CheckoutError::Handshake(error.to_string()))?;
+                // Hyper's IO task processes SETTINGS independently of this
+                // dispatch future. Read its current value at admission rather
+                // than admitting against a stale sampled atomic.
+                let shared = Arc::new(Mutex::new(Observation {
+                    value: Some(Box::pin(connection)),
+                    skipped: false,
+                }));
+                let reader = shared.clone();
+                let remote_limit = Arc::new(move || {
+                    reader
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .sample(|connection| connection.current_max_send_streams())
+                });
+                let changed = self.h2_changed.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = connection.await {
+                    let mut observed = 0;
+                    let mut refresh = Box::pin(tokio::time::sleep(Duration::from_millis(50)));
+                    let result = std::future::poll_fn(|cx| {
+                        // A zero-to-positive SETTINGS change need not wake the
+                        // dispatch future when no requests are queued. Bound
+                        // that wakeup delay, including an otherwise idle pool.
+                        if refresh.as_mut().poll(cx).is_ready() {
+                            refresh
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_millis(50));
+                            let _ = refresh.as_mut().poll(cx);
+                        }
+                        // Poll outside the mutex: polling/dropping Hyper can
+                        // release a request-body reservation into the pool.
+                        let mut connection = shared
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .value
+                            .take()
+                            .expect("one driver owns the connection");
+                        let result = connection.as_mut().poll(cx);
+                        let limit = if result.is_ready() {
+                            0
+                        } else {
+                            connection.current_max_send_streams()
+                        };
+                        let missed = if result.is_pending() {
+                            shared
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .restore(connection)
+                        } else {
+                            // Close the dispatcher before waking pool waiters.
+                            drop(connection);
+                            false
+                        };
+                        // A checkout sampling during poll saw a conservative
+                        // zero; it needs a wake even if SETTINGS did not change.
+                        if missed || observed != limit || result.is_ready() {
+                            observed = limit;
+                            changed.notify_waiters();
+                        }
+                        result
+                    })
+                    .await;
+                    if let Err(error) = result {
                         tracing::debug!(target: "gatel::upstream", %error, "connection closed");
                     }
                 });
-                Ok(Sender::Http2(sender))
+                Ok(Sender::Http2(Http2Sender {
+                    inner: sender,
+                    remote_limit,
+                }))
             }
         }
     }
@@ -210,6 +322,21 @@ async fn connect_with_budget<T>(
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[test]
+    fn observation_during_driver_poll_requires_a_wake_after_restore() {
+        let mut observation = Observation {
+            value: Some(7),
+            skipped: false,
+        };
+        assert_eq!(observation.sample(|n| *n), 7);
+        let value = observation.value.take().unwrap();
+        assert_eq!(observation.sample(|n| *n), 0);
+        assert!(observation.restore(value));
+        assert_eq!(observation.sample(|n| *n), 7);
+        let value = observation.value.take().unwrap();
+        assert!(!observation.restore(value));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn successive_stages_share_one_budget() {

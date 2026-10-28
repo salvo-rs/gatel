@@ -62,3 +62,41 @@ fn endpoint_weight_and_balance_participate_in_inline_identity() {
     );
     assert_eq!(spec.upstreams.len(), 3);
 }
+
+#[test]
+fn each_h2_stream_limit_changes_inline_identity_and_explicit_defaults_share_it() {
+    let result = spec(
+        r#"global { http ":8080"; }; site "*" {
+        route "/default" { proxy "127.0.0.1:9000"; };
+        route "/explicit" { proxy { endpoint "127.0.0.1:9000"; pool max-h2-streams-per-connection=128 max-h2-streams-per-endpoint=128; }; };
+        route "/connection" { proxy { endpoint "127.0.0.1:9000"; pool max-h2-streams-per-connection=7; }; };
+        route "/endpoint" { proxy { endpoint "127.0.0.1:9000"; pool max-h2-streams-per-endpoint=7; }; };
+        route "/both" { proxy { endpoint "127.0.0.1:9000"; pool max-h2-streams-per-connection=7 max-h2-streams-per-endpoint=7; }; };
+    }"#,
+    );
+    assert_eq!(
+        result.upstreams.len(),
+        4,
+        "both stream fields participate independently in the policy hash"
+    );
+    let identity = |path: &str| {
+        let route = result.sites[0]
+            .routes
+            .iter()
+            .find(|route| route.path.describe() == path)
+            .unwrap();
+        let Terminal::Proxy { upstream } = &route.terminal else {
+            panic!("proxy")
+        };
+        upstream
+    };
+    assert_eq!(identity("/default"), identity("/explicit"));
+    let identities = ["/default", "/connection", "/endpoint", "/both"].map(identity);
+    assert_eq!(
+        identities
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
+}

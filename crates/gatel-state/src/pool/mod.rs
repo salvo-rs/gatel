@@ -30,9 +30,10 @@ use crate::endpoint::Endpoint;
 
 mod dial;
 mod lease;
+mod multiplex;
 
 pub use dial::Sender;
-pub use lease::Lease;
+pub use lease::{Lease, SendError};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = BoxBody<Bytes, BoxError>;
@@ -126,6 +127,8 @@ pub(super) struct Counters {
 }
 
 pub(super) struct EndpointPool {
+    h2: multiplex::Multiplex,
+    changed: Arc<tokio::sync::Notify>,
     pub(super) permits: Arc<Semaphore>,
     /// How many permits the semaphore has been given. The semaphore itself
     /// only reports what is *available*, which is not the same number while
@@ -156,6 +159,7 @@ pub struct ConnectionPool {
     tls: Option<Arc<gatel_tls::ClientTls>>,
     endpoints: Mutex<HashMap<String, Arc<EndpointPool>>>,
     draining: AtomicBool,
+    h2_changed: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for ConnectionPool {
@@ -205,6 +209,8 @@ pub struct PoolStats {
     pub endpoint: String,
     pub idle: usize,
     pub in_use: u32,
+    /// Reserved HTTP/2 streams, separate from physical connections in use.
+    pub streams_in_use: u32,
     pub waiting: u64,
     pub opened: u64,
     pub reused: u64,
@@ -229,6 +235,7 @@ impl ConnectionPool {
             tls,
             endpoints: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
+            h2_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -249,13 +256,18 @@ impl ConnectionPool {
         let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
         for slot in endpoints.values() {
             resize(slot, config.max_per_endpoint);
+            slot.h2.adopt(config, slot);
         }
+        self.h2_changed.notify_waiters();
     }
 
-    fn slot(&self, endpoint: &Endpoint, config: &gatel_plan::Pool) -> Arc<EndpointPool> {
+    fn slot(&self, endpoint: &Endpoint) -> Arc<EndpointPool> {
         let mut endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
+        let config = self.policy().config;
         Arc::clone(endpoints.entry(endpoint.id.clone()).or_insert_with(|| {
             Arc::new(EndpointPool {
+                h2: multiplex::Multiplex::new(config, self.draining.load(Ordering::Acquire)),
+                changed: self.h2_changed.clone(),
                 permits: {
                     let permits = Arc::new(Semaphore::new(config.max_per_endpoint as usize));
                     if self.draining.load(Ordering::Acquire) {
@@ -282,17 +294,22 @@ impl ConnectionPool {
             return Err(CheckoutError::Draining);
         }
         let Policy { config, .. } = self.policy();
-        let slot = self.slot(endpoint, &config);
+        let slot = self.slot(endpoint);
 
         let waiting = slot.waiting.fetch_add(1, Ordering::Relaxed) + 1;
         let _waiting_guard = WaitingGuard {
             slot: Arc::clone(&slot),
+            multiplex: self.protocol == UpstreamProtocol::Http2,
         };
         if waiting > config.max_waiters as u64 {
             return Err(CheckoutError::QueueFull {
                 waiting: waiting as u32,
                 limit: config.max_waiters,
             });
+        }
+
+        if self.protocol == UpstreamProtocol::Http2 {
+            return self.checkout_h2(endpoint, slot, timeouts).await;
         }
 
         let permit =
@@ -339,17 +356,28 @@ impl ConnectionPool {
         let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
         let mut stats: Vec<PoolStats> = endpoints
             .iter()
-            .map(|(id, slot)| PoolStats {
-                endpoint: id.clone(),
-                idle: slot.idle.lock().unwrap_or_else(|p| p.into_inner()).len(),
-                in_use: slot
-                    .granted
-                    .load(Ordering::Acquire)
-                    .saturating_sub(slot.permits.available_permits() as u32),
-                waiting: slot.waiting.load(Ordering::Relaxed),
-                opened: slot.counters.opened.load(Ordering::Relaxed),
-                reused: slot.counters.reused.load(Ordering::Relaxed),
-                discarded: slot.counters.discarded.load(Ordering::Relaxed),
+            .map(|(id, slot)| {
+                let (idle, in_use, streams_in_use) = if self.protocol == UpstreamProtocol::Http2 {
+                    slot.h2.stats()
+                } else {
+                    (
+                        slot.idle.lock().unwrap_or_else(|p| p.into_inner()).len(),
+                        slot.granted
+                            .load(Ordering::Acquire)
+                            .saturating_sub(slot.permits.available_permits() as u32),
+                        0,
+                    )
+                };
+                PoolStats {
+                    endpoint: id.clone(),
+                    idle,
+                    in_use,
+                    streams_in_use,
+                    waiting: slot.waiting.load(Ordering::Relaxed),
+                    opened: slot.counters.opened.load(Ordering::Relaxed),
+                    reused: slot.counters.reused.load(Ordering::Relaxed),
+                    discarded: slot.counters.discarded.load(Ordering::Relaxed),
+                }
             })
             .collect();
         stats.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
@@ -369,6 +397,9 @@ impl ConnectionPool {
         let Some(slot) = endpoints.get(endpoint) else {
             return 0;
         };
+        if self.protocol == UpstreamProtocol::Http2 {
+            return slot.h2.retire(keep, slot);
+        }
         *slot.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(keep.to_vec());
         let mut idle = slot.idle.lock().unwrap_or_else(|p| p.into_inner());
         let before = idle.len();
@@ -388,19 +419,30 @@ impl ConnectionPool {
         let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
         self.draining.store(true, Ordering::Release);
         for slot in endpoints.values() {
+            slot.h2.drain(slot);
             slot.permits.close();
             slot.idle.lock().unwrap_or_else(|p| p.into_inner()).clear();
         }
     }
 }
 
+impl Drop for ConnectionPool {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
 struct WaitingGuard {
     slot: Arc<EndpointPool>,
+    multiplex: bool,
 }
 
 impl Drop for WaitingGuard {
     fn drop(&mut self) {
         self.slot.waiting.fetch_sub(1, Ordering::Relaxed);
+        if self.multiplex {
+            self.slot.h2.finish_wait(&self.slot);
+        }
     }
 }
 

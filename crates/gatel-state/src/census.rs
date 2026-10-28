@@ -143,11 +143,21 @@ pub fn publish_one(runtime: &UpstreamRuntime, telemetry: &Telemetry) {
         metrics.census(kind, counts[kind as usize]);
     }
 
-    let (idle, in_use) = runtime.pool.stats().iter().fold((0, 0), |(idle, in_use), stats| {
-        (idle + stats.idle as i64, in_use + stats.in_use as i64)
-    });
+    let (idle, in_use, streams) =
+        runtime
+            .pool
+            .stats()
+            .iter()
+            .fold((0, 0, 0), |(idle, in_use, streams), stats| {
+                (
+                    idle + stats.idle as i64,
+                    in_use + stats.in_use as i64,
+                    streams + stats.streams_in_use as i64,
+                )
+            });
     metrics.pool_idle.set(idle);
     metrics.pool_in_use.set(in_use);
+    metrics.pool_streams_in_use.set(streams);
 
     // Not "any endpoint is healthy" but "any endpoint could take a request
     // right now", which is the question readiness is actually asking. It

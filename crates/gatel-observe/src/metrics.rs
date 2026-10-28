@@ -225,6 +225,8 @@ pub struct Upstream {
     endpoints: [Gauge; Condition::ALL.len()],
     pub pool_idle: Gauge,
     pub pool_in_use: Gauge,
+    /// Reserved HTTP/2 request streams; separate from physical connections.
+    pub pool_streams_in_use: Gauge,
 }
 
 impl Upstream {
