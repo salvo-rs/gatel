@@ -217,11 +217,10 @@ pub async fn deliver(
         // The idle Tokio file transfers its original handle without reopening
         // the path. Read directly into the outgoing buffer in one worker.
         let file = file.into_std().await;
-        let buffer =
-            tokio::task::spawn_blocking(move || crate::file_body::read_exact_prefix(file, length as usize))
-                .await
-                .map_err(std::io::Error::other)??;
-        response.body(ResBody::Once(buffer.into()));
+        let buffer = tokio::task::spawn_blocking(move || crate::file_body::read_bytes(file, length as usize))
+            .await
+            .map_err(std::io::Error::other)??;
+        response.body(ResBody::Once(buffer));
         return Ok(());
     }
     if start > 0 {
@@ -237,14 +236,10 @@ pub async fn deliver(
         return Ok(());
     }
 
-    // Streamed: the memory this costs is one buffer, whatever the file weighs.
-    let stream =
-        tokio_util::io::ReaderStream::with_capacity(crate::file_body::ExactReader::new(file, length), CHUNK);
-    let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
-        Ok(bytes) => Ok(http_body::Frame::data(bytes)),
-        Err(error) => Err(Box::new(error) as salvo_core::BoxedError),
-    });
-    response.body(ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames))));
+    let file = file.into_std().await;
+    response.body(ResBody::Boxed(Box::pin(crate::file_body::FileBody::new(
+        file, length, CHUNK,
+    ))));
     Ok(())
 }
 
@@ -527,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn pathname_replacement_cannot_change_an_opened_representation() {
-        for size in [32, INLINE_LIMIT as usize + 4096] {
+        for size in [32, INLINE_LIMIT as usize, INLINE_LIMIT as usize + 4096] {
             let original = vec![b'a'; size];
             let path = write("replace-opened", &original).await;
             let opened = OpenedFile::open(&path).await.unwrap();
@@ -548,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn truncation_is_an_error_for_inline_and_streaming_bodies() {
         use http_body_util::BodyExt;
-        for size in [32, INLINE_LIMIT as usize + 4096] {
+        for size in [32, INLINE_LIMIT as usize, INLINE_LIMIT as usize + 4096] {
             let path = write("truncate-opened", &vec![b'a'; size]).await;
             let opened = OpenedFile::open(&path).await.unwrap();
             std::fs::OpenOptions::new()
