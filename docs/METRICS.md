@@ -10,11 +10,42 @@
 | `gatel_health_reason{reason}` | 指定原因当前存在为 1，否则为 0；同类多个资源故障只汇总为一个值 |
 
 `reason` 固定为 starting、no_listeners、draining、persistence_unknown、reload_failing、
-upstream_down、certificate_pending，共 7 条序列，始终输出零值。不把配置内容、错误详情、
+upstream_down、certificate_pending、log_io_failed，共 8 条序列，始终输出零值。不把配置内容、错误详情、
 站点/上游名称作为这些指标的标签。两项取自同一次健康报告；不承诺与其他指标形成原子快照。
 普通配置拒绝可能是 degraded 且 `gatel_ready=1`；持久化结果不明为
 `gatel_health_reason{reason="persistence_unknown"}=1` 且 `gatel_ready=0`。
 该故障锁存于当前宿主生命周期，不能用后续内存提交清除；指标不是写入回执或自动重启授权。
+
+## 访问日志与连接池
+
+文件日志按规范化路径共享单个 writer。`sink` 标签只取配置指定的文件路径或固定 `stderr`，
+不从请求或错误文本生成。队列写入不等待磁盘；故障诊断由 writer 直接输出 stderr，
+每个 writer 最多每 30 秒一次，不重新入队。以下指标与原有的队列丢行计数分别统计：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `gatel_log_lines_dropped_total{sink}` | counter | 有界队列已满或 writer 已断开而丢弃的日志行 |
+| `gatel_log_write_errors_total{sink}` | counter | 写入或重新打开文件失败的次数 |
+| `gatel_log_flush_errors_total{sink}` | counter | flush 失败的次数 |
+| `gatel_log_rotation_errors_total{sink}` | counter | 轮换删除、重命名或新文件打开失败的次数 |
+| `gatel_log_last_success_timestamp_seconds{sink}` | gauge | 最近一次成功写入的 Unix 秒；尚未成功为 0 |
+| `gatel_log_io_failed{sink}` | gauge | 最近失败的操作尚未恢复为 1，否则为 0 |
+
+失败累计值不会因恢复清零；成功执行对应操作清除当前故障。后续成功写入且无需轮换时，
+旧轮换故障也视为恢复。存在活动 sink 的 I/O 故障时健康报告为 degraded，固定原因
+`log_io_failed` 为 1，仍可服务且 `gatel_ready=1`；该原因不是自动重启授权。
+成功 write/flush 只表示操作系统接受该调用，不承诺 fsync 持久性。关闭最后一个 sink 时
+会等待 writer 排空队列；这些指标不保证进程崩溃或强制结束后的计量。
+
+轮换 size/keep 仅在成功配置发布时更新共享 writer，失败或 stale 候选不改变现行策略。
+同一候选中同路径配置不同策略会拒绝发布。keep 缩小时在下一次实际轮换清理多余备份；
+禁用轮换保留已有备份。各日志字段独立采样，不是跨字段事务快照。
+
+`gatel_upstream_pool_connections{upstream,state}` 统计物理连接，state 为 idle 或 in_use；
+HTTP/2 的一个繁忙连接可以承载多个请求。新增 gauge
+`gatel_upstream_pool_streams_in_use{upstream}` 统计预约中的 HTTP/2 stream（包括等待响应），
+HTTP/1 为 0。标签仍只使用配置中的 upstream 名称。两者按 census 采样，可能短暂落后
+于当前请求，不能用 stream 数替代物理连接数计算连接上限。
 
 ## 配置代号与通知顺序
 

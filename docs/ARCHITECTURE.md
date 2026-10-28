@@ -27,6 +27,30 @@ the tunnel after Hyper completes its HTTP phase. The original connection task
 keeps its generation and capacity permit until the tunnel ends. Listener drain
 owns all such tasks and cancels/joins them at the configured grace deadline.
 
+## Request path identity
+
+Before selecting a route or its guards, the dispatcher decodes the URL path
+exactly once and normalizes repeated separators and dot components. Backslash
+is treated as a separator on every platform. Route declarations use the same
+identity, and overlap checks run on those normalized patterns. Only a literal
+final `*` in the declaration selects prefix syntax; an encoded asterisk remains
+a literal character. Malformed percent escaping, invalid UTF-8 and decoded
+control characters produce a 400 response before running route handlers.
+
+The original escaped URI and query remain unchanged for the terminal, cache key
+and redirect construction. In particular, `%25` does not cause a second decode.
+File containment and public filename checks continue to apply after routing.
+Filesystem links and aliases are still part of the trusted operator-provided
+file tree; a URL guard does not establish a separate filesystem sandbox.
+
+On Windows, file requests must additionally use the exact canonical relative
+filename spelling. This rejects case aliases, short names and internal
+symlink/junction aliases, including indexes, precompressed sidecars and browse
+entries. Configure index/fallback filenames with their actual on-disk case.
+The configured root itself is canonicalized first and may still name a link.
+Unix public symlinks retain their existing behavior; hard-link aliases and
+concurrent filesystem replacement are outside this spelling check.
+
 ## The one path
 
 `GenerationStore::source_writer` can mint a `SourceWriter` only for an explicitly
@@ -870,6 +894,7 @@ answer.
 | Replace the backend list | replaced | replaced | replaced | reused |
 | Change `balance` | reused | reused | **replaced** | reused |
 | Raise `rate-limit max` | reused | reused | reused | **reused** |
+| Change `rate-limit max-keys` | reused | reused | reused | **replaced** |
 | Change `rate-limit key` | reused | reused | reused | **replaced** |
 | Edit an unrelated route | reused | reused | reused | reused |
 
@@ -879,6 +904,31 @@ limit must not hand every client a fresh allowance. `gatel diff` prints this
 table for two real configurations before either is applied, and
 `gatel-http/tests/stability.rs` fails if any cell of it stops being true — the
 table is a test, not a description.
+
+Changing `rate-limit max-keys` rebuilds its state with the new capacity and
+resets existing counts. Diff reports an incompatible restart; a failed or stale
+candidate does not replace the active state's counters or capacity.
+
+For upstream pools, `max-per-endpoint` limits physical connections for both
+HTTP/1 and HTTP/2. HTTP/2 also has two independent local reservation bounds:
+`max-h2-streams-per-connection` and `max-h2-streams-per-endpoint`, both defaulting
+to 128 and rejecting zero. Both enter the policy hash, including inline proxy
+identity. An endpoint's stream bound spans all its physical connections. Each
+connection is further constrained by the remote SETTINGS already received and
+observed; before receiving it, Hyper's initial estimate is 100. Hyper applies
+the updated remote limit to actual wire sends. A SETTINGS value of zero admits
+no new requests; a 50-ms observation timer wakes pool waiters on capacity changes, so a
+waiting request can proceed when the peer raises the limit without another
+request having to trigger progress.
+
+One HTTP/2 lease admits one request, and its stream reservation remains occupied until
+both request upload and response body finish or are cancelled. A successful
+reload updates these bounds without killing older streams; a shrink may leave
+temporary usage above the new limit while existing work drains. GOAWAY retires
+the connection for new requests while retaining its physical slot until older
+streams finish. With `max-per-endpoint=1`, a replacement waits for those streams
+instead of opening a second physical connection. Physical connection gauges and
+reserved-stream gauges therefore measure different resources.
 
 Directives take part in the same table. A directive declares what it needs to
 keep between requests, and its state is owned by the site or route it was
@@ -1041,20 +1091,24 @@ one that was never offered.
 | `header` | the request head | hyper's read buffer for HTTP/1, `max_header_list_size` for HTTP/2 |
 | `body` | the request body | refused before reading when the length is declared, cut off mid-stream when it is not |
 | `handshake-timeout` | a TLS handshake | a deadline around the accept |
-| `idle` | a connection with no complete head | hyper's header read timeout |
-| `connections` | the whole process | a permit taken before `accept`, held for the connection |
+| `idle` | HTTP protocol detection and a connection with no active request | a connection activity deadline, plus HTTP/1 header read timeout |
+| `connections` | admitted work across the whole process | FIFO admission after accept; held through the connection and any upgrade |
 
 `idle` covers two things with one number on purpose. A keep-alive connection
 waiting for its next request and a client dribbling a head out one byte at a
 time are the same thing seen from the socket, and separating them would mean
-knowing which the peer intends.
+knowing which the peer intends. The activity deadline also covers partial H2
+prefaces, SETTINGS-only peers and unfinished initial headers. Completed headers
+start request activity, which continues through the response body or cancellation.
+Active requests retain their own deadlines; another incomplete H2 stream does
+not yet have an independent header deadline while one stream remains active.
 
-The connection cap is taken *before* accepting rather than after. A connection
-accepted and then closed has already cost a handshake and told the client it was
-welcome; one left in the backlog costs nothing and lets a load balancer notice.
-Lowering the cap never closes anything that is already open — it takes effect as
-connections end, because dropping a live request to satisfy a number somebody
-just typed is a worse surprise than being briefly over it.
+An idle listener does not reserve a connection permit. Each accept loop holds at
+most one accepted, unhandshaken socket while waiting in the shared FIFO queue;
+the remaining traffic stays in the backlog. This adds at most one pending file
+descriptor per listener beyond admitted work. Lowering the cap does not close
+active connections: returned permits consume the outstanding shrink debt before
+new work is admitted, including when an assigned waiter is cancelled.
 
 ## What may be tried again
 

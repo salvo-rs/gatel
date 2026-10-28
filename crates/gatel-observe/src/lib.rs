@@ -12,6 +12,8 @@
 //! handle resolved beforehand, with no way back to the registry, so the number
 //! of series is a property of the configuration rather than of the traffic.
 
+#![forbid(unsafe_code)]
+
 pub mod access;
 pub mod blocking;
 pub mod health;

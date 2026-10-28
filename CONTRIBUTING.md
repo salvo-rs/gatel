@@ -1,115 +1,114 @@
 # Contributing to Gatel
 
-Thank you for your interest in contributing to Gatel! This guide will help you get started.
+This tree is the v2 rewrite. Its APIs and configuration surface are still under
+development; use the checked-in lockfiles when reproducing a result.
 
-## Development Setup
+## Development setup
 
-### Prerequisites
+Requires Rust 1.94 or later and Git. Choose an external build-cache directory
+appropriate for your machine. For example, in PowerShell:
 
-- [Rust](https://rustup.rs/) 1.75 or later (stable)
-- Git
-
-### Building
-
-```bash
-# Clone the repository
-git clone https://github.com/salvo-rs/gatel.git
-cd gatel
-
-# Build in debug mode
-cargo build
-
-# Build with all features
-cargo build --features "http3,bcrypt"
-
-# Run tests
-cargo test --workspace
-
-# Run lints
-cargo clippy --workspace --all-targets -- -D warnings
-
-# Check formatting
-cargo +nightly fmt --all -- --check
+```powershell
+$env:CARGO_TARGET_DIR = 'D:/BuildCache/gatel'
+cargo metadata --no-deps --format-version 1 --locked
 ```
 
-### Running
+Check the returned `target_directory` before compiling. In a WSL workspace whose
+build storage must stay on D, verify the `/mnt/d` mount first and point
+`CARGO_TARGET_DIR` at `/mnt/d/BuildCache/gatel`. Docker has its own storage:
+setting Cargo's directory does not relocate a Docker builder cache.
 
-```bash
-# Quick static file server (no config needed)
-cargo run -- serve --port 8080
-
-# Run with a config file
-cargo run -- run --config gatel.kdl
-
-# Validate a config without starting
-cargo run -- validate --config gatel.kdl
+```sh
+cargo build -p gatel --locked
+cargo test --workspace --all-targets --locked
+cargo test --workspace --all-features --all-targets --locked
+cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo run -p xtask --locked
+cargo +1.94.0 check --workspace --all-features --all-targets --locked
 ```
 
-## Project Structure
+The last command requires that toolchain to be installed. `xtask` checks
+dependency layering, source sizes, events, inert configuration, and the threat
+model's build/evidence inventory. `cargo deny check` gates advisories, licenses,
+banned crates and sources. See [CI](.github/workflows/ci.yml) for separate plugin,
+interop, fuzz, soak and packaging jobs; explicitly ignored tests need their
+documented external fixtures and are not covered by a normal successful run.
 
-```
-crates/
-├── gatel/          # Binary — CLI, signal handling, tracing init
-├── core/           # Library — all server logic
-│   └── src/
-│       ├── config/     # KDL configuration parsing
-│       ├── hoops/      # Middleware (rate limit, auth, CORS, etc.)
-│       ├── goals/      # Terminal handlers (file server, redirect)
-│       ├── proxy/      # Reverse proxy, FastCGI, SCGI, CGI
-│       ├── router/     # Path matching and request matchers
-│       ├── server/     # HTTP/HTTPS/H3 listeners
-│       ├── tls/        # TLS and ACME integration
-│       ├── admin/      # Admin API endpoints
-│       └── stream/     # L4 TCP stream proxy
-├── passwd/         # Password hashing utility
-└── precompress/    # Static asset precompression
-```
+Stable rustfmt may report that this tree's optional nightly-only formatting
+settings are unavailable. Use nightly formatting when changing those settings;
+the stable CI formatting check must still pass.
 
-## Making Changes
+## Running
 
-1. **Fork** the repository and create a feature branch from `main`.
-2. **Write code** — keep changes focused; one PR per concern.
-3. **Add tests** for new functionality where practical.
-4. **Run the full check suite** before submitting:
-   ```bash
-   cargo +nightly fmt --all
-   cargo clippy --workspace --all-targets -- -D warnings
-   cargo test --workspace
-   ```
-5. **Open a pull request** against `main` with a clear description.
-
-### Commit Messages
-
-Use clear, concise commit messages in imperative form:
-
-```
-Add CORS middleware support
-Fix health check timeout handling
-Refactor proxy upstream selection
+```sh
+cargo run -p gatel --locked -- serve . --port 8080
+cargo run -p gatel --locked -- run gatel.kdl
+cargo run -p gatel --locked -- validate gatel.kdl
+cargo run -p gatel --locked -- capabilities
 ```
 
-### Code Style
+Configuration paths are positional arguments. `validate` compiles without
+preparing resources; `run --dry-run` prepares and binds before exiting. Optional
+capabilities include `maintenance`, `fastcgi`, `scgi`, `cgi`, `decode`, `argon2`
+and `admin-api`, selected through Cargo features. Check
+[FEATURES](docs/FEATURES.md), [CLI](docs/CLI.md), and
+[plugin contracts](docs/PLUGINS.md) for their limits and platform support.
 
-- Follow `rustfmt` defaults (see `rustfmt.toml`).
-- Prefer explicit types over excessive `impl Trait` in public APIs.
-- Keep modules focused — one responsibility per file.
-- Use `tracing` for logging, not `println!` or `eprintln!`.
+## Project structure
 
-## Adding a New Middleware (Hoop)
+- `gatel-model`, `gatel-kdl`, `gatel-macros`: format-neutral input, KDL frontend
+  and strict derived decoders.
+- `gatel-plan`: normalization, route compilation and configuration transactions.
+- `gatel-state`, `gatel-http`, `gatel-tls`: persistent runtime state, listeners
+  and proxying, and TLS/certificate ownership.
+- `gatel-observe`, `gatel-bundle-std`: metrics/logging/health and standard
+  directives.
+- `gatel-plugin-api`, `gatel-plugin-runtime`, and `plugins/`: plugin metadata,
+  runtime bridge and optional source-linked capabilities.
+- `gatel-password`, `gatel-cgi-http`, `gatel-cgi-protocol`,
+  `gatel-process-windows`: bounded credential handling and shared CGI/platform
+  boundaries.
+- `crates/gatel`: executable, watcher and optional management/checkpoint host.
+- `xtask/`, `fuzz/`, `benchmarks/`: repository gates, separate fuzz workspace and
+  reproducible local performance workloads.
 
-1. Create `crates/core/src/hoops/your_hoop.rs` implementing `salvo::Handler`.
-2. Add a variant to `HoopConfig` in `crates/core/src/config/types.rs`.
-3. Add a parsing function in `crates/core/src/config/parse.rs`.
-4. Register it in `is_known_directive()` in `parse.rs`.
-5. Wire it up in `build_route_router()` in `crates/core/src/salvo_service.rs`.
-6. Add an example configuration in `examples/`.
+The dependency allowlist in [layers.rs](xtask/src/layers.rs) is checked, not just
+suggested. The production unsafe exception is documented in the
+[threat model](docs/design/threat-model.md); other production entrypoints forbid
+unsafe Rust.
 
-## Reporting Issues
+## Making changes
 
-- Search existing issues before opening a new one.
-- Include your OS, Rust version, and a minimal reproducing config.
-- For security issues, see [SECURITY.md](SECURITY.md).
+Base changes on the development branch for the version being changed. Keep each
+PR focused, describe the observable before/after behavior, and include the
+validation relevant to that behavior. Do not treat a test count alone as proof
+of protocol, security or resource invariants.
 
-## License
+For a new directive:
 
-By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE).
+1. Choose its phase, role, scopes and effects using `gatel-plan` contracts.
+2. Implement strict decoding and `DirectiveConfig`; reject unsupported input
+   rather than silently accepting an inert knob.
+3. Register it through the appropriate standard or optional bundle. Follow
+   [PLUGINS](docs/PLUGINS.md) for prepared resources and lifecycle ownership.
+4. Declare state compatibility/reset semantics and publication behavior. A
+   failed or stale candidate must not mutate the active generation's policy.
+5. Add configuration examples and the smallest meaningful unit and real
+   protocol regressions. Include cancellation, failure and reload cases when
+   the directive owns resources or persistent state.
+6. Update capability and threat-model evidence where behavior changes, then run
+   the relevant tests and repository checks above.
+
+Use `tracing` for runtime events and document new stable events in
+[EVENTS](docs/EVENTS.md). CLI artifacts and intentional command output use
+stdout/stderr according to their existing contracts. Keep modules focused and
+use concise commit and PR titles describing the change.
+
+## Reporting issues
+
+Include the OS, Rust version, enabled features, minimal configuration, expected
+and observed behavior, and a bounded reproduction where possible. For security
+issues follow [SECURITY](SECURITY.md).
+
+Contributions are licensed under [Apache License 2.0](LICENSE).

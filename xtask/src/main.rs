@@ -12,10 +12,13 @@
 //!   and then ignored is worse than one that was never offered, because the operator who sets it stops
 //!   looking for the real problem — and this rule exists because three of them were found that way.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod contracts;
 mod dependencies;
 mod layers;
 mod publish;
@@ -43,16 +46,18 @@ fn main() -> ExitCode {
         "loc" => check_file_sizes(&root),
         "events" => check_events(&root),
         "inert" => check_inert_configuration(&root),
+        "contracts" => contracts::check(&root),
         "check" => {
             let mut failures = check_dependencies(&root);
             failures.extend(check_file_sizes(&root));
             failures.extend(check_events(&root));
             failures.extend(check_inert_configuration(&root));
+            failures.extend(contracts::check(&root));
             failures
         }
         other => {
             eprintln!(
-                "xtask: unknown task `{other}`; try deps, loc, events, inert, check or publish-plan"
+                "xtask: unknown task `{other}`; try deps, loc, events, inert, contracts, check or publish-plan"
             );
             return ExitCode::from(2);
         }
