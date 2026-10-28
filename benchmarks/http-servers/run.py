@@ -456,9 +456,9 @@ def generate_report(
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         for row in rows:
-            ratio = row["rps"] / baseline if baseline else 0.0
+            ratio = f"{row['rps'] / baseline:.2f}x" if baseline else "N/A"
             lines.append(
-                f"| {row['target']} | {row['rps']:,.0f} | {ratio:.2f}x | "
+                f"| {row['target']} | {row['rps']:,.0f} | {ratio} | "
                 f"{row['latency']:.2f} ms | {row['p90']:.2f} ms | {row['p99']:.2f} ms | "
                 f"{format_bps(row['bps'])} | {row['errors']} |"
             )

@@ -10,6 +10,15 @@ import run as bench
 
 
 class HarnessTests(unittest.TestCase):
+    def test_report_without_gatel_does_not_invent_a_baseline_ratio(self):
+        args = argparse.Namespace(rounds=1, duration=2, warmup=0, threads=2, connections=8)
+        row = SimpleNamespace(scenario="static-64k", target="nginx", requests_per_sec=100,
+                              transfer_bytes_per_sec=6553600, latency_avg_ms=1, p90_ms=2,
+                              p99_ms=3, non_2xx_3xx=0, socket_errors=0)
+        report = bench.generate_report(Path("results"), args, {"nginx": "test"}, [row],
+                                       {"static-64k": bench.SCENARIOS["static-64k"]})
+        self.assertIn("| nginx | 100 | N/A |", report)
+
     def test_wrk_errors_and_latency_units_are_not_lost(self):
         raw = """Latency 1.25ms 700.00us 1.10s 90.00%
   50% 800.00us
