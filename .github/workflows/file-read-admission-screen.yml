@@ -1,0 +1,48 @@
+name: Screen bounded bulk-file read admission (one-off)
+on:
+  push:
+    branches: [bench/file-read-admission-screen-20261029]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f11ffccdaaae6249c1f779160b5b84af1f479ae6
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 63102dbec5f411aa300ea7ea3a29ec1eebe98578
+          path: candidate
+          persist-credentials: false
+      - name: Record remote builder and host
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/file-read-admission-screen"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          { uname -a; lscpu; free -h; docker info; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
+      - name: Build alternatives and verify the archived production baseline
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/file-read-admission-screen.py build
+      - name: Compare both alternatives and baseline in balanced order
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-read-admission-screen.py measure
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: file-read-admission-screen
+          path: ${{ runner.temp }}/file-read-admission-screen
+          if-no-files-found: error
