@@ -341,6 +341,21 @@ def verify_payload(url: str, config: dict) -> dict:
     return {"url": url, "status": actual_status, "bytes": len(body), "range": config.get("range")}
 
 
+def client_network_settings() -> dict:
+    """Record the client's actual receive profile once, before warmup."""
+    result = compose(
+        "exec", "-T", "bench", "cat", "/proc/sys/net/ipv4/tcp_rmem",
+        check=False, capture_output=True,
+    )
+    try:
+        values = [int(value) for value in result.stdout.split()]
+        if result.returncode or len(values) != 3 or not 0 < values[0] <= values[1] <= values[2]:
+            raise ValueError("unavailable or invalid tcp_rmem")
+    except ValueError:
+        return {"tcp_rmem_bytes": None, "error": result.stderr.strip() or result.stdout.strip()}
+    return {"tcp_rmem_bytes": values}
+
+
 # ------------------------------------------------------------------ reporting
 
 
@@ -409,6 +424,7 @@ def generate_report(
     software: dict[str, str],
     results: list[BenchResult],
     scenarios: dict,
+    client_network: dict | None = None,
 ) -> str:
     grouped: dict[str, list[BenchResult]] = {}
     for result in results:
@@ -427,11 +443,17 @@ def generate_report(
         "- `wrk` from a container of its own, so it contends with every target alike",
         f"- {args.rounds} round(s) of {args.duration}s each, after a {args.warmup}s warmup",
         f"- {args.threads} threads, {args.connections} connections",
+        "- Client tcp_rmem (bytes): " + (
+            " ".join(map(str, client_network["tcp_rmem_bytes"]))
+            if client_network and client_network.get("tcp_rmem_bytes") else "unavailable"
+        ),
         "- `Accept-Encoding: identity`, so every server returns the same bytes",
         "",
         f"- wrk's latency histogram limit remains {WRK_TIMEOUT_SECONDS}s. Completed requests",
         "  beyond that limit count as timeouts and are excluded from its latency statistics.",
         "  A nonzero over-limit count means p99/Max do not describe the full response tail.",
+        "  Requests still in flight when wrk stops are also absent; zero timeouts",
+        "  do not prove that every request completed within the limit.",
         "",
         "One machine, one moment. These numbers are for comparing the three",
         "servers against each other here, not for quoting anywhere else.",
@@ -523,6 +545,8 @@ def main() -> int:
                 checks.append(verify_payload(url, config))
                 (output_dir / "payload-checks.json").write_text(json.dumps(checks, indent=2), encoding="utf-8")
 
+        client_network = client_network_settings()
+        (output_dir / "network-settings.json").write_text(json.dumps(client_network, indent=2), encoding="utf-8")
         software = versions(targets)
 
         for scenario, config in scenarios.items():
@@ -544,7 +568,7 @@ def main() -> int:
         (output_dir / "summary.json").write_text(
             json.dumps([asdict(item) for item in results], indent=2), encoding="utf-8"
         )
-        report = generate_report(output_dir, args, software, results, scenarios)
+        report = generate_report(output_dir, args, software, results, scenarios, client_network)
         (output_dir / "report.md").write_text(report, encoding="utf-8")
         print(report)
         print(f"\nReport written to: {output_dir / 'report.md'}")
