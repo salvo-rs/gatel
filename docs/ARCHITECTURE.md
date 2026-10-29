@@ -1224,9 +1224,9 @@ cached bodies hold leases outside this idle bound, and a short body can retain
 a full size class.
 
 Larger responses retain the portable Tokio reader and 64 KiB frames. A capable
-Linux host advertises a zero-sized `BoundedFileOutput` marker on HTTP/1.1
-requests. The file handler returns that marker for selected bodies of at least
-8 MiB. H2, HTTP/1.0, smaller selected ranges and hosts without this capability
+Linux host honors a zero-sized `BoundedFileOutput` response marker for HTTP/1.1.
+The file handler adds that marker for selected bodies of at least 8 MiB.
+H2, HTTP/1.0, smaller selected ranges and hosts without this capability
 keep their previous output policy.
 
 The native host bounds the unsent queue for these bulk-file responses using
