@@ -16,7 +16,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: 4a10076
+          ref: 4a10076e798ea2502236201ae910e0c39dd8f3b9
           path: source
           persist-credentials: false
       - name: Record remote environment
