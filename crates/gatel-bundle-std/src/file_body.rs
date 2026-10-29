@@ -113,7 +113,8 @@ static DIAG_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 pub(crate) fn report_delay(event: &str, id: u64, remaining: u64, elapsed: std::time::Duration) {
     if elapsed >= std::time::Duration::from_millis(100)
-        && DIAG_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000
+        && (!event.starts_with("poll_gap")
+            || DIAG_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000)
     {
         let unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -126,6 +127,35 @@ pub(crate) fn report_delay(event: &str, id: u64, remaining: u64, elapsed: std::t
     }
 }
 
+struct StreamProbe {
+    id: u64,
+    remaining: u64,
+    started: std::time::Instant,
+    gaps: std::time::Duration,
+    queue: std::time::Duration,
+    io: std::time::Duration,
+    resume: std::time::Duration,
+    reads: u64,
+}
+impl Drop for StreamProbe {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) {
+            eprintln!(
+                "FILE_TOTAL id={} remaining={} elapsed_us={} gap_us={} queue_us={} io_us={} resume_us={} reads={}",
+                self.id,
+                self.remaining,
+                elapsed.as_micros(),
+                self.gaps.as_micros(),
+                self.queue.as_micros(),
+                self.io.as_micros(),
+                self.resume.as_micros(),
+                self.reads
+            );
+        }
+    }
+}
+
 pub(crate) fn large_stream(file: std::fs::File, length: u64) -> salvo_core::http::ResBody {
     let id = DIAG_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let state = (
@@ -135,13 +165,24 @@ pub(crate) fn large_stream(file: std::fs::File, length: u64) -> salvo_core::http
         false,
         std::time::Instant::now(),
         id,
+        StreamProbe {
+            id,
+            remaining: length,
+            started: std::time::Instant::now(),
+            gaps: std::time::Duration::ZERO,
+            queue: std::time::Duration::ZERO,
+            io: std::time::Duration::ZERO,
+            resume: std::time::Duration::ZERO,
+            reads: 0,
+        },
     );
     let frames = futures_util::stream::try_unfold(
         state,
-        |(mut file, mut remaining, mut ready, started, last, id)| async move {
+        |(mut file, mut remaining, mut ready, started, last, id, mut probe)| async move {
             if remaining == 0 {
                 return Ok::<_, salvo_core::BoxedError>(None);
             }
+            probe.gaps += last.elapsed();
             report_delay(
                 if ready.is_empty() {
                     "poll_gap_empty"
@@ -159,26 +200,34 @@ pub(crate) fn large_stream(file: std::fs::File, length: u64) -> salvo_core::http
                 let length = remaining.min(STREAM_READ as u64) as usize;
                 let mut input = file.take().expect("a pending batch owns its file");
                 let queued = std::time::Instant::now();
-                let (next, bytes, finished) = tokio::task::spawn_blocking(move || {
-                    report_delay("read_queue", id, remaining, queued.elapsed());
+                let (next, bytes, finished, queue, io) = tokio::task::spawn_blocking(move || {
+                    let queue = queued.elapsed();
+                    report_delay("read_queue", id, remaining, queue);
                     let start = std::time::Instant::now();
                     let bytes = STREAM_BUFFERS.read(&mut input, length);
-                    report_delay("read_io", id, remaining, start.elapsed());
+                    let io = start.elapsed();
+                    report_delay("read_io", id, remaining, io);
                     let bytes = bytes?;
                     let file = (remaining > length as u64).then_some(input);
-                    Ok::<_, io::Error>((file, bytes, std::time::Instant::now()))
+                    Ok::<_, io::Error>((file, bytes, std::time::Instant::now(), queue, io))
                 })
                 .await
                 .map_err(io::Error::other)??;
-                report_delay("read_resume", id, remaining, finished.elapsed());
+                let resume = finished.elapsed();
+                probe.queue += queue;
+                probe.io += io;
+                probe.resume += resume;
+                probe.reads += 1;
+                report_delay("read_resume", id, remaining, resume);
                 file = next;
                 ready = bytes;
             }
             let bytes = ready.split_to(MAX_CHUNK.min(ready.len()));
             remaining -= bytes.len() as u64;
+            probe.remaining = remaining;
             Ok(Some((
                 http_body::Frame::data(bytes),
-                (file, remaining, ready, true, std::time::Instant::now(), id),
+                (file, remaining, ready, true, std::time::Instant::now(), id, probe),
             )))
         },
     );
