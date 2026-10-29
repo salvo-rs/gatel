@@ -45,10 +45,15 @@ def main():
                     proofs.append({'mode':mode,'phase':phase,'variant':variant,'size':size,'sha256':hashlib.sha256(body).hexdigest(),'bytes':len(body)})
                     clients,streams=(1,1) if smoke else (128,1) if mode=='h1-tls' else (8,16)
                     duration=1 if smoke else 30 if size=='10m' else 10
-                    command=['docker','exec','gatel-protocol-client','h2load','-t4','-c'+str(clients),'-m'+str(streams),'-D'+str(duration),'--warm-up-time='+('0' if smoke else '3'),'-N5','-H','accept-encoding: identity']
+                    command=['docker','exec','gatel-protocol-client','h2load','-t'+('1' if smoke else '4'),'-c'+str(clients),'-m'+str(streams),'-D'+str(duration),'--warm-up-time='+('0' if smoke else '3'),'-N5','-H','accept-encoding: identity']
                     if mode=='h1-tls':command.append('--h1')
-                    raw=capture(command+[url],text=True,timeout=duration+35)
+                    measured=subprocess.run(list(map(str,command+[url])),capture_output=True,text=True,timeout=duration+35)
+                    raw=measured.stdout
                     (directory/(size+'.txt')).write_text(raw)
+                    (directory/(size+'-stderr.txt')).write_text(measured.stderr)
+                    if measured.returncode:
+                        print(measured.stderr,flush=True)
+                        raise RuntimeError('h2load exited '+str(measured.returncode))
                     metric=re.search(r'requests:.*?(\d+) done, (\d+) succeeded, (\d+) failed, (\d+) errored, (\d+) timeout',raw)
                     assert metric,raw
                     done,succeeded,failed,errored,timeout=map(int,metric.groups())
