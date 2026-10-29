@@ -101,10 +101,16 @@ pub(crate) fn stream(
     length: u64,
 ) -> salvo_core::http::ResBody {
     let frames = futures_util::stream::try_unfold(
-        (reader, start, length),
-        |(mut reader, start, remaining)| async move {
+        (reader, start, length, false),
+        |(mut reader, start, remaining, started)| async move {
             if remaining == 0 {
                 return Ok::<_, salvo_core::BoxedError>(None);
+            }
+            // A ready blocking result must not let a hot file produce a run
+            // of ready frames. Give the transport a chance to flush and let
+            // other connections progress between chunks.
+            if started {
+                tokio::task::yield_now().await;
             }
             let length = remaining.min(MAX_CHUNK as u64) as usize;
             let (reader, bytes) = tokio::task::spawn_blocking(move || {
@@ -118,7 +124,7 @@ pub(crate) fn stream(
             .map_err(io::Error::other)??;
             Ok(Some((
                 http_body::Frame::data(bytes),
-                (reader, 0, remaining - length as u64),
+                (reader, 0, remaining - length as u64, true),
             )))
         },
     );
