@@ -6,6 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(feature = "admin-api")]
 mod admin;
 mod app;

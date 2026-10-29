@@ -46,6 +46,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
+
 [features]
 admin-api = ["dep:bytes", "dep:http", "dep:http-body", "dep:http-body-util", "dep:subtle", "dep:hyper", "dep:hyper-util", "dep:serde_json"]
 decode = ["dep:gatel-decode"]
