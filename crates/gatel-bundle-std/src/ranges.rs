@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use salvo_core::http::{Request, ResBody, Response, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncSeekExt;
 
 /// Files up to this size are read in one go. Bigger ones are streamed.
 ///
@@ -32,6 +32,9 @@ const INLINE_LIMIT: u64 = 64 * 1024;
 /// [`INLINE_LIMIT`]: below that a file is read whole, above it the file is read
 /// in pieces of exactly that size.
 const CHUNK: usize = INLINE_LIMIT as usize;
+
+/// Large responses read each frame directly into its outgoing owner.
+const DIRECT_READ_MIN: u64 = 1024 * 1024;
 
 /// One opened representation owns both the metadata and the eventual reader.
 /// A path replacement after opening cannot select another file for its body.
@@ -213,40 +216,40 @@ pub async fn deliver(
     }
 
     let mut file = opened.file;
-    if length <= INLINE_LIMIT && start == 0 {
+    if length <= INLINE_LIMIT {
         // The idle Tokio file transfers its original handle without reopening
         // the path. Read directly into the outgoing buffer in one worker.
-        let file = file.into_std().await;
+        let mut file = file.into_std().await;
         if length < crate::file_body::POOLED_MIN as u64 {
             let buffer = tokio::task::spawn_blocking(move || {
+                if start != 0 {
+                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))?;
+                }
                 crate::file_body::read_exact_prefix(file, length as usize)
             })
             .await
             .map_err(std::io::Error::other)??;
             response.body(ResBody::Once(buffer.into()));
         } else {
-            let buffer =
-                tokio::task::spawn_blocking(move || crate::file_body::read_bytes(file, length as usize))
-                    .await
-                    .map_err(std::io::Error::other)??;
+            let buffer = tokio::task::spawn_blocking(move || {
+                if start != 0 {
+                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))?;
+                }
+                crate::file_body::read_bytes(file, length as usize)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
             response.body(ResBody::Once(buffer));
         }
         return Ok(());
     }
-    if start > 0 {
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-    }
-
-    if length <= INLINE_LIMIT {
-        let mut buffer = Vec::with_capacity(length as usize);
-        crate::file_body::ExactReader::new(file, length)
-            .read_to_end(&mut buffer)
-            .await?;
-        response.body(ResBody::Once(buffer.into()));
+    if length >= DIRECT_READ_MIN {
+        response.body(crate::file_body::stream(file.into_std().await, start, length));
         return Ok(());
     }
-
-    // Streamed: the memory this costs is one buffer, whatever the file weighs.
+    if start != 0 {
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+    }
     let stream =
         tokio_util::io::ReaderStream::with_capacity(crate::file_body::ExactReader::new(file, length), CHUNK);
     let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {

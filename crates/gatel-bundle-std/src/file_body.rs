@@ -93,6 +93,38 @@ pub(crate) fn read_bytes(reader: impl Read, length: usize) -> io::Result<bytes::
     }
 }
 
+/// Read only when the transport asks for another frame, directly into its
+/// outgoing owner. At most one 64 KiB read is pending per response.
+pub(crate) fn stream(
+    reader: impl Read + io::Seek + Send + Sync + 'static,
+    start: u64,
+    length: u64,
+) -> salvo_core::http::ResBody {
+    let frames = futures_util::stream::try_unfold(
+        (reader, start, length),
+        |(mut reader, start, remaining)| async move {
+            if remaining == 0 {
+                return Ok::<_, salvo_core::BoxedError>(None);
+            }
+            let length = remaining.min(MAX_CHUNK as u64) as usize;
+            let (reader, bytes) = tokio::task::spawn_blocking(move || {
+                if start != 0 {
+                    reader.seek(io::SeekFrom::Start(start))?;
+                }
+                let bytes = LARGE_BUFFERS.read(&mut reader, length)?;
+                Ok::<_, io::Error>((reader, bytes))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            Ok(Some((
+                http_body::Frame::data(bytes),
+                (reader, 0, remaining - length as u64),
+            )))
+        },
+    );
+    salvo_core::http::ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames)))
+}
+
 pub(crate) struct ExactReader<R> {
     inner: Take<R>,
 }
@@ -128,6 +160,143 @@ impl<R: AsyncRead + Unpin> AsyncRead for ExactReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_frames_preserve_offsets_lengths_and_retained_clones() {
+        use http_body_util::BodyExt as _;
+        let source: Vec<_> = (0..MAX_CHUNK * 3 + 41).map(|n| (n % 251) as u8).collect();
+        let start = 13;
+        let length = MAX_CHUNK * 2 + 17;
+        let mut body = stream(io::Cursor::new(source.clone()), start as u64, length as u64);
+        let mut frames = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let bytes = frame.unwrap().into_data().unwrap();
+            assert!(bytes.len() <= MAX_CHUNK);
+            frames.push(bytes.clone());
+        }
+        assert_eq!(
+            frames.iter().map(|b| b.len()).collect::<Vec<_>>(),
+            [MAX_CHUNK, MAX_CHUNK, 17]
+        );
+        let received: Vec<_> = frames.iter().flat_map(|b| b.iter().copied()).collect();
+        assert_eq!(received, source[start..start + length]);
+    }
+
+    #[tokio::test]
+    async fn direct_reads_are_demand_driven_and_stop_when_the_body_is_dropped() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use http_body_util::BodyExt as _;
+        struct Reader {
+            input: io::Cursor<Vec<u8>>,
+            read: Arc<AtomicUsize>,
+        }
+        impl Read for Reader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let size = Read::read(&mut self.input, bytes)?;
+                self.read.fetch_add(size, Ordering::Relaxed);
+                Ok(size)
+            }
+        }
+        impl io::Seek for Reader {
+            fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+                self.input.seek(position)
+            }
+        }
+        let read = Arc::new(AtomicUsize::new(0));
+        let input = Reader {
+            input: io::Cursor::new(vec![b'x'; MAX_CHUNK * 4]),
+            read: read.clone(),
+        };
+        let mut body = stream(input, 0, MAX_CHUNK as u64 * 4);
+        assert_eq!(read.load(Ordering::Relaxed), 0);
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(read.load(Ordering::Relaxed), MAX_CHUNK);
+        drop(body);
+        tokio::task::yield_now().await;
+        assert_eq!(read.load(Ordering::Relaxed), MAX_CHUNK);
+        assert_eq!(first.as_ref(), vec![b'x'; MAX_CHUNK]);
+    }
+
+    #[tokio::test]
+    async fn a_direct_read_error_is_terminal_and_never_exposes_a_partial_frame() {
+        use http_body_util::BodyExt as _;
+        let mut body = stream(io::Cursor::new(vec![b'x'; 17]), 0, MAX_CHUNK as u64);
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_direct_read_releases_the_reader_after_that_read() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use http_body_util::BodyExt as _;
+        struct Reader {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            dropped: Option<tokio::sync::oneshot::Sender<()>>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl Read for Reader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.started.take().unwrap().send(()).unwrap();
+                self.resume
+                    .get_mut()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+                bytes.fill(b'x');
+                Ok(bytes.len())
+            }
+        }
+        impl io::Seek for Reader {
+            fn seek(&mut self, _: io::SeekFrom) -> io::Result<u64> {
+                unreachable!()
+            }
+        }
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                let _ = self.dropped.take().unwrap().send(());
+            }
+        }
+        let (started, beginning) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let (dropped, ended) = tokio::sync::oneshot::channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut body = stream(
+            Reader {
+                started: Some(started),
+                resume: std::sync::Mutex::new(resumed),
+                dropped: Some(dropped),
+                reads: reads.clone(),
+            },
+            0,
+            MAX_CHUNK as u64 * 4,
+        );
+        let mut pending = Box::pin(body.frame());
+        std::future::poll_fn(|cx| {
+            assert!(pending.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), beginning)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(pending);
+        drop(body);
+        // Started blocking I/O cannot be aborted. Completing that one read must
+        // drop its file and outgoing lease, without starting the next read.
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn pooled_bytes_keep_the_lease_until_the_last_clone_is_dropped() {
