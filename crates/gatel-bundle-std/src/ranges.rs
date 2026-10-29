@@ -519,6 +519,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ranges_preserve_frames_and_bytes_at_the_direct_read_boundary() {
+        use http_body_util::BodyExt as _;
+        let original: Vec<_> = (0..DIRECT_READ_MIN as usize + 32)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let path = write("direct-read-boundary", &original).await;
+        for start in [0, 13] {
+            for length in [DIRECT_READ_MIN - 1, DIRECT_READ_MIN, DIRECT_READ_MIN + 1] {
+                let mut response = Response::new();
+                deliver(
+                    &mut response,
+                    &path,
+                    original.len() as u64,
+                    Wanted::Part {
+                        start,
+                        end: start + length - 1,
+                    },
+                )
+                .await
+                .unwrap();
+                let mut body = std::mem::take(response.body_mut());
+                let mut received = Vec::new();
+                while let Some(frame) = body.frame().await {
+                    let bytes = frame.unwrap().into_data().unwrap();
+                    assert!(bytes.len() <= CHUNK);
+                    received.extend_from_slice(&bytes);
+                }
+                assert_eq!(received, original[start as usize..(start + length) as usize]);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn large_ranges_preserve_offsets_and_bound_outgoing_frames() {
         use http_body_util::BodyExt as _;
         let original: Vec<_> = (0..LARGE_FILE as usize * 2)

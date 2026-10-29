@@ -488,11 +488,18 @@ async fn a_poisoned_lease_is_not_returned() {
     let endpoint = Arc::clone(&set.all()[0]);
     let timeouts = Timeouts::default();
 
-    let mut lease = pool.checkout(&endpoint, &timeouts).await.unwrap();
-    lease.send(request()).await.unwrap();
-    lease.poison();
-    drop(lease);
-    assert_eq!(pool.stats()[0].idle, 0);
+    for poison_before_send in [true, false] {
+        let mut lease = pool.checkout(&endpoint, &timeouts).await.unwrap();
+        if poison_before_send {
+            lease.poison();
+        }
+        lease.send(request()).await.unwrap();
+        if !poison_before_send {
+            lease.poison();
+        }
+        drop(lease);
+        assert_eq!(pool.stats()[0].idle, 0);
+    }
 }
 
 #[tokio::test]
