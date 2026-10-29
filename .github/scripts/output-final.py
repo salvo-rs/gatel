@@ -5,7 +5,7 @@ ROOT=Path.cwd()
 HERE=ROOT/"benchmarks/http-servers"
 OUT=Path(os.environ["BENCHMARK_OUTPUT"])
 BASE="f11ffccdaaae6249c1f779160b5b84af1f479ae6"
-CANDIDATE="bde268d7b8687e0ffe376ef9dc863e2727f57769"
+CANDIDATE="57574c9e5d48d227661cabeb6ecbfb9f7d17436c"
 SCENARIOS=["static-4k","static-16k","static-32k","static-63k","static-64k","static-64k-plus1","static-65k","range-10m","range-offset-10m","range-65k","range-bulk-offset","static-1m","static-4m","static-8m-minus1","static-8m-plus1","static-10m","proxy","proxy-1m","proxy-10m"]
 ORDER=["base","candidate","candidate","base","base","candidate"]
 def run(args,**kw):
@@ -16,26 +16,40 @@ def build():
     assert subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()==BASE
     candidate=ROOT.parent/"candidate"
     assert subprocess.check_output(["git","-C",candidate,"rev-parse","HEAD"],text=True).strip()==CANDIDATE
+    for attempt in range(3):
+        try:
+            payload=subprocess.check_output(["gh","api","repos/salvo-rs/gatel/actions/artifacts/12906571886/zip"],timeout=90)
+            archived=zipfile.ZipFile(io.BytesIO(payload));break
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,zipfile.BadZipFile):
+            if attempt==2:raise
+    previous=json.loads(archived.read("build-manifest.json"))
+    assert previous["base_revision"]==BASE
+    binary=archived.read("base-gatel")
+    assert hashlib.sha256(binary).hexdigest()==previous["images"]["base"]["binary_sha256"]
+    (OUT/"base-gatel").write_bytes(binary)
+    context=OUT/"base-context";path=context/"context/linux/amd64/gatel"
+    path.parent.mkdir(parents=True);path.write_bytes(binary)
+    (context/"Dockerfile").write_bytes((ROOT/"Dockerfile").read_bytes())
+    run(["docker","build","--build-arg","SOURCE=prebuilt","--build-arg","TARGETPLATFORM=linux/amd64","-t","gatel-ab:base",context])
     manifest={"base_revision":BASE,"candidate_revision":CANDIDATE,"execution_revision":os.environ["GITHUB_SHA"],"phase_order":ORDER,"scenarios":SCENARIOS,
-        "error_policy":"Retain every HTTP/socket/over-limit error, default client32MiB and wrk5s limit. Require zero candidate errors and examine throughput and all tail quantiles. Control regressions of >5% throughput or >10% p99 with nonoverlapping round ranges require rejection or independent paired replication; extreme quantiles are reported separately, never hidden.",
+        "error_policy":"Retain all HTTP/socket/over-limit errors on both revisions through all phases; require zero candidate errors. Default client and unchanged wrk 5s limit. No namespace tuning.",
         "dockerfile_sha256":digest(ROOT/"Dockerfile"),"lock_sha256":digest(ROOT/"Cargo.lock"),
-        "build":"Fresh source builds of BOTH revisions in this job using byte-identical production Dockerfile and Cargo.lock, same builder image, compiler, release flags and runtime image.",
-        "policy":"Portable Tokio file reader unchanged. Linux host advertises ZST capability; only HTTP1.1 selected file bodies>=8MiB request TCP_NOTSENT_LOWAT64KiB. Restore original value for all other responses; proxy/H2/small files/unsupported hosts retain original policy. No SO_SNDBUF or client tuning.","images":{}}
+        "build":"Exact archived production baseline12906571886 plus final candidate built with unmodified production Dockerfile SOURCE=source and identical locked compiler/dependencies.",
+        "policy":"Portable Tokio file reader unchanged. A response-only ZST hint opts HTTP1.1 selected file bodies>=8MiB into Linux TCP_NOTSENT_LOWAT64KiB. Restore original value for all other responses; proxy/H2/small files/unsupported hosts retain original policy. No request capability entries, SO_SNDBUF or client tuning.","source_artifact":12906571886,"images":{"base":previous["images"]["base"]}}
+    assert manifest["lock_sha256"]==previous["lock_sha256"] and manifest["dockerfile_sha256"]==previous["dockerfile_sha256"]
     assert digest(candidate/"Dockerfile")==manifest["dockerfile_sha256"] and digest(candidate/"Cargo.lock")==manifest["lock_sha256"]
     manifest["socket_source_sha256"]=digest(candidate/"crates/gatel-http/src/socket_output.rs")
     (OUT/"socket_output.rs").write_bytes((candidate/"crates/gatel-http/src/socket_output.rs").read_bytes())
-    run(["docker","pull","rust:1-alpine"])
-    (OUT/"compiler-image-inspect.json").write_text(run(["docker","image","inspect","rust:1-alpine"],capture_output=True,text=True).stdout)
-    for name,source in [("base",ROOT),("candidate",candidate)]:
-        run(["docker","build","--target","build-source","-t","gatel-ab-builder:"+name,source])
-        compiler=run(["docker","run","--rm","--entrypoint","rustc","gatel-ab-builder:"+name,"-Vv"],capture_output=True,text=True).stdout
-        run(["docker","build","-t","gatel-ab:"+name,source])
-        container="gatel-ab-copy-"+name;run(["docker","create","--name",container,"gatel-ab:"+name])
-        try:run(["docker","cp",container+":/usr/local/bin/gatel",OUT/(name+"-gatel")])
-        finally:run(["docker","rm",container])
-        manifest["images"][name]={"compiler":compiler,"binary_sha256":digest(OUT/(name+"-gatel"))}
-        (OUT/"build-manifest.json").write_text(json.dumps(manifest,indent=2))
-    assert manifest["images"]["base"]["compiler"]==manifest["images"]["candidate"]["compiler"]
+    assert (candidate/"crates/gatel-bundle-std/src/file_body.rs").read_bytes()==(ROOT/"crates/gatel-bundle-std/src/file_body.rs").read_bytes()
+    run(["docker","build","--target","build-source","-t","gatel-ab-builder:candidate",candidate])
+    compiler=run(["docker","run","--rm","--entrypoint","rustc","gatel-ab-builder:candidate","-Vv"],capture_output=True,text=True).stdout
+    assert compiler==manifest["images"]["base"]["compiler"]
+    run(["docker","build","-t","gatel-ab:candidate",candidate])
+    container="gatel-ab-copy-candidate";run(["docker","create","--name",container,"gatel-ab:candidate"])
+    try:run(["docker","cp",container+":/usr/local/bin/gatel",OUT/"candidate-gatel"])
+    finally:run(["docker","rm",container])
+    manifest["images"]["candidate"]={"compiler":compiler,"binary_sha256":digest(OUT/"candidate-gatel")}
+    (OUT/"build-manifest.json").write_text(json.dumps(manifest,indent=2))
     (OUT/"image-inspect.json").write_text(run(["docker","image","inspect","gatel-ab:base","gatel-ab:candidate"],capture_output=True,text=True).stdout)
     run(["docker","compose","-f",HERE/"compose.yml","build","bench"])
 

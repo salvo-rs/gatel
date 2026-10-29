@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: bde268d7b8687e0ffe376ef9dc863e2727f57769
+          ref: 57574c9e5d48d227661cabeb6ecbfb9f7d17436c
           path: candidate
           persist-credentials: false
       - name: Record remote host and storage
@@ -32,7 +32,7 @@ jobs:
           mkdir -p "$BENCHMARK_OUTPUT"
           test "$GITHUB_ACTIONS" = true
           { uname -a; lscpu; free -h; docker info; docker buildx ls; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
-      - name: Fresh production source builds for both revisions
+      - name: Verify reproducible baseline and production-build the final candidate
         working-directory: source
         run: python3 -B -u ../orchestration/.github/scripts/output-final.py build
       - uses: actions/upload-artifact@v7

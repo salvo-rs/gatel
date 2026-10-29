@@ -343,9 +343,6 @@ async fn serve_connection(
     let handler = Arc::new(handler);
     let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
         let http1 = request.version() == hyper::Version::HTTP_11;
-        if http1 && output.is_some() {
-            request.extensions_mut().insert(gatel_plan::BoundedFileOutput);
-        }
         request.extensions_mut().insert(request_work.clone());
         let output = output.clone();
         let active = request_activity.request();
