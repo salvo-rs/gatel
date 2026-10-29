@@ -1,0 +1,41 @@
+name: Diagnose cached file NOWAIT capability (one-off)
+on:
+  push:
+    branches: [bench/file-nowait-probe-20261029]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Probe cached and cold regular-file reads without changing client networking
+        run: |
+          python3 -B - <<'PY'
+          import json,os,platform,subprocess
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'file-nowait-probe';root.mkdir()
+          p=Path.cwd()/'file-nowait-probe.bin'
+          p.write_bytes(bytes(range(256))*40960)
+          rows=[]
+          with p.open('r+b',buffering=0) as f:
+              os.fsync(f.fileno());f.read()
+              for cold in [False,True]:
+                  if cold:os.posix_fadvise(f.fileno(),0,0,os.POSIX_FADV_DONTNEED)
+                  for offset in [0,1048576,10485760-65536]:
+                      b=bytearray(65536)
+                      try:
+                          n=os.preadv(f.fileno(),[b],offset,os.RWF_NOWAIT)
+                          rows.append({'cold':cold,'offset':offset,'read':n,'correct':b[:n]==(bytes(range(256))*256)[:n]})
+                      except OSError as e:rows.append({'cold':cold,'offset':offset,'errno':e.errno,'error':str(e)})
+          p.unlink()
+          result={'kernel':platform.release(),'cpu':subprocess.check_output(['lscpu'],text=True),'filesystem':subprocess.check_output(['stat','-f','-c','%T',str(Path.cwd())],text=True).strip(),'reads':rows}
+          (root/'probe.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+          PY
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: file-nowait-probe
+          path: ${{ runner.temp }}/file-nowait-probe
