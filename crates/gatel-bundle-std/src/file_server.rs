@@ -433,7 +433,13 @@ impl Handler for FileServer {
             crate::ranges::wanted(request, size, &tag)
         };
 
-        if let Err(error) = crate::ranges::deliver(response, opened, wanted).await {
+        let bounded_output = request
+            .extensions()
+            .get::<gatel_plan::BoundedTcpOutput>()
+            .is_some();
+        if let Err(error) =
+            crate::ranges::deliver_with_backpressure(response, opened, wanted, bounded_output).await
+        {
             unreadable(&source, &error, depot, response);
         } else if let Some(encoding) = transform {
             crate::encode_metadata::transformed(response.headers_mut());

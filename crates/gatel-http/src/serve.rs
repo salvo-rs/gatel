@@ -284,6 +284,7 @@ async fn serve_connection(
     stop: watch::Receiver<bool>,
     retirement: &crate::connection_drain::Retirement,
 ) {
+    let bounded_output = crate::socket_output::configure(&stream);
     let limits = &generation.runtime.limits;
     let metrics = Arc::clone(&runtime.metrics);
     metrics.connections_total.increment();
@@ -342,6 +343,9 @@ async fn serve_connection(
     let handler = Arc::new(handler);
     let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
         request.extensions_mut().insert(request_work.clone());
+        if bounded_output {
+            request.extensions_mut().insert(gatel_plan::BoundedTcpOutput);
+        }
         let active = request_activity.request();
         let handler = handler.clone();
         async move {

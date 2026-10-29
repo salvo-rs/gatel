@@ -23,6 +23,16 @@ impl ExecutionIdentity {
     pub const DEPOT_KEY: &'static str = "gatel.execution_identity";
 }
 
+/// The downstream TCP socket has a 64 KiB unsent-queue low-water mark.
+///
+/// Hosts insert this request extension only after successfully configuring the
+/// socket. File delivery can then read directly into outgoing frames without
+/// outrunning transport backpressure. Absence keeps the portable reader path.
+/// This is a scheduling hint, not an authorization capability or a strict cap
+/// on kernel memory, bytes in flight, or transformed response buffers.
+#[derive(Debug, Clone, Copy)]
+pub struct BoundedTcpOutput;
+
 /// State a directive keeps between requests.
 ///
 /// A directive that needs one declares it here rather than reaching for a
