@@ -1,0 +1,43 @@
+name: Diagnose server unsent queue backpressure (one-off)
+on:
+  push:
+    branches: [bench/file-lowat-screen-20261029]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f11ffccdaaae6249c1f779160b5b84af1f479ae6
+          path: source
+          persist-credentials: false
+      - name: Record remote builder and host
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/file-lowat-screen"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          { uname -a; lscpu; free -h; docker info; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
+      - name: Verify and repackage the identical production binary
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/file-lowat-screen.py build
+      - name: Compare three server unsent-queue profiles with identical binaries
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-lowat-screen.py measure
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: file-lowat-screen
+          path: ${{ runner.temp }}/file-lowat-screen
+          if-no-files-found: error
