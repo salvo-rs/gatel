@@ -1223,15 +1223,7 @@ at most 32 idle buffers, for a combined 3 MiB idle payload bound. Live frames an
 cached bodies hold leases outside this idle bound, and a short body can retain
 a full size class.
 
-Selected responses of at least 1 MiB read directly into the shared 64 KiB class,
-one frame per blocking task, instead of copying from a Tokio file buffer into a
-second outgoing allocation. A nonzero range seeks only in the first task. Reads
-start on body demand, with at most one pending read per response and no producer
-queue. Each frame retains its owner independently of later frames. Cancellation
-cannot abort started blocking I/O, but its completion releases the file and
-buffer without starting another read. Responses between 64 KiB and 1 MiB retain
-the Tokio reader with 64 KiB frames. Both paths enforce the selected length and
-report premature EOF. The shared idle payload bound remains 3 MiB.
+Responses larger than 64 KiB retain the Tokio seek/read path and 64 KiB frames.
 
 An exact-length reader bounds growth and reports premature EOF as an error for
 both buffered and streaming bodies. This prevents a truncated stream from looking

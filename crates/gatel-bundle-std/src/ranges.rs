@@ -33,9 +33,6 @@ const INLINE_LIMIT: u64 = 64 * 1024;
 /// in pieces of exactly that size.
 const CHUNK: usize = INLINE_LIMIT as usize;
 
-/// Large responses read each frame directly into its outgoing owner.
-const DIRECT_READ_MIN: u64 = 1024 * 1024;
-
 /// One opened representation owns both the metadata and the eventual reader.
 /// A path replacement after opening cannot select another file for its body.
 pub struct OpenedFile {
@@ -241,10 +238,6 @@ pub async fn deliver(
             .map_err(std::io::Error::other)??;
             response.body(ResBody::Once(buffer));
         }
-        return Ok(());
-    }
-    if length >= DIRECT_READ_MIN {
-        response.body(crate::file_body::stream(file.into_std().await, start, length));
         return Ok(());
     }
     if start != 0 {
@@ -519,14 +512,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ranges_preserve_frames_and_bytes_at_the_direct_read_boundary() {
+    async fn large_range_lengths_and_offsets_preserve_frames_and_bytes() {
         use http_body_util::BodyExt as _;
-        let original: Vec<_> = (0..DIRECT_READ_MIN as usize + 32)
-            .map(|n| (n % 251) as u8)
-            .collect();
+        let original: Vec<_> = (0..LARGE_FILE as usize + 32).map(|n| (n % 251) as u8).collect();
         let path = write("direct-read-boundary", &original).await;
         for start in [0, 13] {
-            for length in [DIRECT_READ_MIN - 1, DIRECT_READ_MIN, DIRECT_READ_MIN + 1] {
+            for length in [LARGE_FILE - 1, LARGE_FILE, LARGE_FILE + 1] {
                 let mut response = Response::new();
                 deliver(
                     &mut response,
