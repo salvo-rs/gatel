@@ -14,7 +14,7 @@ class HarnessTests(unittest.TestCase):
         args = argparse.Namespace(rounds=1, duration=2, warmup=0, threads=2, connections=8)
         row = SimpleNamespace(scenario="static-64k", target="nginx", requests_per_sec=100,
                               transfer_bytes_per_sec=6553600, latency_avg_ms=1, p90_ms=2,
-                              p99_ms=3, non_2xx_3xx=0, socket_errors=0)
+                              p99_ms=3, non_2xx_3xx=0, socket_errors=0, timeout_errors=0)
         report = bench.generate_report(Path("results"), args, {"nginx": "test"}, [row],
                                        {"static-64k": bench.SCENARIOS["static-64k"]})
         self.assertIn("| nginx | 100 | N/A |", report)
@@ -33,6 +33,24 @@ Transfer/sec: 255.75KB
 """
         result = bench.parse_wrk_output("proxy", "gatel", 1, raw)
         self.assertEqual(result.socket_errors, 10)
+        self.assertEqual(result.timeout_errors, 4)
+        args = argparse.Namespace(rounds=1, duration=10, warmup=0, threads=2, connections=8)
+        report = bench.generate_report(Path("results"), args, {"gatel": "test"}, [result],
+                                       {"proxy": bench.SCENARIOS["proxy"]}, {"tcp_rmem_bytes": [4096, 131072, 524288]})
+        self.assertIn("Client tcp_rmem (bytes): 4096 131072 524288", report)
+        self.assertIn("Over-limit completions", report)
+        self.assertIn("| 15 | 4 |", report)
+        self.assertIn("excluded from its latency statistics", report)
+        self.assertIn("Requests still in flight when wrk stops are also absent", report)
+        clean = bench.parse_wrk_output("proxy", "gatel", 1,
+                                      raw.replace("Socket errors: connect 1, read 2, write 3, timeout 4", ""))
+        self.assertEqual(clean.timeout_errors, 0)
+        self.assertEqual(clean.socket_errors, 0)
+        for malformed in ["Socket errors: connect 1, read 2, write 3",
+                          "Socket errors: connect 1, read 2, write 3, timeout bad"]:
+            with self.subTest(malformed=malformed), self.assertRaises(RuntimeError):
+                bench.parse_wrk_output("proxy", "gatel", 1,
+                                      raw.replace("Socket errors: connect 1, read 2, write 3, timeout 4", malformed))
         self.assertEqual(result.non_2xx_3xx, 5)
         self.assertEqual(result.p99_ms, 1000)
         self.assertEqual(result.latency_stdev_ms, 0.7)
@@ -129,6 +147,23 @@ Transfer/sec: 2.70GB
                         bench.main()
                     downs = [call for call in commands.call_args_list if call.args[0] == "down"]
                     self.assertEqual(len(downs), 2, "teardown must run after the initial reset")
+
+    def test_receive_profile_records_actual_values_and_explicit_failures(self):
+        with patch.object(bench, "compose") as command:
+            command.return_value = SimpleNamespace(returncode=0, stdout="4096\t131072\t524288\n", stderr="")
+            self.assertEqual(bench.client_network_settings(), {"tcp_rmem_bytes": [4096, 131072, 524288]})
+            command.return_value = SimpleNamespace(returncode=0, stdout="4096 131072 65536", stderr="")
+            self.assertEqual(bench.client_network_settings(), {"tcp_rmem_bytes": [4096, 131072, 65536]})
+            for result in [
+                SimpleNamespace(returncode=1, stdout="", stderr="not available"),
+                SimpleNamespace(returncode=0, stdout="4096 131072 bad", stderr=""),
+                SimpleNamespace(returncode=0, stdout="4096 131072", stderr=""),
+                SimpleNamespace(returncode=0, stdout="4096 131072 0", stderr=""),
+            ]:
+                command.return_value = result
+                self.assertIsNone(bench.client_network_settings()["tcp_rmem_bytes"])
+            command.assert_called_with("exec", "-T", "bench", "cat", "/proc/sys/net/ipv4/tcp_rmem",
+                                       check=False, capture_output=True)
 
     def test_warmup_uses_the_measured_range_and_concurrency(self):
         args = argparse.Namespace(warmup=5, threads=4, connections=128)

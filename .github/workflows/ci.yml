@@ -33,11 +33,31 @@ jobs:
             --scenario static-64k --scenario static-65k --scenario range-10m \
             --scenario range-offset-10m --scenario range-65k \
             --output-dir "$RUNNER_TEMP/http-bench-smoke"
+      - name: Verify the optional bounded receive profile on reference servers
+        env:
+          COMPOSE_FILE: compose.yml:profiles/bounded-client.yml
+        run: |
+          python3 -B benchmarks/http-servers/run.py --target nginx --target caddy --no-build \
+            --rounds 1 --duration 2 --warmup 0 --threads 2 --connections 8 \
+            --scenario static-64k --scenario static-10m \
+            --output-dir "$RUNNER_TEMP/http-bench-bounded"
+          python3 -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          settings = json.loads((root / "http-bench-bounded/network-settings.json").read_text())
+          assert settings["tcp_rmem_bytes"] == [4096, 131072, 524288]
+          for profile in ["http-bench-smoke", "http-bench-bounded"]:
+              rows = json.loads((root / profile / "summary.json").read_text())
+              assert rows and all(row["non_2xx_3xx"] == row["socket_errors"] == 0 for row in rows), rows
+          PY
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: http-benchmark-smoke
-          path: ${{ runner.temp }}/http-bench-smoke
+          path: |
+            ${{ runner.temp }}/http-bench-smoke
+            ${{ runner.temp }}/http-bench-bounded
           if-no-files-found: ignore
 
   test:

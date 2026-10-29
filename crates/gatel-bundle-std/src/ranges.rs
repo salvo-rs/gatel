@@ -217,11 +217,20 @@ pub async fn deliver(
         // The idle Tokio file transfers its original handle without reopening
         // the path. Read directly into the outgoing buffer in one worker.
         let file = file.into_std().await;
-        let buffer =
-            tokio::task::spawn_blocking(move || crate::file_body::read_exact_prefix(file, length as usize))
-                .await
-                .map_err(std::io::Error::other)??;
-        response.body(ResBody::Once(buffer.into()));
+        if length < crate::file_body::POOLED_MIN as u64 {
+            let buffer = tokio::task::spawn_blocking(move || {
+                crate::file_body::read_exact_prefix(file, length as usize)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            response.body(ResBody::Once(buffer.into()));
+        } else {
+            let buffer =
+                tokio::task::spawn_blocking(move || crate::file_body::read_bytes(file, length as usize))
+                    .await
+                    .map_err(std::io::Error::other)??;
+            response.body(ResBody::Once(buffer));
+        }
         return Ok(());
     }
     if start > 0 {
@@ -275,6 +284,8 @@ mod tests {
         }
         request
     }
+
+    const LARGE_FILE: u64 = 1024 * 1024;
 
     const TAG: &str = "\"abc-123\"";
 
@@ -470,7 +481,15 @@ mod tests {
         let original: Vec<u8> = (0..(1024 * 1024 + 70 * 1024)).map(|n| (n % 251) as u8).collect();
         let path = write("boundary-offset", &original).await;
         for start in [0, 1024 * 1024 + 13] {
-            for length in [INLINE_LIMIT, INLINE_LIMIT + 1024] {
+            for length in [
+                32 * 1024 - 1,
+                32 * 1024,
+                32 * 1024 + 1,
+                INLINE_LIMIT - 1,
+                INLINE_LIMIT,
+                INLINE_LIMIT + 1,
+                INLINE_LIMIT + 1024,
+            ] {
                 let wanted = Wanted::Part {
                     start,
                     end: start + length - 1,
@@ -494,6 +513,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn large_ranges_preserve_offsets_and_bound_outgoing_frames() {
+        use http_body_util::BodyExt as _;
+        let original: Vec<_> = (0..LARGE_FILE as usize * 2)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        let path = write("buffered-range", &original).await;
+        let start = 17;
+        let length = LARGE_FILE as usize + 123;
+        let mut response = Response::new();
+        deliver(
+            &mut response,
+            &path,
+            original.len() as u64,
+            Wanted::Part {
+                start: start as u64,
+                end: (start + length - 1) as u64,
+            },
+        )
+        .await
+        .unwrap();
+        let mut body = std::mem::take(response.body_mut());
+        let mut received = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let bytes = frame.unwrap().into_data().unwrap();
+            assert!(bytes.len() <= CHUNK);
+            received.extend_from_slice(&bytes);
+        }
+        assert_eq!(received, original[start..start + length]);
+    }
+
+    #[tokio::test]
+    async fn truncation_after_a_streamed_frame_still_reports_early_eof() {
+        use http_body_util::BodyExt as _;
+        let size = LARGE_FILE as usize + 1;
+        let path = write("truncate-buffered", &vec![b'x'; size]).await;
+        let mut response = Response::new();
+        deliver(&mut response, &path, size as u64, Wanted::Whole)
+            .await
+            .unwrap();
+        let mut body = std::mem::take(response.body_mut());
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        let mut received = first.len();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        while let Ok(frame) = body.frame().await.expect("a truncated body must report an error") {
+            received += frame.into_data().unwrap().len();
+        }
+        // Already-read bytes may be forwarded, but read-ahead stays bounded.
+        assert!(received <= CHUNK);
     }
 
     #[tokio::test]
@@ -527,7 +602,12 @@ mod tests {
 
     #[tokio::test]
     async fn pathname_replacement_cannot_change_an_opened_representation() {
-        for size in [32, INLINE_LIMIT as usize + 4096] {
+        for size in [
+            32,
+            INLINE_LIMIT as usize,
+            INLINE_LIMIT as usize + 4096,
+            LARGE_FILE as usize + 4096,
+        ] {
             let original = vec![b'a'; size];
             let path = write("replace-opened", &original).await;
             let opened = OpenedFile::open(&path).await.unwrap();
@@ -548,7 +628,12 @@ mod tests {
     #[tokio::test]
     async fn truncation_is_an_error_for_inline_and_streaming_bodies() {
         use http_body_util::BodyExt;
-        for size in [32, INLINE_LIMIT as usize + 4096] {
+        for size in [
+            32,
+            INLINE_LIMIT as usize,
+            INLINE_LIMIT as usize + 4096,
+            LARGE_FILE as usize + 4096,
+        ] {
             let path = write("truncate-opened", &vec![b'a'; size]).await;
             let opened = OpenedFile::open(&path).await.unwrap();
             std::fs::OpenOptions::new()

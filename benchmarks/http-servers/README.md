@@ -17,8 +17,8 @@ system and how many other things are running.
 
 So the report is for deciding whether a change made this project faster or
 slower than it was, and for noticing when it is wildly out of line with the
-other two. It is not a claim about anybody else's deployment, and nothing in
-this repository quotes a number from it.
+other two. It is not a claim about anybody else's deployment. The diagnostic
+measurements below retain their host and workload context.
 
 Performance comparisons and throughput thresholds are deliberately not CI
 gates. A shared runner's throughput moves by tens of
@@ -68,9 +68,21 @@ Results land in `target/benchmarks/http-servers/<timestamp>/`:
 - `summary.json` — every round, machine-readable
 - `raw/*.txt` — what `wrk` actually printed
 - `payload-checks.json` — status, exact bytes and range headers checked before load
+- `network-settings.json` — actual client TCP receive settings, captured before warmup
 - `containers.log` — service logs, captured before cleanup even on failure
 
 Container cleanup still runs if collecting or saving the service logs fails.
+
+The unchanged wrk limit is 5 seconds. wrk counts a response completed beyond
+that limit as a timeout, but excludes it from its latency histogram. Its
+reported p99 and maximum can therefore remain below 5 seconds even when slower
+responses occurred. Requests still in flight when wrk stops are also absent:
+zero timeout counts do not prove that every request completed within the limit.
+Check the over-limit completion count before interpreting tail latency. JSON keeps `timeout_errors` separately; `socket_errors` remains
+the aggregate of wrk's connect, read, write and timeout counters. The report's
+Errors column already includes timeouts; the separate column does not add them
+again. See wrk's [completion accounting](https://github.com/wg/wrk/blob/4.2.0/src/wrk.c#L301-L325)
+and [histogram bounds](https://github.com/wg/wrk/blob/4.2.0/src/stats.c#L19-L27).
 
 Each completed round is saved immediately. Reported p90/p99 values are means
 of the individual rounds' percentiles, not percentiles of pooled requests.
@@ -125,6 +137,72 @@ Harness regression tests (without Docker):
 ```bash
 python -B -m unittest discover -s benchmarks/http-servers -p 'test_*.py'
 ```
+
+## Diagnosing receive-queue pressure
+
+A 128-connection large-file run can consume much more kernel socket memory than
+the server's process RSS suggests. On one 4-vCPU runner, a 32 MiB receive-buffer
+ceiling let client socket memory reach 758 MiB. The run recorded TCP memory
+pressure, receive-queue drops, retransmission timeouts and two responses completed
+beyond wrk's 5-second histogram limit. This is a reproducible trigger in that
+environment, not proof that every slow request has the same cause. The kernel's
+[TCP memory controls](https://docs.kernel.org/networking/ip-sysctl.html) distinguish
+per-socket receive auto-tuning limits from the global TCP page budget.
+
+An optional Compose override bounds the shared client's receive buffers for a
+separate diagnostic comparison:
+
+```bash
+COMPOSE_FILE=compose.yml:profiles/bounded-client.yml python benchmarks/http-servers/run.py --no-build
+```
+
+On Windows, separate the two Compose paths with a semicolon. The harness runs
+Compose from this directory. Build the images first with the regular command,
+or omit `--no-build`. Check `network-settings.json` and the report: this
+profile should record `4096 131072 524288` bytes.
+
+Apply the same profile to every baseline, candidate and reference server in a
+comparison. Keep its results separate from the default profile: reducing the
+receive window changes flow control and may affect throughput over higher-RTT
+links. It is a benchmark control, not a production socket setting. In the paired
+reproduction, the override reduced client socket memory to 57 MiB and removed
+the recorded pressure/drops/retransmission-timeout counters, while throughput
+changed by -1.4%; one pair does not establish a universal tail-latency guarantee.
+See the [diagnostic run](https://github.com/salvo-rs/gatel/actions/runs/40814116374)
+for both measurements of the archived `95642ddb` experiment binary and raw data.
+
+A subsequent [extended-quantile run](https://github.com/salvo-rs/gatel/actions/runs/40820807989)
+also exposed the control's limits: one baseline window with the 512 KiB ceiling
+recorded 17 over-limit completions despite zero memory-pressure/drop counters;
+zero-window transitions and probes were frequent. A lower ceiling can add flow
+control stalls even on a colocated runner. Use the override to distinguish
+pressure and flow control, not as a general latency remedy.
+
+## 2026-10-29 inline-buffer validation
+
+The [default-profile A/B](https://github.com/salvo-rs/gatel/actions/runs/40815218937)
+alternated baseline `1bbdebfb` and runtime candidate `6568aad` on one
+4-vCPU EPYC 9V45 runner. The production Dockerfile and dependency lock were
+unchanged. It completed 84 exact-byte/status/Range preflights and 84 measurement
+windows, about 39.9 million responses, with zero reported HTTP/socket/over-limit
+errors on both sides. The 32/64 KiB response rates increased by 114%/129% and
+mean round p99 decreased by 45%/40%. Sampled 64 KiB process RSS increased from
+15.6 to 22.0 MiB; idle retention, active leases and allocator overhead are the
+documented tradeoff.
+
+[Higher-quantile checks](https://github.com/salvo-rs/gatel/actions/runs/40820807989)
+used the same verified binaries and a done-only wrk callback, with no per-request
+script callbacks. The 32/64 KiB p99.9 and p99.99 improved in those alternating
+windows. [Fresh-process 10 MiB checks](https://github.com/salvo-rs/gatel/actions/runs/40821803810)
+used four 120-second windows: throughput remained close; p99/p99.9 ranges
+overlapped and candidate p99.99 was lower in both windows. Candidate maxima ranged from 1.92 to 2.88 seconds, versus
+2.28 to 2.43 seconds for the baseline; the initial maximum difference did not
+reproduce consistently. TCP pressure/retransmission events remained present.
+
+These are scoped runner observations, not a production tail-latency guarantee.
+Large-file delivery retains the baseline reader. Keep all original windows and
+the separate controlled-profile failures when assessing this change; do not
+merge measurements from different hosts or receive profiles.
 
 ## The files under test
 
