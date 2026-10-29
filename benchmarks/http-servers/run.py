@@ -349,7 +349,7 @@ def client_network_settings() -> dict:
     )
     try:
         values = [int(value) for value in result.stdout.split()]
-        if result.returncode or len(values) != 3 or not 0 < values[0] <= values[1] <= values[2]:
+        if result.returncode or len(values) != 3 or any(value <= 0 for value in values):
             raise ValueError("unavailable or invalid tcp_rmem")
     except ValueError:
         return {"tcp_rmem_bytes": None, "error": result.stderr.strip() or result.stdout.strip()}

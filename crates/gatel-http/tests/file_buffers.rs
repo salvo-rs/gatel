@@ -10,7 +10,7 @@ async fn pooled_and_streamed_files_survive_encoding_and_cache_reuse() {
     let gateway = Gateway::new("file-buffer-consumers");
     let root = gateway.directory.join("www");
     std::fs::create_dir_all(&root).unwrap();
-    let sizes = [65536, 65537, 1024 * 1024 + 17];
+    let sizes = [32768, 32769, 65536, 65537, 1024 * 1024 + 17];
     for (id, length) in sizes.into_iter().enumerate() {
         let bytes: Vec<_> = (0..length)
             .map(|offset| b'a' + ((offset + id) % 26) as u8)

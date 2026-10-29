@@ -17,8 +17,8 @@ system and how many other things are running.
 
 So the report is for deciding whether a change made this project faster or
 slower than it was, and for noticing when it is wildly out of line with the
-other two. It is not a claim about anybody else's deployment, and nothing in
-this repository quotes a number from it.
+other two. It is not a claim about anybody else's deployment. The diagnostic
+measurements below retain their host and workload context.
 
 Performance comparisons and throughput thresholds are deliberately not CI
 gates. A shared runner's throughput moves by tens of
@@ -145,7 +145,9 @@ the server's process RSS suggests. On one 4-vCPU runner, a 32 MiB receive-buffer
 ceiling let client socket memory reach 758 MiB. The run recorded TCP memory
 pressure, receive-queue drops, retransmission timeouts and two responses completed
 beyond wrk's 5-second histogram limit. This is a reproducible trigger in that
-environment, not proof that every slow request has the same cause.
+environment, not proof that every slow request has the same cause. The kernel's
+[TCP memory controls](https://docs.kernel.org/networking/ip-sysctl.html) distinguish
+per-socket receive auto-tuning limits from the global TCP page budget.
 
 An optional Compose override bounds the shared client's receive buffers for a
 separate diagnostic comparison:
@@ -167,7 +169,7 @@ reproduction, the override reduced client socket memory to 57 MiB and removed
 the recorded pressure/drops/retransmission-timeout counters, while throughput
 changed by -1.4%; one pair does not establish a universal tail-latency guarantee.
 See the [diagnostic run](https://github.com/salvo-rs/gatel/actions/runs/40814116374)
-for both original-binary measurements and raw data.
+for both measurements of the archived `95642ddb` experiment binary and raw data.
 
 ## The files under test
 

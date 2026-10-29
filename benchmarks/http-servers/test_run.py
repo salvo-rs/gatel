@@ -152,11 +152,13 @@ Transfer/sec: 2.70GB
         with patch.object(bench, "compose") as command:
             command.return_value = SimpleNamespace(returncode=0, stdout="4096\t131072\t524288\n", stderr="")
             self.assertEqual(bench.client_network_settings(), {"tcp_rmem_bytes": [4096, 131072, 524288]})
+            command.return_value = SimpleNamespace(returncode=0, stdout="4096 131072 65536", stderr="")
+            self.assertEqual(bench.client_network_settings(), {"tcp_rmem_bytes": [4096, 131072, 65536]})
             for result in [
                 SimpleNamespace(returncode=1, stdout="", stderr="not available"),
                 SimpleNamespace(returncode=0, stdout="4096 131072 bad", stderr=""),
                 SimpleNamespace(returncode=0, stdout="4096 131072", stderr=""),
-                SimpleNamespace(returncode=0, stdout="4096 131072 1024", stderr=""),
+                SimpleNamespace(returncode=0, stdout="4096 131072 0", stderr=""),
             ]:
                 command.return_value = result
                 self.assertIsNone(bench.client_network_settings()["tcp_rmem_bytes"])
