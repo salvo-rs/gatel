@@ -1,0 +1,138 @@
+name: Validate shared-hint file output and proxy fixes on one host (one-off)
+on:
+  push:
+    branches: [bench/proxy-range-tail-shared-hint-final-20261030]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f11ffccdaaae6249c1f779160b5b84af1f479ae6
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f0bee4835423e9c0084dff50ceac2fa95e634d9e
+          path: candidate
+          persist-credentials: false
+      - name: Record remote host and storage
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/proxy-range-tail-shared-hint-final"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          { uname -a; lscpu; free -h; docker info; docker buildx ls; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
+      - name: Verify reproducible baseline and production-build the final candidate
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shared-hint-final-build
+          path: ${{ runner.temp }}/proxy-range-tail-shared-hint-final
+      - name: matrix phase 1 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure matrix 1
+      - name: matrix phase 2 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure matrix 2
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shared-hint-final-matrix-phase2
+          path: ${{ runner.temp }}/proxy-range-tail-shared-hint-final
+      - name: matrix phase 3 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure matrix 3
+      - name: matrix phase 4 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure matrix 4
+      - name: matrix phase 5 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure matrix 5
+      - name: matrix phase 6 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure matrix 6
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shared-hint-final-matrix-phase6
+          path: ${{ runner.temp }}/proxy-range-tail-shared-hint-final
+      - name: tail phase 1 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure tail 1
+      - name: tail phase 2 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure tail 2
+      - name: tail phase 3 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure tail 3
+      - name: tail phase 4 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure tail 4
+      - name: tail phase 5 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure tail 5
+      - name: tail phase 6 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure tail 6
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shared-hint-final-tail-phase6
+          path: ${{ runner.temp }}/proxy-range-tail-shared-hint-final
+      - name: proxy-tail phase 1 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure proxy-tail 1
+      - name: proxy-tail phase 2 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure proxy-tail 2
+      - name: proxy-tail phase 3 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure proxy-tail 3
+      - name: proxy-tail phase 4 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure proxy-tail 4
+      - name: proxy-tail phase 5 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure proxy-tail 5
+      - name: proxy-tail phase 6 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure proxy-tail 6
+      - name: single phase 1 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure single 1
+      - name: single phase 2 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure single 2
+      - name: single phase 3 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure single 3
+      - name: single phase 4 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure single 4
+      - name: single phase 5 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure single 5
+      - name: single phase 6 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/shared-hint-final.py measure single 6
+      - name: Same-host H2c and TLS controls
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/protocol-controls-fixed.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: proxy-range-tail-shared-hint-final
+          path: |
+            ${{ runner.temp }}/proxy-range-tail-shared-hint-final
+            !${{ runner.temp }}/proxy-range-tail-shared-hint-final/protocol-controls/tls/key.pem
+          if-no-files-found: error
