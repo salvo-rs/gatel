@@ -76,6 +76,172 @@ fn request() -> http::Request<Body> {
 }
 
 #[tokio::test]
+async fn http1_send_errors_preserve_the_cancellation_reason() {
+    let (io, _peer) = tokio::io::duplex(1024);
+    let (mut sender, _driver) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+        .await
+        .unwrap();
+    let _pending = sender.send_request(request());
+    let error = sender.send_request(request()).await.unwrap_err();
+    assert!(error.is_canceled());
+    let summary = SendError::Connection(error).to_string();
+    assert!(summary.contains("connection was not ready"), "{summary}");
+}
+
+#[tokio::test]
+async fn cancelling_an_http1_send_cannot_park_an_in_flight_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (set, pool) = set(listener.local_addr().unwrap(), Default::default());
+    let (received, receipt) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        assert!(head.starts_with(b"POST "));
+        received.send(()).unwrap();
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "a cancelled exchange must not be reused");
+        let (mut next, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(next.read_u8().await.unwrap());
+        }
+        assert!(
+            head.starts_with(b"GET "),
+            "the cancelled POST must not be replayed"
+        );
+        next.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let mut lease = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    let mut post = request();
+    *post.method_mut() = http::Method::POST;
+    let mut send = Box::pin(lease.send(post));
+    tokio::select! {
+        result = &mut send => panic!("backend has not answered: {result:?}"),
+        result = receipt => result.unwrap(),
+    }
+    // No await between cancellation and drop: Hyper's driver has not yet
+    // observed the cancelled response promise and closed its dispatcher.
+    drop(send);
+    drop(lease);
+    assert_eq!(pool.stats()[0].idle, 0);
+    assert_eq!(pool.stats()[0].in_use, 0);
+    let mut next = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    assert_eq!(next.send(request()).await.unwrap().status(), 200);
+    tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn http1_reuse_waits_until_the_dispatcher_accepts_another_request() {
+    use http_body_util::BodyExt as _;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (set, pool) = set(listener.local_addr().unwrap(), Default::default());
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+            .await
+            .unwrap();
+        // The response head can be delivered while the connection is
+        // still busy. Let the caller observe that state deterministically.
+        finished.await.unwrap();
+        stream.write_all(b"ok").await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    let mut lease = pool.checkout(&set.all()[0], &Timeouts::default()).await.unwrap();
+    let first = lease.send(request()).await.unwrap();
+    let mut second = Box::pin(lease.send(request()));
+    let pending = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(matches!(second.as_mut().poll(cx), std::task::Poll::Pending))
+    })
+    .await;
+    assert!(pending, "sending on a busy dispatcher must wait, not cancel");
+    finish.send(()).unwrap();
+    assert_eq!(first.into_body().collect().await.unwrap().to_bytes(), "ok");
+    let response = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "ok");
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn http1_idle_close_is_discarded_before_dispatching_the_request() {
+    let (set, pool) = set(backend().await, Default::default());
+    let endpoint = &set.all()[0];
+    let slot = pool.slot(endpoint);
+    let (io, peer) = tokio::io::duplex(1024);
+    drop(peer);
+    let (sender, driver) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+        .await
+        .unwrap();
+    assert!(!sender.is_closed(), "the driver has not observed EOF yet");
+    slot.idle.lock().unwrap().push_back(Idle {
+        sender: Sender::Http1(sender),
+        address: None,
+        opened: Instant::now(),
+        returned: Instant::now(),
+    });
+    tokio::spawn(driver);
+    let mut lease = pool.checkout(endpoint, &Timeouts::default()).await.unwrap();
+    assert_eq!(lease.send(request()).await.unwrap().status(), 200);
+    let stats = &pool.stats()[0];
+    assert_eq!(stats.discarded, 1);
+    assert_eq!(stats.reused, 0);
+    assert_eq!(stats.opened, 1);
+}
+
+#[tokio::test]
+async fn http1_readiness_wait_is_bounded_and_releases_its_permit() {
+    let (set, pool) = set("127.0.0.1:9".parse().unwrap(), Default::default());
+    let endpoint = &set.all()[0];
+    let (io, _peer) = tokio::io::duplex(1024);
+    let (sender, _driver) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+        .await
+        .unwrap();
+    pool.slot(endpoint).idle.lock().unwrap().push_back(Idle {
+        sender: Sender::Http1(sender),
+        address: None,
+        opened: Instant::now(),
+        returned: Instant::now(),
+    });
+    let timeouts = Timeouts {
+        connect: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let result = tokio::time::timeout(Duration::from_secs(2), pool.checkout(endpoint, &timeouts))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, Err(CheckoutError::ConnectTimeout(_))),
+        "{result:?}"
+    );
+    assert_eq!(pool.stats()[0].in_use, 0);
+    assert_eq!(pool.stats()[0].idle, 0);
+}
+
+#[tokio::test]
 async fn draining_an_unused_pool_refuses_its_first_endpoint() {
     let (set, pool) = set("127.0.0.1:9".parse().unwrap(), Default::default());
     pool.drain();
