@@ -19,6 +19,7 @@ pub(crate) fn read_exact_prefix(reader: impl Read, length: usize) -> io::Result<
 
 pub(crate) const POOLED_MIN: usize = 32 * 1024;
 const MAX_CHUNK: usize = 64 * 1024;
+const STREAM_FRAME: usize = 32 * 1024;
 const MAX_IDLE: usize = 32;
 
 struct BufferPool {
@@ -101,8 +102,8 @@ pub(crate) fn stream(
     length: u64,
 ) -> salvo_core::http::ResBody {
     let frames = futures_util::stream::try_unfold(
-        (reader, start, length, false),
-        |(mut reader, start, remaining, started)| async move {
+        (reader, start, length, bytes::Bytes::new(), false),
+        |(mut reader, start, remaining, mut ready, started)| async move {
             if remaining == 0 {
                 return Ok::<_, salvo_core::BoxedError>(None);
             }
@@ -112,19 +113,25 @@ pub(crate) fn stream(
             if started {
                 tokio::task::yield_now().await;
             }
-            let length = remaining.min(MAX_CHUNK as u64) as usize;
-            let (reader, bytes) = tokio::task::spawn_blocking(move || {
-                if start != 0 {
-                    reader.seek(io::SeekFrom::Start(start))?;
-                }
-                let bytes = LARGE_BUFFERS.read(&mut reader, length)?;
-                Ok::<_, io::Error>((reader, bytes))
-            })
-            .await
-            .map_err(io::Error::other)??;
+            if ready.is_empty() {
+                let length = remaining.min(MAX_CHUNK as u64) as usize;
+                let (next, bytes) = tokio::task::spawn_blocking(move || {
+                    if start != 0 {
+                        reader.seek(io::SeekFrom::Start(start))?;
+                    }
+                    let bytes = LARGE_BUFFERS.read(&mut reader, length)?;
+                    Ok::<_, io::Error>((reader, bytes))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                reader = next;
+                ready = bytes;
+            }
+            let bytes = ready.split_to(STREAM_FRAME.min(ready.len()));
+            let sent = bytes.len() as u64;
             Ok(Some((
                 http_body::Frame::data(bytes),
-                (reader, 0, remaining - length as u64, true),
+                (reader, 0, remaining - sent, ready, true),
             )))
         },
     );
@@ -177,12 +184,12 @@ mod tests {
         let mut frames = Vec::new();
         while let Some(frame) = body.frame().await {
             let bytes = frame.unwrap().into_data().unwrap();
-            assert!(bytes.len() <= MAX_CHUNK);
+            assert!(bytes.len() <= STREAM_FRAME);
             frames.push(bytes.clone());
         }
         assert_eq!(
             frames.iter().map(|b| b.len()).collect::<Vec<_>>(),
-            [MAX_CHUNK, MAX_CHUNK, 17]
+            [STREAM_FRAME, STREAM_FRAME, STREAM_FRAME, STREAM_FRAME, 17]
         );
         let received: Vec<_> = frames.iter().flat_map(|b| b.iter().copied()).collect();
         assert_eq!(received, source[start..start + length]);
@@ -222,7 +229,7 @@ mod tests {
         drop(body);
         tokio::task::yield_now().await;
         assert_eq!(read.load(Ordering::Relaxed), MAX_CHUNK);
-        assert_eq!(first.as_ref(), vec![b'x'; MAX_CHUNK]);
+        assert_eq!(first.as_ref(), vec![b'x'; STREAM_FRAME]);
     }
 
     #[tokio::test]
