@@ -309,14 +309,31 @@ impl ConnectionPool {
 
         // Drop stale idle connections rather than sending a request into a
         // socket the backend has already closed.
-        let now = Instant::now();
+        let connect_deadline = tokio::time::Instant::now() + timeouts.connect;
         loop {
             let candidate = {
                 let mut idle = slot.idle.lock().unwrap_or_else(|p| p.into_inner());
                 idle.pop_front()
             };
             match candidate {
-                Some(entry) if entry.is_usable(&config, now) => {
+                Some(mut entry) if entry.is_usable(&config, Instant::now()) => {
+                    // A response body can finish before the driver advertises
+                    // readiness (or notices a peer close). Validate reuse before
+                    // handing out the lease; no request has been dispatched yet.
+                    if let Sender::Http1(sender) = &mut entry.sender {
+                        match tokio::time::timeout_at(connect_deadline, sender.ready()).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                slot.counters.discarded.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            Err(_) => return Err(CheckoutError::ConnectTimeout(timeouts.connect)),
+                        }
+                    }
+                    if !entry.is_usable(&config, Instant::now()) {
+                        slot.counters.discarded.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     slot.counters.reused.fetch_add(1, Ordering::Relaxed);
                     return Ok(Lease::new(
                         entry.sender,
@@ -333,7 +350,13 @@ impl ConnectionPool {
             }
         }
 
-        let (sender, address) = self.dial(endpoint, timeouts).await?;
+        // Stale senders and a replacement dial share one connect budget.
+        let remaining = connect_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let dial_timeouts = Timeouts {
+            connect: remaining,
+            ..*timeouts
+        };
+        let (sender, address) = self.dial(endpoint, &dial_timeouts).await?;
         slot.counters.opened.fetch_add(1, Ordering::Relaxed);
         Ok(Lease::new(sender, address, Instant::now(), slot, permit))
     }
