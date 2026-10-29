@@ -217,6 +217,7 @@ pub(crate) const ALLOWED: &[(&str, &[&str])] = &[
             "hyper-util",
             "pin-project-lite",
             "salvo_core",
+            "socket2",
             "tokio",
             "tracing",
         ],
