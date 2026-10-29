@@ -24,15 +24,16 @@ def main():
     info=(tls/'key.pem').stat()
     assert info.st_uid==65532 and info.st_mode & 0o777 == 0o600
     (OUT/'fixture-permissions.json').write_text(json.dumps({'key_uid':info.st_uid,'key_mode':oct(info.st_mode & 0o777)}))
+    smoke=os.environ.get("PROTOCOL_SMOKE_ONLY")=="1"
     rows=[];proofs=[]
-    for mode in ['h2c','h2-tls','h1-tls']:
-        for phase,variant in enumerate(['base','candidate','candidate','base'],1):
+    for mode in (['h2-tls','h1-tls'] if smoke else ['h2c','h2-tls','h1-tls']):
+        for phase,variant in enumerate(['base','candidate'] if smoke else ['base','candidate','candidate','base'],1):
             directory=OUT/f'{mode}-{phase:02d}-{variant}';directory.mkdir()
             config=directory/'gatel.kdl'
             secure=mode!='h2c'
-            config.write_text('global { '+('https ":8443"' if secure else 'http ":8080"')+'; log level="error" format="json"; }\nsite "gatel-protocol" { '+('tls cert="/certs/cert.pem" key="/certs/key.pem"; ' if secure else '')+'route "/*" { file-server root="/srv/www"; } }\n')
+            config.write_text('global { '+('https ":8443"' if secure else 'http ":8080"')+'; log level="error" format="json"; }\nsite "gatel-protocol" { '+('tls cert="certs/cert.pem" key="certs/key.pem"; ' if secure else '')+'route "/*" { file-server root="/srv/www"; } }\n')
             try:
-                run(['docker','run','-d','--network','gatel-protocol-ab','--name','gatel-protocol','--no-healthcheck','-v',str(config)+':/etc/gatel/gatel.kdl:ro','-v',str(tls)+':/certs:ro','-v',str(HERE/'fixtures/www')+':/srv/www:ro','gatel-ab:'+variant])
+                run(['docker','run','-d','--network','gatel-protocol-ab','--name','gatel-protocol','--no-healthcheck','-v',str(config)+':/etc/gatel/gatel.kdl:ro','-v',str(tls)+':/etc/gatel/certs:ro','-v',str(HERE/'fixtures/www')+':/srv/www:ro','gatel-ab:'+variant])
                 run(['docker','run','-d','--network','gatel-protocol-ab','--name','gatel-protocol-client','gatel-protocol-client:local'])
                 version=capture(['docker','exec','gatel-protocol-client','h2load','--version'],text=True)
                 (directory/'client-version.txt').write_text(version)
@@ -42,9 +43,9 @@ def main():
                     source=(HERE/'fixtures/www'/('payload-'+size+'.bin')).read_bytes()
                     assert body==source
                     proofs.append({'mode':mode,'phase':phase,'variant':variant,'size':size,'sha256':hashlib.sha256(body).hexdigest(),'bytes':len(body)})
-                    clients,streams=(128,1) if mode=='h1-tls' else (8,16)
-                    duration=30 if size=='10m' else 10
-                    command=['docker','exec','gatel-protocol-client','h2load','-t4','-c'+str(clients),'-m'+str(streams),'-D'+str(duration),'--warm-up-time=3','-N5','-H','accept-encoding: identity']
+                    clients,streams=(1,1) if smoke else (128,1) if mode=='h1-tls' else (8,16)
+                    duration=1 if smoke else 30 if size=='10m' else 10
+                    command=['docker','exec','gatel-protocol-client','h2load','-t4','-c'+str(clients),'-m'+str(streams),'-D'+str(duration),'--warm-up-time='+('0' if smoke else '3'),'-N5','-H','accept-encoding: identity']
                     if mode=='h1-tls':command.append('--h1')
                     raw=capture(command+[url],text=True,timeout=duration+35)
                     (directory/(size+'.txt')).write_text(raw)
@@ -61,7 +62,7 @@ def main():
                 logs=subprocess.run(['docker','logs','gatel-protocol'],capture_output=True,text=True)
                 (directory/'server.log').write_text(logs.stdout+logs.stderr)
                 subprocess.run(['docker','rm','-f','gatel-protocol','gatel-protocol-client'],check=False)
-    assert len(rows)==len(proofs)==36
+    assert len(rows)==len(proofs)==(12 if smoke else 36)
     assert all(r['failed']==r['errored']==r['timeout']==0 for r in rows if r['variant']=='candidate'), 'Candidate protocol errors; all data retained.'
     run(['docker','network','rm','gatel-protocol-ab'])
 
