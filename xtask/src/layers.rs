@@ -217,6 +217,8 @@ pub(crate) const ALLOWED: &[(&str, &[&str])] = &[
             "hyper-util",
             "pin-project-lite",
             "salvo_core",
+            // The HTTP transport owns accepted sockets and their write readiness.
+            "socket2",
             "tokio",
             "tracing",
         ],
