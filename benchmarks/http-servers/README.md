@@ -17,8 +17,8 @@ system and how many other things are running.
 
 So the report is for deciding whether a change made this project faster or
 slower than it was, and for noticing when it is wildly out of line with the
-other two. It is not a claim about anybody else's deployment, and nothing in
-this repository quotes a number from it.
+other two. It is not a claim about anybody else's deployment. The diagnostic
+measurements below retain their host and workload context.
 
 Performance comparisons and throughput thresholds are deliberately not CI
 gates. A shared runner's throughput moves by tens of
@@ -68,9 +68,21 @@ Results land in `target/benchmarks/http-servers/<timestamp>/`:
 - `summary.json` — every round, machine-readable
 - `raw/*.txt` — what `wrk` actually printed
 - `payload-checks.json` — status, exact bytes and range headers checked before load
+- `network-settings.json` — actual client TCP receive settings, captured before warmup
 - `containers.log` — service logs, captured before cleanup even on failure
 
 Container cleanup still runs if collecting or saving the service logs fails.
+
+The unchanged wrk limit is 5 seconds. wrk counts a response completed beyond
+that limit as a timeout, but excludes it from its latency histogram. Its
+reported p99 and maximum can therefore remain below 5 seconds even when slower
+responses occurred. Requests still in flight when wrk stops are also absent:
+zero timeout counts do not prove that every request completed within the limit.
+Check the over-limit completion count before interpreting tail latency. JSON keeps `timeout_errors` separately; `socket_errors` remains
+the aggregate of wrk's connect, read, write and timeout counters. The report's
+Errors column already includes timeouts; the separate column does not add them
+again. See wrk's [completion accounting](https://github.com/wg/wrk/blob/4.2.0/src/wrk.c#L301-L325)
+and [histogram bounds](https://github.com/wg/wrk/blob/4.2.0/src/stats.c#L19-L27).
 
 Each completed round is saved immediately. Reported p90/p99 values are means
 of the individual rounds' percentiles, not percentiles of pooled requests.
@@ -125,6 +137,39 @@ Harness regression tests (without Docker):
 ```bash
 python -B -m unittest discover -s benchmarks/http-servers -p 'test_*.py'
 ```
+
+## Diagnosing receive-queue pressure
+
+A 128-connection large-file run can consume much more kernel socket memory than
+the server's process RSS suggests. On one 4-vCPU runner, a 32 MiB receive-buffer
+ceiling let client socket memory reach 758 MiB. The run recorded TCP memory
+pressure, receive-queue drops, retransmission timeouts and two responses completed
+beyond wrk's 5-second histogram limit. This is a reproducible trigger in that
+environment, not proof that every slow request has the same cause. The kernel's
+[TCP memory controls](https://docs.kernel.org/networking/ip-sysctl.html) distinguish
+per-socket receive auto-tuning limits from the global TCP page budget.
+
+An optional Compose override bounds the shared client's receive buffers for a
+separate diagnostic comparison:
+
+```bash
+COMPOSE_FILE=compose.yml:profiles/bounded-client.yml python benchmarks/http-servers/run.py --no-build
+```
+
+On Windows, separate the two Compose paths with a semicolon. The harness runs
+Compose from this directory. Build the images first with the regular command,
+or omit `--no-build`. Check `network-settings.json` and the report: this
+profile should record `4096 131072 524288` bytes.
+
+Apply the same profile to every baseline, candidate and reference server in a
+comparison. Keep its results separate from the default profile: reducing the
+receive window changes flow control and may affect throughput over higher-RTT
+links. It is a benchmark control, not a production socket setting. In the paired
+reproduction, the override reduced client socket memory to 57 MiB and removed
+the recorded pressure/drops/retransmission-timeout counters, while throughput
+changed by -1.4%; one pair does not establish a universal tail-latency guarantee.
+See the [diagnostic run](https://github.com/salvo-rs/gatel/actions/runs/40814116374)
+for both measurements of the archived `95642ddb` experiment binary and raw data.
 
 ## The files under test
 
