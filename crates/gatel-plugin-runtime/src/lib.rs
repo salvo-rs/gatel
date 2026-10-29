@@ -15,6 +15,13 @@ pub use body_error::{BodyTooLarge, RequestBodyLimit};
 pub use subrequest::{Answer, Ask, SharedUpstreams, UpstreamHandle};
 pub use task::{BackgroundTask, Shutdown, ShutdownSignal};
 
+/// A host can bound queued bulk-file output independently of other responses.
+/// Hosts advertise this on HTTP/1.1 requests; file producers return the same
+/// marker on responses requesting that policy. Absence preserves the portable
+/// reader. This zero-sized marker carries no per-request handle.
+#[derive(Debug, Clone, Copy)]
+pub struct BoundedFileOutput;
+
 /// Host-supplied identity of the selected execution plan and declared upstream
 /// configurations. Not an authorization capability or a generation counter.
 #[derive(Debug, Clone, Copy)]

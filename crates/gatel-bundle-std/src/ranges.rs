@@ -22,6 +22,7 @@ const INLINE_LIMIT: u64 = 64 * 1024;
 /// Reserve bounded direct reads for bulk downloads. Mid-size streams retain
 /// the portable reader's scheduling and throughput characteristics.
 const DIRECT_MIN: u64 = 8 * 1024 * 1024;
+const DIRECT_BULK: bool = false;
 
 /// How much is read from disk at a time once a file is streamed.
 ///
@@ -186,6 +187,7 @@ pub(crate) async fn deliver_with_bulk(
     wanted: Wanted,
     bulk_direct: bool,
 ) -> Result<(), std::io::Error> {
+    response.extensions.remove::<gatel_plan::BoundedFileOutput>();
     let size = opened.metadata.len();
     if let Wanted::Part { start, end } = wanted
         && (start > end || end >= size)
@@ -256,8 +258,11 @@ pub(crate) async fn deliver_with_bulk(
         return Ok(());
     }
     if length >= DIRECT_MIN && bulk_direct {
-        response.body(crate::file_body::stream(file.into_std().await, start, length));
-        return Ok(());
+        response.extensions.insert(gatel_plan::BoundedFileOutput);
+        if DIRECT_BULK {
+            response.body(crate::file_body::stream(file.into_std().await, start, length));
+            return Ok(());
+        }
     }
     if start != 0 {
         file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -550,6 +555,13 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                    assert_eq!(
+                        response
+                            .extensions
+                            .get::<gatel_plan::BoundedFileOutput>()
+                            .is_some(),
+                        enabled && length >= DIRECT_MIN
+                    );
                     let mut body = std::mem::take(response.body_mut());
                     let mut received = Vec::new();
                     while let Some(frame) = body.frame().await {

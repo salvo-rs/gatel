@@ -433,7 +433,11 @@ impl Handler for FileServer {
             crate::ranges::wanted(request, size, &tag)
         };
 
-        let bulk_direct = request.version() == http::Version::HTTP_11;
+        let bulk_direct = request.version() == http::Version::HTTP_11
+            && request
+                .extensions()
+                .get::<gatel_plan::BoundedFileOutput>()
+                .is_some();
         if let Err(error) = crate::ranges::deliver_with_bulk(response, opened, wanted, bulk_direct).await {
             unreadable(&source, &error, depot, response);
         } else if let Some(encoding) = transform {
