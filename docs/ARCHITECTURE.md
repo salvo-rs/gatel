@@ -1223,16 +1223,19 @@ at most 32 idle buffers, for a combined 3 MiB idle payload bound. Live frames an
 cached bodies hold leases outside this idle bound, and a short body can retain
 a full size class.
 
-HTTP/1.1 responses of at least 8 MiB use a demand-driven direct reader. Each
-64 KiB read targets its outgoing owned buffer. Concurrent blocking reads share
-a process-wide limit of 16; a cancelled body does not release its permit
-until already-started blocking work finishes. Network writes and cached frames
-do not hold admission. There is no independent producer or unbounded read-ahead.
+Larger responses retain the portable Tokio reader and 64 KiB frames. A capable
+Linux host advertises a zero-sized `BoundedFileOutput` marker on HTTP/1.1
+requests. The file handler returns that marker for selected bodies of at least
+8 MiB. H2, HTTP/1.0, smaller selected ranges and hosts without this capability
+keep their previous output policy.
 
-The first task seeks when needed, always using the original opened handle.
-Retained frame clones keep their buffer lease. H2, HTTP/1.0, standalone adapters
-and responses between 64 KiB and 8 MiB keep the original portable Tokio reader.
-The downstream TCP socket policy is unchanged.
+The native host bounds the unsent queue for these bulk-file responses using
+`TCP_NOTSENT_LOWAT`. It leaves `SO_SNDBUF` auto-tuning and bytes in flight alone.
+The next response without the marker restores the socket's original value,
+including zero (inherit the namespace setting), before writing. Proxy responses
+and upgrades use their original policy. Private connection hint state is
+independent of upgrade handoff ownership; the SDK marker holds no request or
+connection handle.
 
 An exact-length reader bounds growth and reports premature EOF as an error for
 both buffered and streaming bodies. This prevents a truncated stream from looking

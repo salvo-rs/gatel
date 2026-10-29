@@ -19,9 +19,9 @@ use tokio::io::AsyncSeekExt;
 /// and one buffer.
 const INLINE_LIMIT: u64 = 64 * 1024;
 
-/// Reserve bounded direct reads for bulk downloads. Mid-size streams retain
-/// the portable reader's scheduling and throughput characteristics.
-const DIRECT_MIN: u64 = 8 * 1024 * 1024;
+/// Scope output backpressure to bulk downloads; smaller streams keep the
+/// socket policy that was in use before this response.
+const BULK_MIN: u64 = 8 * 1024 * 1024;
 
 /// How much is read from disk at a time once a file is streamed.
 ///
@@ -178,14 +178,15 @@ pub async fn deliver(
     deliver_with_bulk(response, opened, wanted, false).await
 }
 
-/// HTTP/1.1 can use bounded blocking reads for bulk streams. Other adapters
-/// keep the original reader.
+/// Advertise selected bulk-file responses to a capable HTTP/1.1 host.
+/// Every host keeps the original portable body reader.
 pub(crate) async fn deliver_with_bulk(
     response: &mut Response,
     opened: OpenedFile,
     wanted: Wanted,
-    bulk_direct: bool,
+    bounded_output: bool,
 ) -> Result<(), std::io::Error> {
+    response.extensions.remove::<gatel_plan::BoundedFileOutput>();
     let size = opened.metadata.len();
     if let Wanted::Part { start, end } = wanted
         && (start > end || end >= size)
@@ -255,9 +256,8 @@ pub(crate) async fn deliver_with_bulk(
         }
         return Ok(());
     }
-    if length >= DIRECT_MIN && bulk_direct {
-        response.body(crate::file_body::stream(file.into_std().await, start, length));
-        return Ok(());
+    if length >= BULK_MIN && bounded_output {
+        response.extensions.insert(gatel_plan::BoundedFileOutput);
     }
     if start != 0 {
         file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -533,11 +533,11 @@ mod tests {
     #[tokio::test]
     async fn large_range_lengths_and_offsets_preserve_frames_and_bytes() {
         use http_body_util::BodyExt as _;
-        let original: Vec<_> = (0..DIRECT_MIN as usize + 32).map(|n| (n % 251) as u8).collect();
+        let original: Vec<_> = (0..BULK_MIN as usize + 32).map(|n| (n % 251) as u8).collect();
         let path = write("direct-read-boundary", &original).await;
         for enabled in [false, true] {
             for start in [0, 13] {
-                for length in [DIRECT_MIN - 1, DIRECT_MIN, DIRECT_MIN + 1] {
+                for length in [BULK_MIN - 1, BULK_MIN, BULK_MIN + 1] {
                     let mut response = Response::new();
                     super::deliver_with_bulk(
                         &mut response,
@@ -550,6 +550,13 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                    assert_eq!(
+                        response
+                            .extensions
+                            .get::<gatel_plan::BoundedFileOutput>()
+                            .is_some(),
+                        enabled && length >= BULK_MIN
+                    );
                     let mut body = std::mem::take(response.body_mut());
                     let mut received = Vec::new();
                     while let Some(frame) = body.frame().await {
@@ -597,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_reads_keep_the_opened_file_and_report_truncation_after_a_frame() {
         use http_body_util::BodyExt as _;
-        let original: Vec<_> = (0..DIRECT_MIN as usize + 61).map(|n| (n % 251) as u8).collect();
+        let original: Vec<_> = (0..BULK_MIN as usize + 61).map(|n| (n % 251) as u8).collect();
         let path = write("bulk-opened", &original).await;
         let opened = OpenedFile::open(&path).await.unwrap();
         let previous = path.with_extension("old");
@@ -609,7 +616,7 @@ mod tests {
             opened,
             Wanted::Part {
                 start: 13,
-                end: 13 + DIRECT_MIN + 16,
+                end: 13 + BULK_MIN + 16,
             },
             true,
         )
@@ -617,7 +624,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             body_of(&mut response).await,
-            original[13..13 + DIRECT_MIN as usize + 17]
+            original[13..13 + BULK_MIN as usize + 17]
         );
 
         let opened = OpenedFile::open(&previous).await.unwrap();

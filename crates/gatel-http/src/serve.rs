@@ -335,20 +335,34 @@ async fn serve_connection(
         runtime
             .service
             .hyper_handler(local.into(), peer.into(), scheme, None, ConnCtrl::new(), None);
+    let (stream, output) = crate::socket_output::configure(stream);
     let work = crate::connection_work::ConnectionWork::default();
     let request_work = work.clone();
     let activity = crate::connection_activity::Activity::new();
     let request_activity = activity.clone();
     let handler = Arc::new(handler);
     let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
+        let http1 = request.version() == hyper::Version::HTTP_11;
+        if http1 && output.is_some() {
+            request.extensions_mut().insert(gatel_plan::BoundedFileOutput);
+        }
         request.extensions_mut().insert(request_work.clone());
+        let output = output.clone();
         let active = request_activity.request();
         let handler = handler.clone();
         async move {
-            handler
-                .call(request)
-                .await
-                .map(|response| response.map(|body| crate::connection_activity::Body::new(body, active)))
+            handler.call(request).await.map(|response| {
+                if let Some(output) = output {
+                    output.set_file(
+                        http1
+                            && response
+                                .extensions()
+                                .get::<gatel_plan::BoundedFileOutput>()
+                                .is_some(),
+                    );
+                }
+                response.map(|body| crate::connection_activity::Body::new(body, active))
+            })
         }
     });
     let mut builder = auto::Builder::new(TokioExecutor::new());
