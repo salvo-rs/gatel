@@ -1,0 +1,6 @@
+# Optional diagnostic profile. Applies to the shared load generator for every target.
+# Keep default-profile results separately; this changes TCP flow control.
+services:
+  bench:
+    sysctls:
+      net.ipv4.tcp_rmem: '4096 131072 524288'
