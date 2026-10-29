@@ -124,6 +124,108 @@ fn files_head_ranges_browsing_and_changes_use_the_standard_handler() {
 }
 
 #[test]
+fn file_buffer_boundaries_preserve_persistent_http_framing() {
+    use std::io::{BufRead, BufReader};
+
+    fn exchange(
+        stream: &mut BufReader<TcpStream>,
+        method: &str,
+        path: &str,
+        range: Option<(usize, usize)>,
+    ) -> Vec<u8> {
+        write!(
+            stream.get_mut(),
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+        )
+        .unwrap();
+        if let Some((start, end)) = range {
+            write!(stream.get_mut(), "Range: bytes={start}-{end}\r\n").unwrap();
+        }
+        write!(stream.get_mut(), "\r\n").unwrap();
+        let mut status = String::new();
+        stream.read_line(&mut status).unwrap();
+        let expected = if range.is_some() { 206 } else { 200 };
+        assert!(status.starts_with(&format!("HTTP/1.1 {expected} ")), "{status}");
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert!(
+                stream.read_line(&mut line).unwrap() > 0,
+                "incomplete response head"
+            );
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let length = length.expect("file response must declare its selected length");
+        let mut body = vec![0; if method == "HEAD" { 0 } else { length }];
+        stream.read_exact(&mut body).unwrap();
+        body
+    }
+
+    let directory = Directory::new();
+    let sizes = [
+        32767,
+        32768,
+        32769,
+        64512,
+        65535,
+        65536,
+        65537,
+        66560,
+        1024 * 1024 + 123,
+    ];
+    for (id, size) in sizes.into_iter().enumerate() {
+        let bytes: Vec<_> = (0..size).map(|offset| ((offset + id * 17) % 251) as u8).collect();
+        std::fs::write(directory.0.join(format!("{id}.bin")), bytes).unwrap();
+    }
+    let port = port();
+    let mut process = Process(
+        command()
+            .arg("serve")
+            .arg(&directory.0)
+            .args(["--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let socket = loop {
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "server exited before readiness"
+        );
+        if let Ok(socket) = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)) {
+            break socket;
+        }
+        assert!(Instant::now() < deadline, "server never became ready");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream = BufReader::new(socket);
+    // Alternate representations on one connection. A leaked HEAD body, a
+    // truncated frame or extra bytes from a previous lease corrupts the next head.
+    for (id, size) in sizes.into_iter().enumerate().rev() {
+        let path = format!("/{id}.bin");
+        let expected: Vec<_> = (0..size).map(|offset| ((offset + id * 17) % 251) as u8).collect();
+        assert!(exchange(&mut stream, "HEAD", &path, None).is_empty());
+        assert_eq!(exchange(&mut stream, "GET", &path, None), expected);
+        let end = (size - 1).min(65549);
+        assert_eq!(
+            exchange(&mut stream, "GET", &path, Some((13, end))),
+            expected[13..=end]
+        );
+    }
+}
+
+#[test]
 fn dry_run_validates_root_binds_and_reports_usage_errors() {
     let directory = Directory::new();
     let output = command()
