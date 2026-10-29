@@ -1,0 +1,45 @@
+name: Final candidate H2 and TLS same-host controls (one-off)
+on:
+  push:
+    branches: [bench/file-protocol-controls-20261029]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  protocols:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f11ffccdaaae6249c1f779160b5b84af1f479ae6
+          path: source
+          persist-credentials: false
+      - name: Record remote host and storage
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/final-protocol-controls"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          { uname -a; lscpu; docker info; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
+      - name: Verify the exact final A/B binaries and build the common client
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/protocol-repackage.py
+      - name: Paired H2c, H2 TLS and H1 TLS controls
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/protocol-controls-fixed.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: final-protocol-controls
+          path: |
+            ${{ runner.temp }}/final-protocol-controls
+            !${{ runner.temp }}/final-protocol-controls/protocol-controls/tls/key.pem
+          if-no-files-found: error
