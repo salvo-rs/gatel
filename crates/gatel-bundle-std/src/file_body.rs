@@ -186,10 +186,18 @@ mod tests {
         static POOL: BufferPool = BufferPool::new(64);
         let bytes = POOL.read(&b"ok"[..], 2).unwrap();
         let idle = POOL.idle.lock().unwrap();
-        // Dropping on this same thread would deadlock if Drop waited for the
-        // lock. A contended pool releases the allocation instead of retaining it.
-        drop(bytes);
+        let (dropped, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            drop(bytes);
+            dropped.send(()).unwrap();
+        });
+        // Keep the lock held until Drop completes or the deadline expires.
+        // Release it before joining, so a regression fails instead of hanging.
+        let completed = done.recv_timeout(std::time::Duration::from_secs(5));
         assert!(idle.is_empty());
+        drop(idle);
+        worker.join().unwrap();
+        assert!(completed.is_ok(), "returning a lease waited for the pool lock");
     }
 
     #[test]
