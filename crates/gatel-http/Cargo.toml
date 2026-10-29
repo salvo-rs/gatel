@@ -26,6 +26,9 @@ salvo_core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+
 [dev-dependencies]
 socket2 = "0.6"
 gatel-decode = { version = "2.0.0-alpha.1", path = "../../plugins/decode" }

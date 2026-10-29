@@ -23,6 +23,30 @@ impl ExecutionIdentity {
     pub const DEPOT_KEY: &'static str = "gatel.execution_identity";
 }
 
+/// Host-supplied output scheduling hint for the current HTTP/1.1 response.
+///
+/// Hosts provide it only when the socket supports bounded unsent TCP output.
+/// The HTTP/1 transport resets it before each sequential request; a streamed
+/// file enables it for that response. H2 and adapters without the extension keep
+/// the portable reader. This does not authorize access or cap bytes in flight.
+#[derive(Debug, Clone, Default)]
+pub struct BoundedTcpOutput(Arc<std::sync::atomic::AtomicBool>);
+
+impl BoundedTcpOutput {
+    pub fn enable(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Called by the host before dispatching the next sequential request.
+    pub fn reset(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// State a directive keeps between requests.
 ///
 /// A directive that needs one declares it here rather than reaching for a

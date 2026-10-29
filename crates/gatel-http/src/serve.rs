@@ -323,6 +323,7 @@ async fn serve_connection(
             }
         }
     }
+    let (stream, bounded_output) = crate::socket_output::configure(stream);
     // A guard rather than a decrement at the end: this function returns from
     // four places, and one of them being forgotten would make the gauge climb
     // forever.
@@ -342,6 +343,16 @@ async fn serve_connection(
     let handler = Arc::new(handler);
     let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
         request.extensions_mut().insert(request_work.clone());
+        // HTTP/1 dispatches responses sequentially. H2 streams share a socket,
+        // so they keep the portable reader and the original socket policy.
+        if request.version() != http::Version::HTTP_2
+            && let Some(output) = &bounded_output
+        {
+            output.reset();
+            if request.version() == http::Version::HTTP_11 {
+                request.extensions_mut().insert(output.clone());
+            }
+        }
         let active = request_activity.request();
         let handler = handler.clone();
         async move {
