@@ -17,6 +17,94 @@ pub(crate) fn read_exact_prefix(reader: impl Read, length: usize) -> io::Result<
     Ok(buffer)
 }
 
+pub(crate) const POOLED_MIN: usize = 32 * 1024;
+const MAX_CHUNK: usize = 64 * 1024;
+const MAX_IDLE: usize = 32;
+
+struct BufferPool {
+    size: usize,
+    idle: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl BufferPool {
+    const fn new(size: usize) -> Self {
+        Self {
+            size,
+            idle: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn read(&'static self, mut reader: impl Read, length: usize) -> io::Result<bytes::Bytes> {
+        assert!(length <= self.size);
+        // Do not hold the pool lock during allocation or filesystem I/O.
+        let buffer = self
+            .idle
+            .try_lock()
+            .ok()
+            .and_then(|mut idle| idle.pop())
+            .unwrap_or_else(|| vec![0; self.size]);
+        let mut lease = BufferLease {
+            pool: self,
+            buffer: Some(buffer),
+            length: 0,
+        };
+        reader.read_exact(&mut lease.buffer.as_mut().expect("a live lease owns its buffer")[..length])?;
+        lease.length = length;
+        Ok(bytes::Bytes::from_owner(lease))
+    }
+}
+
+struct BufferLease {
+    pool: &'static BufferPool,
+    buffer: Option<Vec<u8>>,
+    length: usize,
+}
+
+impl AsRef<[u8]> for BufferLease {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer.as_ref().expect("a live lease owns its buffer")[..self.length]
+    }
+}
+
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else { return };
+        // Returning the last Bytes clone must not wait for the pool lock.
+        // Contention and a full pool simply release the buffer.
+        if let Ok(mut idle) = self.pool.idle.try_lock()
+            && idle.len() < MAX_IDLE
+        {
+            idle.push(buffer);
+        }
+    }
+}
+
+static MEDIUM_BUFFERS: BufferPool = BufferPool::new(32 * 1024);
+static LARGE_BUFFERS: BufferPool = BufferPool::new(MAX_CHUNK);
+
+/// Reuse initialized buffers for the eager 32–64 KiB response path.
+/// Idle retention is bounded to 32 buffers per class (3 MiB total).
+pub(crate) fn read_bytes(reader: impl Read, length: usize) -> io::Result<bytes::Bytes> {
+    assert!((POOLED_MIN..=MAX_CHUNK).contains(&length));
+    if length <= MEDIUM_BUFFERS.size {
+        MEDIUM_BUFFERS.read(reader, length)
+    } else {
+        LARGE_BUFFERS.read(reader, length)
+    }
+}
+
+pub(crate) fn stream(
+    reader: impl AsyncRead + Send + Sync + Unpin + 'static,
+    chunk: usize,
+) -> salvo_core::http::ResBody {
+    let stream = tokio_util::io::ReaderStream::with_capacity(reader, chunk);
+    let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
+        Ok(bytes) => Ok(http_body::Frame::data(bytes)),
+        Err(error) => Err(Box::new(error) as salvo_core::BoxedError),
+    });
+    salvo_core::http::ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames)))
+}
+
 pub(crate) struct ExactReader<R> {
     inner: Take<R>,
 }
@@ -52,6 +140,58 @@ impl<R: AsyncRead + Unpin> AsyncRead for ExactReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pooled_bytes_keep_the_lease_until_the_last_clone_is_dropped() {
+        static POOL: BufferPool = BufferPool::new(64);
+        let bytes = POOL.read(&b"original"[..], 8).unwrap();
+        let clone = bytes.clone();
+        drop(bytes);
+        assert!(POOL.idle.lock().unwrap().is_empty());
+        assert_eq!(clone.as_ref(), b"original");
+        drop(clone);
+        assert_eq!(POOL.idle.lock().unwrap().len(), 1);
+        let reused = POOL.read(&b"new"[..], 3).unwrap();
+        assert_eq!(reused.as_ref(), b"new");
+        assert!(POOL.idle.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_short_read_returns_its_lease_without_exposing_old_bytes() {
+        static POOL: BufferPool = BufferPool::new(64);
+        drop(POOL.read(&[b's'; 64][..], 64).unwrap());
+        assert_eq!(
+            POOL.read(&b"short"[..], 64).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(POOL.idle.lock().unwrap().len(), 1);
+        assert_eq!(POOL.read(&b"x"[..], 1).unwrap().as_ref(), b"x");
+    }
+
+    #[test]
+    fn idle_retention_is_bounded_even_after_a_burst() {
+        static POOL: BufferPool = BufferPool::new(64);
+        let leases: Vec<_> = (0..MAX_IDLE + 5)
+            .map(|_| POOL.read(&b"ok"[..], 2).unwrap())
+            .collect();
+        assert!(POOL.idle.lock().unwrap().is_empty());
+        drop(leases);
+        let idle = POOL.idle.lock().unwrap();
+        assert_eq!(idle.len(), MAX_IDLE);
+        assert!(idle.iter().all(|buffer| buffer.len() == 64));
+    }
+
+    #[test]
+    fn dropping_a_lease_does_not_wait_for_the_pool_lock() {
+        static POOL: BufferPool = BufferPool::new(64);
+        let bytes = POOL.read(&b"ok"[..], 2).unwrap();
+        let idle = POOL.idle.lock().unwrap();
+        // Dropping on this same thread would deadlock if Drop waited for the
+        // lock. A contended pool releases the allocation instead of retaining it.
+        drop(bytes);
+        assert!(idle.is_empty());
+    }
+
     #[test]
     fn bounded_read_rejects_short_input_and_ignores_growth() {
         assert_eq!(
