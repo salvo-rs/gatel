@@ -108,29 +108,69 @@ pub(crate) fn stream(
     salvo_core::http::ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames)))
 }
 
-/// Read a bounded batch directly into its outgoing owner, then split it into
-/// 64 KiB frames. Yield between batches so ready downloads share the executor.
+static DIAG_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static DIAG_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn report_delay(event: &str, id: u64, remaining: u64, elapsed: std::time::Duration) {
+    if elapsed >= std::time::Duration::from_millis(100)
+        && DIAG_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000
+    {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        eprintln!(
+            "FILE_DIAG event={event} id={id} remaining={remaining} elapsed_us={} unix_ms={unix_ms}",
+            elapsed.as_micros()
+        );
+    }
+}
+
 pub(crate) fn large_stream(file: std::fs::File, length: u64) -> salvo_core::http::ResBody {
-    let state = (Some(file), length, bytes::Bytes::new(), false);
+    let id = DIAG_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let state = (
+        Some(file),
+        length,
+        bytes::Bytes::new(),
+        false,
+        std::time::Instant::now(),
+        id,
+    );
     let frames = futures_util::stream::try_unfold(
         state,
-        |(mut file, mut remaining, mut ready, started)| async move {
+        |(mut file, mut remaining, mut ready, started, last, id)| async move {
             if remaining == 0 {
                 return Ok::<_, salvo_core::BoxedError>(None);
             }
+            report_delay(
+                if ready.is_empty() {
+                    "poll_gap_empty"
+                } else {
+                    "poll_gap_ready"
+                },
+                id,
+                remaining,
+                last.elapsed(),
+            );
             if ready.is_empty() {
                 if started {
                     tokio::task::yield_now().await;
                 }
                 let length = remaining.min(STREAM_READ as u64) as usize;
                 let mut input = file.take().expect("a pending batch owns its file");
-                let (next, bytes) = tokio::task::spawn_blocking(move || {
-                    let bytes = STREAM_BUFFERS.read(&mut input, length)?;
+                let queued = std::time::Instant::now();
+                let (next, bytes, finished) = tokio::task::spawn_blocking(move || {
+                    report_delay("read_queue", id, remaining, queued.elapsed());
+                    let start = std::time::Instant::now();
+                    let bytes = STREAM_BUFFERS.read(&mut input, length);
+                    report_delay("read_io", id, remaining, start.elapsed());
+                    let bytes = bytes?;
                     let file = (remaining > length as u64).then_some(input);
-                    Ok::<_, io::Error>((file, bytes))
+                    Ok::<_, io::Error>((file, bytes, std::time::Instant::now()))
                 })
                 .await
                 .map_err(io::Error::other)??;
+                report_delay("read_resume", id, remaining, finished.elapsed());
                 file = next;
                 ready = bytes;
             }
@@ -138,7 +178,7 @@ pub(crate) fn large_stream(file: std::fs::File, length: u64) -> salvo_core::http
             remaining -= bytes.len() as u64;
             Ok(Some((
                 http_body::Frame::data(bytes),
-                (file, remaining, ready, true),
+                (file, remaining, ready, true, std::time::Instant::now(), id),
             )))
         },
     );

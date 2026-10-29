@@ -35,8 +35,12 @@ pub struct OpenedFile {
 
 impl OpenedFile {
     pub async fn open(path: &Path) -> Result<Self, std::io::Error> {
+        let open_start = std::time::Instant::now();
         let file = tokio::fs::File::open(path).await?;
+        crate::file_body::report_delay("open_wait", 0, 0, open_start.elapsed());
+        let meta_start = std::time::Instant::now();
         let metadata = file.metadata().await?;
+        crate::file_body::report_delay("metadata_wait", 0, 0, meta_start.elapsed());
         if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
