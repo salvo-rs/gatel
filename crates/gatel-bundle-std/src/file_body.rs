@@ -104,7 +104,17 @@ pub(crate) fn stream(
 }
 
 const BULK_READS: usize = 16;
+const FILE_BUDGET_BYTES: usize = 1024;
 static BULK_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(BULK_READS);
+
+async fn charge_file_budget(bytes: usize) {
+    // Account for the bytes processed, rather than treating a ready 64 KiB
+    // frame as one cheap operation. Unlike yield_now, exhausting cooperation
+    // also stops other ready Tokio I/O in the enclosing connection task.
+    for _ in 0..bytes.div_ceil(FILE_BUDGET_BYTES) {
+        tokio::task::consume_budget().await;
+    }
+}
 
 fn stream_limited(
     reader: impl Read + io::Seek + Send + Sync + 'static,
@@ -132,6 +142,7 @@ fn stream_limited(
             })
             .await
             .map_err(io::Error::other)??;
+            charge_file_budget(length).await;
             Ok(Some((
                 http_body::Frame::data(bytes),
                 (reader, 0, remaining - length as u64),
@@ -176,6 +187,24 @@ impl<R: AsyncRead + Unpin> AsyncRead for ExactReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn file_budget_cooperates_and_finishes_when_the_caller_is_unconstrained() {
+        use std::future::Future as _;
+        let mut charged = Box::pin(charge_file_budget(MAX_CHUNK * 64));
+        std::future::poll_fn(|cx| {
+            assert!(charged.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        charged.await;
+        let mut unconstrained = Box::pin(tokio::task::unconstrained(charge_file_budget(MAX_CHUNK * 64)));
+        std::future::poll_fn(|cx| {
+            assert!(unconstrained.as_mut().poll(cx).is_ready());
+            Poll::Ready(())
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn direct_frames_preserve_offsets_lengths_and_retained_clones() {
