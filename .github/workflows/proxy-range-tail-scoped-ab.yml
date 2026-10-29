@@ -1,0 +1,124 @@
+name: Proxy cancellation and file delivery same-host A/B validation (one-off)
+on:
+  push:
+    branches: [bench/proxy-range-tail-scoped-ab-20261029]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f11ffccdaaae6249c1f779160b5b84af1f479ae6
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 90fff1582053b1811364c0b76cc8bb46d146311a
+          path: candidate
+          persist-credentials: false
+      - name: Record remote host and Docker storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/proxy-range-tail-scoped-ab"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          {
+            uname -a
+            lscpu
+            free -h
+            docker info
+            docker buildx ls
+            df -h "$(docker info --format '{{.DockerRootDir}}')"
+            git -C source rev-parse HEAD
+            git -C candidate rev-parse HEAD
+            git -C orchestration rev-parse HEAD
+          } > "$BENCHMARK_OUTPUT/environment.txt"
+      - name: Verify archived baseline and production-build the final candidate
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py build
+      - name: matrix phase 1 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure matrix 1
+      - name: matrix phase 2 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure matrix 2
+      - uses: actions/upload-artifact@v7
+        with:
+          name: scoped-ab-matrix-phase2
+          path: ${{ runner.temp }}/proxy-range-tail-scoped-ab
+      - name: matrix phase 3 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure matrix 3
+      - name: matrix phase 4 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure matrix 4
+      - name: matrix phase 5 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure matrix 5
+      - name: matrix phase 6 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure matrix 6
+      - uses: actions/upload-artifact@v7
+        with:
+          name: scoped-ab-matrix-phase6
+          path: ${{ runner.temp }}/proxy-range-tail-scoped-ab
+      - name: tail phase 1 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure tail 1
+      - name: tail phase 2 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure tail 2
+      - name: tail phase 3 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure tail 3
+      - name: tail phase 4 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure tail 4
+      - name: tail phase 5 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure tail 5
+      - name: tail phase 6 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure tail 6
+      - name: proxy-tail phase 1 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure proxy-tail 1
+      - name: proxy-tail phase 2 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure proxy-tail 2
+      - name: proxy-tail phase 3 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure proxy-tail 3
+      - name: proxy-tail phase 4 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure proxy-tail 4
+      - name: proxy-tail phase 5 of 6 (base)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure proxy-tail 5
+      - name: proxy-tail phase 6 of 6 (candidate)
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/scoped-ab.py measure proxy-tail 6
+      - name: Supplemental H2 and TLS controls on this host
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/protocol-controls-fixed.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: proxy-range-tail-scoped-ab
+          path: |
+            ${{ runner.temp }}/proxy-range-tail-scoped-ab
+            !${{ runner.temp }}/proxy-range-tail-scoped-ab/protocol-controls/tls/key.pem
+          if-no-files-found: error
+
