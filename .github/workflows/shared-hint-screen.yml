@@ -1,4 +1,4 @@
-name: Share the file output hint owner: three-arm screen (one-off)
+name: Share the file output hint owner three-arm screen (one-off)
 on:
   push:
     branches: [bench/file-output-shared-hint-screen-20261030]
