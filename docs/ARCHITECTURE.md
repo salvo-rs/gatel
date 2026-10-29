@@ -1224,10 +1224,12 @@ cached bodies hold leases outside this idle bound, and a short body can retain
 a full size class.
 
 Larger responses retain the portable Tokio reader and 64 KiB frames. A capable
-Linux host honors a zero-sized `BoundedFileOutput` response marker for HTTP/1.1.
+Linux host honors a zero-sized `BoundedFileOutput` response marker for plaintext
+HTTP/1.1.
 The file handler adds that marker for selected bodies of at least 8 MiB.
-H2, HTTP/1.0, smaller selected ranges and hosts without this capability
-keep their previous output policy.
+H2, TLS, HTTP/1.0, smaller selected ranges and hosts without this capability
+keep their previous output policy. TLS retains the original raw TCP transport
+without the file-output wrapper or a connection hint.
 
 The native host bounds the unsent queue for these bulk-file responses using
 `TCP_NOTSENT_LOWAT`. It leaves `SO_SNDBUF` auto-tuning and bytes in flight alone.
@@ -1235,7 +1237,8 @@ The next response without the marker restores the socket's original value,
 including zero (inherit the namespace setting), before writing. Proxy responses
 and upgrades use their original policy. Private connection hint state is
 independent of upgrade handoff ownership; the SDK marker holds no request or
-connection handle.
+connection handle. The existing handler owner carries the optional hint, so a
+request does not clone a separate hint owner.
 
 An exact-length reader bounds growth and reports premature EOF as an error for
 both buffered and streaming bodies. This prevents a truncated stream from looking

@@ -33,7 +33,17 @@ impl Hint {
     }
 }
 
-pub(crate) fn configure(stream: tokio::net::TcpStream) -> (Output, Option<Arc<Hint>>) {
+pub(crate) fn configure(stream: tokio::net::TcpStream, enabled: bool) -> (Output, Option<Arc<Hint>>) {
+    if !enabled {
+        return (
+            Output {
+                stream,
+                #[cfg(target_os = "linux")]
+                policy: None,
+            },
+            None,
+        );
+    }
     #[cfg(target_os = "linux")]
     {
         let socket = socket2::SockRef::from(&stream);
@@ -54,6 +64,10 @@ pub(crate) fn configure(stream: tokio::net::TcpStream) -> (Output, Option<Arc<Hi
 }
 
 impl Output {
+    pub(crate) fn into_inner(self) -> tokio::net::TcpStream {
+        self.stream
+    }
+
     fn apply(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(policy) = &mut self.policy {
@@ -132,6 +146,37 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn tls_uses_raw_tcp_without_a_file_policy_or_socket_changes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        #[cfg(target_os = "linux")]
+        socket2::SockRef::from(&stream)
+            .set_tcp_notsent_lowat(256 * 1024)
+            .unwrap();
+        let (output, hint) = configure(stream, false);
+        assert!(hint.is_none());
+        let mut stream = output.into_inner();
+        assert!(stream.nodelay().unwrap());
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket2::SockRef::from(&stream).tcp_notsent_lowat().unwrap(),
+            256 * 1024
+        );
+        stream.write_all(b"before TLS").await.unwrap();
+        let mut received = [0; 10];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"before TLS");
+        client.write_all(b"client").await.unwrap();
+        let mut received = [0; 6];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"client");
+    }
+
+    #[tokio::test]
     async fn io_contract_and_owner_cancellation_do_not_depend_on_output_hints() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
@@ -139,7 +184,7 @@ mod tests {
             .unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         let vectored = stream.is_write_vectored();
-        let (mut output, _hint) = configure(stream);
+        let (mut output, _hint) = configure(stream, true);
         assert_eq!(output.is_write_vectored(), vectored);
         let work = crate::connection_work::ConnectionWork::default();
         let (held, closed) = tokio::sync::oneshot::channel::<()>();
@@ -180,7 +225,7 @@ mod tests {
             let socket = socket2::SockRef::from(&stream);
             socket.set_tcp_notsent_lowat(original).unwrap();
             let send_buffer = socket.send_buffer_size().unwrap();
-            let (mut output, hint) = configure(stream);
+            let (mut output, hint) = configure(stream, true);
             let hint = hint.unwrap();
             assert_eq!(
                 socket2::SockRef::from(&output.stream)

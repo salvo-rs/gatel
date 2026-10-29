@@ -335,7 +335,7 @@ async fn serve_connection(
         runtime
             .service
             .hyper_handler(local.into(), peer.into(), scheme, None, ConnCtrl::new(), None);
-    let (stream, output) = crate::socket_output::configure(stream);
+    let (stream, output) = crate::socket_output::configure(stream, !runtime.is_tls());
     let work = crate::connection_work::ConnectionWork::default();
     let request_work = work.clone();
     let activity = crate::connection_activity::Activity::new();
@@ -394,7 +394,7 @@ async fn serve_connection(
         }
         Some(config) => {
             let acceptor = TlsAcceptor::from(Arc::clone(config));
-            match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream)).await {
+            match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream.into_inner())).await {
                 Ok(Ok(stream)) => {
                     metrics.handshakes_ok.increment();
                     let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), handler);
