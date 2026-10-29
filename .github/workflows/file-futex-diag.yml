@@ -1,0 +1,49 @@
+name: File futex ownership diagnostic (one-off)
+on:
+  push:
+    branches: [bench/file-futex-diag-20261029]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  transport:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 1bbdebfb67a9611e56f798ae9f3afd7275743eb1
+          path: source
+          persist-credentials: false
+      - name: Record remote environment
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/file-futex-diag"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          { uname -a; lscpu; docker info; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
+          command -v nsenter
+          command -v ss
+          if ! command -v strace; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends strace
+          fi
+      - name: Repackage verified original production binaries
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/file-futex-diag.py build
+      - name: Trace futex addresses separately from performance measurements
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-futex-diag.py measure
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: file-futex-diag
+          path: ${{ runner.temp }}/file-futex-diag
+          if-no-files-found: error
+
