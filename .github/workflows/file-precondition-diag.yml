@@ -1,0 +1,45 @@
+name: File timeout diagnostic after boundary workloads (one-off)
+on:
+  push:
+    branches: [bench/file-precondition-diag-20261029]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  transport:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 8fbc53db89acdae56a47fb8a8eda8611c102a175
+          path: source
+          persist-credentials: false
+      - name: Record remote environment
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/file-precondition-diag"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          { uname -a; lscpu; docker info; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
+          command -v nsenter
+          command -v ss
+      - name: Build instrumented production binary
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/file-precondition-diag.py build
+      - name: Locate read and transport stalls
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-precondition-diag.py measure
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: file-precondition-diag
+          path: ${{ runner.temp }}/file-precondition-diag
+          if-no-files-found: error
+
