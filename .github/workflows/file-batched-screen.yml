@@ -1,0 +1,53 @@
+name: Screen bounded read batches with 64KiB output frames (one-off)
+on:
+  push:
+    branches: [bench/file-batched-screen-20261029]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: orchestration
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f11ffccdaaae6249c1f779160b5b84af1f479ae6
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 4fc25c6079331617aea42169ee6fc4abd2b35b9c
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: bf8e8cb19b475cd7b2048272fa30e2a7386f917d
+          path: stable
+          persist-credentials: false
+      - name: Record remote builder and host
+        run: |
+          set -euo pipefail
+          export BENCHMARK_OUTPUT="$RUNNER_TEMP/file-batched-screen"
+          echo "BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$BENCHMARK_OUTPUT"
+          test "$GITHUB_ACTIONS" = true
+          { uname -a; lscpu; free -h; docker info; df -h "$(docker info --format '{{.DockerRootDir}}')"; } > "$BENCHMARK_OUTPUT/environment.txt"
+      - name: Build alternatives and verify the archived production baseline
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -u ../orchestration/.github/scripts/file-batched-screen.py build
+      - name: Compare both alternatives and baseline in balanced order
+        working-directory: source
+        run: python3 -B -u ../orchestration/.github/scripts/file-batched-screen.py measure
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: file-batched-screen
+          path: ${{ runner.temp }}/file-batched-screen
+          if-no-files-found: error
