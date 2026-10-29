@@ -35,7 +35,15 @@ pub enum SendError {
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Connection(error) => error.fmt(f),
+            Self::Connection(error) => {
+                error.fmt(f)?;
+                let mut cause = std::error::Error::source(error);
+                while let Some(error) = cause {
+                    write!(f, ": {error}")?;
+                    cause = error.source();
+                }
+                Ok(())
+            }
             Self::AlreadySent => f.write_str("an HTTP/2 lease permits one request"),
         }
     }
@@ -152,13 +160,19 @@ impl Lease {
             return sender.send_request(request).await.map_err(SendError::Connection);
         }
         let exclusive = self.exclusive.as_mut().expect("a lease owns its reservation");
+        // Cancellation can drop this future before Hyper's driver notices the
+        // cancelled response promise. Do not park that still-open sender.
+        let reusable = std::mem::replace(&mut exclusive.reusable, false);
         let result = match exclusive.sender.as_mut() {
-            Some(Sender::Http1(sender)) => sender.send_request(request).await,
+            Some(Sender::Http1(sender)) => match sender.ready().await {
+                Ok(()) => sender.send_request(request).await,
+                Err(error) => Err(error),
+            },
             Some(Sender::Http2(sender)) => sender.send_request(request).await,
             None => unreachable!("a lease always holds a sender until it is dropped"),
         };
-        if result.is_err() {
-            exclusive.reusable = false;
+        if result.is_ok() {
+            exclusive.reusable = reusable;
         }
         result.map_err(SendError::Connection)
     }

@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use salvo_core::http::{Request, ResBody, Response, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncSeekExt;
 
 /// Files up to this size are read in one go. Bigger ones are streamed.
 ///
@@ -18,6 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 /// the ordinary web asset — a stylesheet, a script, an icon — is still one read
 /// and one buffer.
 const INLINE_LIMIT: u64 = 64 * 1024;
+
+/// Reserve bounded direct reads for bulk downloads. Mid-size streams retain
+/// the portable reader's scheduling and throughput characteristics.
+const DIRECT_MIN: u64 = 8 * 1024 * 1024;
 
 /// How much is read from disk at a time once a file is streamed.
 ///
@@ -171,6 +175,17 @@ pub async fn deliver(
     opened: OpenedFile,
     wanted: Wanted,
 ) -> Result<(), std::io::Error> {
+    deliver_with_bulk(response, opened, wanted, false).await
+}
+
+/// HTTP/1.1 can use bounded blocking reads for bulk streams. Other adapters
+/// keep the original reader.
+pub(crate) async fn deliver_with_bulk(
+    response: &mut Response,
+    opened: OpenedFile,
+    wanted: Wanted,
+    bulk_direct: bool,
+) -> Result<(), std::io::Error> {
     let size = opened.metadata.len();
     if let Wanted::Part { start, end } = wanted
         && (start > end || end >= size)
@@ -213,40 +228,40 @@ pub async fn deliver(
     }
 
     let mut file = opened.file;
-    if length <= INLINE_LIMIT && start == 0 {
+    if length <= INLINE_LIMIT {
         // The idle Tokio file transfers its original handle without reopening
         // the path. Read directly into the outgoing buffer in one worker.
-        let file = file.into_std().await;
+        let mut file = file.into_std().await;
         if length < crate::file_body::POOLED_MIN as u64 {
             let buffer = tokio::task::spawn_blocking(move || {
+                if start != 0 {
+                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))?;
+                }
                 crate::file_body::read_exact_prefix(file, length as usize)
             })
             .await
             .map_err(std::io::Error::other)??;
             response.body(ResBody::Once(buffer.into()));
         } else {
-            let buffer =
-                tokio::task::spawn_blocking(move || crate::file_body::read_bytes(file, length as usize))
-                    .await
-                    .map_err(std::io::Error::other)??;
+            let buffer = tokio::task::spawn_blocking(move || {
+                if start != 0 {
+                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))?;
+                }
+                crate::file_body::read_bytes(file, length as usize)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
             response.body(ResBody::Once(buffer));
         }
         return Ok(());
     }
-    if start > 0 {
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-    }
-
-    if length <= INLINE_LIMIT {
-        let mut buffer = Vec::with_capacity(length as usize);
-        crate::file_body::ExactReader::new(file, length)
-            .read_to_end(&mut buffer)
-            .await?;
-        response.body(ResBody::Once(buffer.into()));
+    if length >= DIRECT_MIN && bulk_direct {
+        response.body(crate::file_body::stream(file.into_std().await, start, length));
         return Ok(());
     }
-
-    // Streamed: the memory this costs is one buffer, whatever the file weighs.
+    if start != 0 {
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+    }
     let stream =
         tokio_util::io::ReaderStream::with_capacity(crate::file_body::ExactReader::new(file, length), CHUNK);
     let frames = futures_util::StreamExt::map(stream, |chunk| match chunk {
@@ -516,6 +531,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_range_lengths_and_offsets_preserve_frames_and_bytes() {
+        use http_body_util::BodyExt as _;
+        let original: Vec<_> = (0..DIRECT_MIN as usize + 32).map(|n| (n % 251) as u8).collect();
+        let path = write("direct-read-boundary", &original).await;
+        for enabled in [false, true] {
+            for start in [0, 13] {
+                for length in [DIRECT_MIN - 1, DIRECT_MIN, DIRECT_MIN + 1] {
+                    let mut response = Response::new();
+                    super::deliver_with_bulk(
+                        &mut response,
+                        OpenedFile::open(&path).await.unwrap(),
+                        Wanted::Part {
+                            start,
+                            end: start + length - 1,
+                        },
+                        enabled,
+                    )
+                    .await
+                    .unwrap();
+                    let mut body = std::mem::take(response.body_mut());
+                    let mut received = Vec::new();
+                    while let Some(frame) = body.frame().await {
+                        let bytes = frame.unwrap().into_data().unwrap();
+                        assert!(bytes.len() <= CHUNK);
+                        received.extend_from_slice(&bytes);
+                    }
+                    assert_eq!(received, original[start as usize..(start + length) as usize]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn large_ranges_preserve_offsets_and_bound_outgoing_frames() {
         use http_body_util::BodyExt as _;
         let original: Vec<_> = (0..LARGE_FILE as usize * 2)
@@ -544,6 +592,50 @@ mod tests {
             received.extend_from_slice(&bytes);
         }
         assert_eq!(received, original[start..start + length]);
+    }
+
+    #[tokio::test]
+    async fn bulk_reads_keep_the_opened_file_and_report_truncation_after_a_frame() {
+        use http_body_util::BodyExt as _;
+        let original: Vec<_> = (0..DIRECT_MIN as usize + 61).map(|n| (n % 251) as u8).collect();
+        let path = write("bulk-opened", &original).await;
+        let opened = OpenedFile::open(&path).await.unwrap();
+        let previous = path.with_extension("old");
+        std::fs::rename(&path, &previous).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        let mut response = Response::new();
+        super::deliver_with_bulk(
+            &mut response,
+            opened,
+            Wanted::Part {
+                start: 13,
+                end: 13 + DIRECT_MIN + 16,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body_of(&mut response).await,
+            original[13..13 + DIRECT_MIN as usize + 17]
+        );
+
+        let opened = OpenedFile::open(&previous).await.unwrap();
+        super::deliver_with_bulk(&mut response, opened, Wanted::Whole, true)
+            .await
+            .unwrap();
+        let mut body = std::mem::take(response.body_mut());
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first.len(), CHUNK);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&previous)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(body.frame().await.unwrap().is_err());
+        assert_eq!(first.as_ref(), &original[..CHUNK]);
+        assert!(body.frame().await.is_none());
     }
 
     #[tokio::test]
@@ -588,6 +680,34 @@ mod tests {
             .unwrap();
         assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "8");
         assert_eq!(body_of(&mut response).await, b"original");
+    }
+
+    #[tokio::test]
+    async fn truncated_offset_ranges_never_publish_an_incomplete_inline_body() {
+        for length in [32 * 1024 - 1, 32 * 1024, INLINE_LIMIT] {
+            let start = 1024 * 1024 + 13;
+            let path = write("truncate-offset", &vec![b'x'; (start + length) as usize]).await;
+            let opened = OpenedFile::open(&path).await.unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(start + length - 1)
+                .unwrap();
+            let mut response = Response::new();
+            let error = super::deliver(
+                &mut response,
+                opened,
+                Wanted::Part {
+                    start,
+                    end: start + length - 1,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert!(matches!(response.body_mut(), ResBody::None));
+        }
     }
 
     #[tokio::test]
