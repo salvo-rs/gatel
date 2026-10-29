@@ -948,6 +948,15 @@ lease return share the current idle/lifetime policy lock: a lease created under
 an older generation cannot repopulate a newly disabled idle pool. Publication
 also trims existing idle sockets, retaining active requests until they finish.
 
+An HTTP/1 sender being open does not establish dispatcher readiness. Checkout
+waits for readiness before reusing an idle sender and discards one whose driver
+observes closure. Stale checks and a replacement dial share one connect budget.
+A send marks its exclusive lease non-reusable before awaiting readiness or the
+response head; only success restores its previous reuse policy. Dropping a
+pending send therefore cannot park a connection before Hyper observes the
+cancellation. This never replays an already dispatched request. Send errors
+retain Hyper's underlying cause as well as its top-level message.
+
 Directives take part in the same table. A directive declares what it needs to
 keep between requests, and its state is owned by the site or route it was
 written on — so moving it gives it different state, and editing an unrelated
@@ -1198,10 +1207,11 @@ Body delivery consumes the same owner instead of reopening its pathname. A
 deployment that replaces the directory entry cannot switch the response body to
 the replacement after its validators have been chosen.
 
-Responses of at most 64 KiB starting at offset zero transfer the already-opened
+Responses of at most 64 KiB transfer the already-opened
 idle Tokio file to a standard file handle. One blocking task reads exactly the
 selected length into the outgoing buffer, avoiding a separate file read buffer.
-This does not reopen the pathname. Reads below 32 KiB keep the original outgoing
+For a nonzero range, that same task seeks before reading. This does not reopen
+the pathname. Reads below 32 KiB keep the original outgoing
 buffer conversion on the asynchronous task.
 
 Direct reads of 32–64 KiB use initialized buffers from two process-wide size
@@ -1211,8 +1221,18 @@ Only the newly read prefix is exposed. Pool acquisition and return use try_lock;
 contention falls back to allocation or releases the buffer. Each class retains
 at most 32 idle buffers, for a combined 3 MiB idle payload bound. Live frames and
 cached bodies hold leases outside this idle bound, and a short body can retain
-a full size class. Small responses at nonzero offsets use the Tokio seek/read
-path. Larger responses use the existing Tokio reader with 64 KiB frames.
+a full size class.
+
+HTTP/1.1 responses of at least 8 MiB use a demand-driven direct reader. Each
+64 KiB read targets its outgoing owned buffer. Concurrent blocking reads share
+a process-wide limit of 16; a cancelled body does not release its permit
+until already-started blocking work finishes. Network writes and cached frames
+do not hold admission. There is no independent producer or unbounded read-ahead.
+
+The first task seeks when needed, always using the original opened handle.
+Retained frame clones keep their buffer lease. H2, HTTP/1.0, standalone adapters
+and responses between 64 KiB and 8 MiB keep the original portable Tokio reader.
+The downstream TCP socket policy is unchanged.
 
 An exact-length reader bounds growth and reports premature EOF as an error for
 both buffered and streaming bodies. This prevents a truncated stream from looking

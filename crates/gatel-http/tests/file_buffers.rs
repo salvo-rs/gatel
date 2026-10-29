@@ -6,11 +6,50 @@ use support::*;
 use tokio::io::AsyncReadExt as _;
 
 #[tokio::test]
+async fn pipelined_files_and_proxy_responses_keep_their_own_bytes() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let gateway = Gateway::new("file-proxy-pipeline");
+    let root = gateway.directory.join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    let expected: Vec<_> = (0..8 * 1024 * 1024 + 17).map(|n| (n % 251) as u8).collect();
+    std::fs::write(root.join("data.bin"), &expected).unwrap();
+    let origin = backend("proxied").await;
+    let port = free_port();
+    let outcome = gateway.apply(&format!(
+        "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/proxy\" {{ proxy \"{origin}\"; }}; route \"/*\" {{ file-server root=\"{}\"; }} }}",
+        root.display().to_string().replace('\\', "/")
+    )).await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::Started { .. }),
+        "{outcome:?}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut client = tokio::net::TcpStream::connect(gateway.address()).await.unwrap();
+        client.write_all(
+            b"GET /data.bin HTTP/1.1\r\nHost: example.com\r\n\r\nGET /proxy HTTP/1.1\r\nHost: example.com\r\n\r\nGET /data.bin HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        ).await.unwrap();
+        let mut wire = Vec::new();
+        client.read_to_end(&mut wire).await.unwrap();
+        let mut remaining = wire.as_slice();
+        for body in [expected.as_slice(), b"proxied xff=127.0.0.1".as_slice(), expected.as_slice()] {
+            let end = remaining.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4;
+            let head = std::str::from_utf8(&remaining[..end]).unwrap();
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert!(head.to_ascii_lowercase().contains(&format!("content-length: {}\r\n", body.len())));
+            assert_eq!(&remaining[end..end + body.len()], body);
+            remaining = &remaining[end + body.len()..];
+        }
+        assert!(remaining.is_empty());
+    }).await.expect("pipelined file/proxy responses stalled");
+}
+
+#[tokio::test]
 async fn pooled_and_streamed_files_survive_encoding_and_cache_reuse() {
     let gateway = Gateway::new("file-buffer-consumers");
     let root = gateway.directory.join("www");
     std::fs::create_dir_all(&root).unwrap();
-    let sizes = [32768, 32769, 65536, 65537, 1024 * 1024 + 17];
+    let sizes = [32768, 32769, 65536, 65537, 1024 * 1024 + 17, 8 * 1024 * 1024 + 17];
     for (id, length) in sizes.into_iter().enumerate() {
         let bytes: Vec<_> = (0..length)
             .map(|offset| b'a' + ((offset + id) % 26) as u8)
@@ -19,7 +58,7 @@ async fn pooled_and_streamed_files_survive_encoding_and_cache_reuse() {
     }
     let port = free_port();
     let outcome = gateway.apply(&format!(
-        "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ cache default-ttl=\"60s\" max-entry=\"2MiB\"; encode \"gzip\" min-size=1; file-server root=\"{}\"; }} }}",
+        "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ cache default-ttl=\"60s\" max-entry=\"12MiB\"; encode \"gzip\" min-size=1; file-server root=\"{}\"; }} }}",
         root.display().to_string().replace('\\', "/")
     )).await;
     assert!(
@@ -87,7 +126,9 @@ async fn http2_preserves_whole_files_and_ranges_across_the_inline_boundary() {
     let gateway = Gateway::new("file-buffer-h2");
     let root = gateway.directory.join("www");
     std::fs::create_dir_all(&root).unwrap();
-    let expected: Vec<_> = (0..1024 * 1024 + 17).map(|offset| (offset % 251) as u8).collect();
+    let expected: Vec<_> = (0..8 * 1024 * 1024 + 17)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
     std::fs::write(root.join("data.bin"), &expected).unwrap();
     let port = free_port();
     let outcome = gateway.apply(&format!(
