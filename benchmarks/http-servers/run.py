@@ -35,6 +35,7 @@ OUTPUT_ROOT = REPO_ROOT / "target" / "benchmarks" / "http-servers"
 WWW = HERE / "fixtures" / "www"
 
 TARGETS = ("gatel", "nginx", "caddy")
+WRK_TIMEOUT_SECONDS = 5
 
 # Generated rather than committed: eleven megabytes of incompressible noise is
 # not source, and a repository that carries it pays for it on every clone.
@@ -129,6 +130,7 @@ class BenchResult:
     total_read_bytes: float
     non_2xx_3xx: int
     socket_errors: int
+    timeout_errors: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -243,6 +245,9 @@ def parse_wrk_output(scenario: str, target: str, round_id: int, text: str) -> Be
         text,
     )
 
+    if "Socket errors:" in text and sockets is None:
+        raise RuntimeError(f"failed to parse socket errors for {where}\n{text}")
+
     return BenchResult(
         scenario=scenario,
         target=target,
@@ -261,6 +266,7 @@ def parse_wrk_output(scenario: str, target: str, round_id: int, text: str) -> Be
         total_read_bytes=to_bytes(requests.group(3)),
         non_2xx_3xx=int(non_2xx.group(1)) if non_2xx else 0,
         socket_errors=sum(int(value) for value in sockets.groups()) if sockets else 0,
+        timeout_errors=int(sockets.group(4)) if sockets else 0,
     )
 
 
@@ -286,7 +292,7 @@ def benchmark_target(url: str, args: argparse.Namespace, wrk_script: str | None)
         "-t", str(args.threads),
         "-c", str(args.connections),
         "-d", f"{args.duration}s",
-        "--timeout", "5s",
+        "--timeout", f"{WRK_TIMEOUT_SECONDS}s",
     ]
     if wrk_script:
         cmd.extend(["-s", wrk_script])
@@ -423,6 +429,10 @@ def generate_report(
         f"- {args.threads} threads, {args.connections} connections",
         "- `Accept-Encoding: identity`, so every server returns the same bytes",
         "",
+        f"- wrk's latency histogram limit remains {WRK_TIMEOUT_SECONDS}s. Completed requests",
+        "  beyond that limit count as timeouts and are excluded from its latency statistics.",
+        "  A nonzero over-limit count means p99/Max do not describe the full response tail.",
+        "",
         "One machine, one moment. These numbers are for comparing the three",
         "servers against each other here, not for quoting anywhere else.",
         "",
@@ -446,6 +456,7 @@ def generate_report(
                     "p90": mean([item.p90_ms for item in rounds]),
                     "p99": mean([item.p99_ms for item in rounds]),
                     "errors": sum(item.non_2xx_3xx + item.socket_errors for item in rounds),
+                    "timeouts": sum(item.timeout_errors for item in rounds),
                 }
                 for target, rounds in by_target.items()
             ),
@@ -458,15 +469,15 @@ def generate_report(
             "",
             config["description"],
             "",
-            "| Target | Avg req/s | vs gatel | Avg latency | Mean round p90 | Mean round p99 | Transfer/sec | Errors |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Target | Avg req/s | vs gatel | Avg latency | Mean round p90 | Mean round p99 | Transfer/sec | Errors | Over-limit completions |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         for row in rows:
             ratio = f"{row['rps'] / baseline:.2f}x" if baseline else "N/A"
             lines.append(
                 f"| {row['target']} | {row['rps']:,.0f} | {ratio} | "
                 f"{row['latency']:.2f} ms | {row['p90']:.2f} ms | {row['p99']:.2f} ms | "
-                f"{format_bps(row['bps'])} | {row['errors']} |"
+                f"{format_bps(row['bps'])} | {row['errors']} | {row['timeouts']} |"
             )
         lines.append("")
 

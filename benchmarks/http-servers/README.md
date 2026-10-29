@@ -72,6 +72,16 @@ Results land in `target/benchmarks/http-servers/<timestamp>/`:
 
 Container cleanup still runs if collecting or saving the service logs fails.
 
+The unchanged wrk limit is 5 seconds. wrk counts a response completed beyond
+that limit as a timeout, but excludes it from its latency histogram. Its
+reported p99 and maximum can therefore remain below 5 seconds even when slower
+responses occurred. Check the over-limit completion count before interpreting
+tail latency. JSON keeps `timeout_errors` separately; `socket_errors` remains
+the aggregate of wrk's connect, read, write and timeout counters. The report's
+Errors column already includes timeouts; the separate column does not add them
+again. See wrk's [completion accounting](https://github.com/wg/wrk/blob/4.2.0/src/wrk.c#L301-L325)
+and [histogram bounds](https://github.com/wg/wrk/blob/4.2.0/src/stats.c#L19-L27).
+
 Each completed round is saved immediately. Reported p90/p99 values are means
 of the individual rounds' percentiles, not percentiles of pooled requests.
 Warmup uses the measured concurrency and Range script, including nonzero offsets.

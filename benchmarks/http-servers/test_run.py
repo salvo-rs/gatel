@@ -14,7 +14,7 @@ class HarnessTests(unittest.TestCase):
         args = argparse.Namespace(rounds=1, duration=2, warmup=0, threads=2, connections=8)
         row = SimpleNamespace(scenario="static-64k", target="nginx", requests_per_sec=100,
                               transfer_bytes_per_sec=6553600, latency_avg_ms=1, p90_ms=2,
-                              p99_ms=3, non_2xx_3xx=0, socket_errors=0)
+                              p99_ms=3, non_2xx_3xx=0, socket_errors=0, timeout_errors=0)
         report = bench.generate_report(Path("results"), args, {"nginx": "test"}, [row],
                                        {"static-64k": bench.SCENARIOS["static-64k"]})
         self.assertIn("| nginx | 100 | N/A |", report)
@@ -33,6 +33,22 @@ Transfer/sec: 255.75KB
 """
         result = bench.parse_wrk_output("proxy", "gatel", 1, raw)
         self.assertEqual(result.socket_errors, 10)
+        self.assertEqual(result.timeout_errors, 4)
+        args = argparse.Namespace(rounds=1, duration=10, warmup=0, threads=2, connections=8)
+        report = bench.generate_report(Path("results"), args, {"gatel": "test"}, [result],
+                                       {"proxy": bench.SCENARIOS["proxy"]})
+        self.assertIn("Over-limit completions", report)
+        self.assertIn("| 15 | 4 |", report)
+        self.assertIn("excluded from its latency statistics", report)
+        clean = bench.parse_wrk_output("proxy", "gatel", 1,
+                                      raw.replace("Socket errors: connect 1, read 2, write 3, timeout 4", ""))
+        self.assertEqual(clean.timeout_errors, 0)
+        self.assertEqual(clean.socket_errors, 0)
+        for malformed in ["Socket errors: connect 1, read 2, write 3",
+                          "Socket errors: connect 1, read 2, write 3, timeout bad"]:
+            with self.subTest(malformed=malformed), self.assertRaises(RuntimeError):
+                bench.parse_wrk_output("proxy", "gatel", 1,
+                                      raw.replace("Socket errors: connect 1, read 2, write 3, timeout 4", malformed))
         self.assertEqual(result.non_2xx_3xx, 5)
         self.assertEqual(result.p99_ms, 1000)
         self.assertEqual(result.latency_stdev_ms, 0.7)
