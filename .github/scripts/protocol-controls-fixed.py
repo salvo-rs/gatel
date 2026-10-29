@@ -12,7 +12,7 @@ def capture(args,**kw):
 def main():
     OUT.mkdir()
     context=OUT/'client-context';context.mkdir()
-    (context/'Dockerfile').write_text('FROM gatel-http-bench-runner:local\nRUN apk add --no-cache nghttp2-client\n')
+    (context/'Dockerfile').write_text('FROM gatel-http-bench-runner:local\nRUN apk add --no-cache nghttp2\n')
     run(['docker','build','-t','gatel-protocol-client:local',context])
     run(['docker','network','create','gatel-protocol-ab'])
     tls=OUT/'tls';tls.mkdir()
