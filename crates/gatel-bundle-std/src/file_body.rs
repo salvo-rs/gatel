@@ -19,17 +19,24 @@ pub(crate) fn read_exact_prefix(reader: impl Read, length: usize) -> io::Result<
 
 pub(crate) const POOLED_MIN: usize = 32 * 1024;
 const MAX_CHUNK: usize = 64 * 1024;
+pub(crate) const BULK_READ_SIZE: usize = 128 * 1024;
 const MAX_IDLE: usize = 32;
 
 struct BufferPool {
     size: usize,
+    max_idle: usize,
     idle: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl BufferPool {
     const fn new(size: usize) -> Self {
+        Self::with_max_idle(size, MAX_IDLE)
+    }
+
+    const fn with_max_idle(size: usize, max_idle: usize) -> Self {
         Self {
             size,
+            max_idle,
             idle: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -72,7 +79,7 @@ impl Drop for BufferLease {
         // Returning the last Bytes clone must not wait for the pool lock.
         // Contention and a full pool simply release the buffer.
         if let Ok(mut idle) = self.pool.idle.try_lock()
-            && idle.len() < MAX_IDLE
+            && idle.len() < self.pool.max_idle
         {
             idle.push(buffer);
         }
@@ -81,6 +88,7 @@ impl Drop for BufferLease {
 
 static MEDIUM_BUFFERS: BufferPool = BufferPool::new(32 * 1024);
 static LARGE_BUFFERS: BufferPool = BufferPool::new(MAX_CHUNK);
+static BULK_BUFFERS: BufferPool = BufferPool::with_max_idle(BULK_READ_SIZE, 8);
 
 /// Reuse initialized buffers for the eager 32–64 KiB response path.
 /// The two eager classes retain at most 32 buffers each (3 MiB total).
@@ -94,7 +102,8 @@ pub(crate) fn read_bytes(reader: impl Read, length: usize) -> io::Result<bytes::
 }
 
 /// Read only when the transport asks for another frame, directly into its
-/// outgoing owner. At most one 64 KiB read is pending per response.
+/// outgoing owner. At most one bounded read batch is pending per response;
+/// its output is split into frames of at most 64 KiB.
 pub(crate) fn stream(
     reader: impl Read + io::Seek + Send + Sync + 'static,
     start: u64,
@@ -113,28 +122,40 @@ fn stream_limited(
     readers: &'static tokio::sync::Semaphore,
 ) -> salvo_core::http::ResBody {
     let frames = futures_util::stream::try_unfold(
-        (reader, start, length),
-        move |(mut reader, start, remaining)| async move {
-            if remaining == 0 {
-                return Ok::<_, salvo_core::BoxedError>(None);
-            }
-            let length = remaining.min(MAX_CHUNK as u64) as usize;
-            let permit = readers.acquire().await.map_err(io::Error::other)?;
-            let (reader, bytes) = tokio::task::spawn_blocking(move || {
-                // Cancellation cannot release admission while the blocking
-                // read is still queued or running.
-                let _permit = permit;
-                if start != 0 {
-                    reader.seek(io::SeekFrom::Start(start))?;
+        (reader, start, length, bytes::Bytes::new()),
+        move |(mut reader, mut start, mut remaining, mut buffered)| async move {
+            if buffered.is_empty() {
+                if remaining == 0 {
+                    return Ok::<_, salvo_core::BoxedError>(None);
                 }
-                let bytes = LARGE_BUFFERS.read(&mut reader, length)?;
-                Ok::<_, io::Error>((reader, bytes))
-            })
-            .await
-            .map_err(io::Error::other)??;
+                let length = remaining.min(BULK_READ_SIZE as u64) as usize;
+                let permit = readers.acquire().await.map_err(io::Error::other)?;
+                let (next_reader, bytes) = tokio::task::spawn_blocking(move || {
+                    // Admission remains with queued/running I/O after cancellation,
+                    // but does not cover consumption of the returned batch.
+                    let _permit = permit;
+                    if start != 0 {
+                        reader.seek(io::SeekFrom::Start(start))?;
+                    }
+                    let bytes = if length <= MAX_CHUNK {
+                        LARGE_BUFFERS.read(&mut reader, length)?
+                    } else {
+                        BULK_BUFFERS.read(&mut reader, length)?
+                    };
+                    Ok::<_, io::Error>((reader, bytes))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                reader = next_reader;
+                buffered = bytes;
+                start = 0;
+                remaining -= length as u64;
+            }
+            let length = buffered.len().min(MAX_CHUNK);
+            let bytes = buffered.split_to(length);
             Ok(Some((
                 http_body::Frame::data(bytes),
-                (reader, 0, remaining - length as u64),
+                (reader, start, remaining, buffered),
             )))
         },
     );
@@ -199,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_reads_are_demand_driven_and_stop_when_the_body_is_dropped() {
+    async fn batch_reads_are_bounded_and_stop_when_the_body_is_dropped() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -228,11 +249,51 @@ mod tests {
         let mut body = stream(input, 0, MAX_CHUNK as u64 * 4);
         assert_eq!(read.load(Ordering::Relaxed), 0);
         let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
-        assert_eq!(read.load(Ordering::Relaxed), MAX_CHUNK);
+        assert_eq!(read.load(Ordering::Relaxed), BULK_READ_SIZE.min(MAX_CHUNK * 4));
         drop(body);
         tokio::task::yield_now().await;
-        assert_eq!(read.load(Ordering::Relaxed), MAX_CHUNK);
+        assert_eq!(read.load(Ordering::Relaxed), BULK_READ_SIZE.min(MAX_CHUNK * 4));
         assert_eq!(first.as_ref(), vec![b'x'; MAX_CHUNK]);
+    }
+
+    #[tokio::test]
+    async fn a_read_batch_is_drained_before_another_read_and_slices_keep_the_owner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use http_body_util::BodyExt as _;
+        struct Reader(io::Cursor<Vec<u8>>, Arc<AtomicUsize>);
+        impl Read for Reader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let count = Read::read(&mut self.0, output)?;
+                self.1.fetch_add(count, Ordering::Relaxed);
+                Ok(count)
+            }
+        }
+        impl io::Seek for Reader {
+            fn seek(&mut self, offset: io::SeekFrom) -> io::Result<u64> {
+                self.0.seek(offset)
+            }
+        }
+        let original: Vec<_> = (0..BULK_READ_SIZE * 3 + 17).map(|n| (n % 251) as u8).collect();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut body = stream(
+            Reader(io::Cursor::new(original.clone()), count.clone()),
+            0,
+            original.len() as u64,
+        );
+        let mut retained = Vec::new();
+        for _ in 0..BULK_READ_SIZE / MAX_CHUNK {
+            retained.push(body.frame().await.unwrap().unwrap().into_data().unwrap());
+            assert_eq!(count.load(Ordering::Relaxed), BULK_READ_SIZE);
+        }
+        let next = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), BULK_READ_SIZE * 2);
+        drop(body);
+        assert_eq!(count.load(Ordering::Relaxed), BULK_READ_SIZE * 2);
+        let bytes: Vec<_> = retained.iter().flat_map(|b| b.iter().copied()).collect();
+        assert_eq!(bytes, original[..BULK_READ_SIZE]);
+        assert_eq!(next, original[BULK_READ_SIZE..BULK_READ_SIZE + MAX_CHUNK]);
     }
 
     #[tokio::test]

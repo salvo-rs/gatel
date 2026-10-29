@@ -633,7 +633,18 @@ mod tests {
             .unwrap()
             .set_len(0)
             .unwrap();
-        assert!(body.frame().await.unwrap().is_err());
+        let mut produced = first.len();
+        while let Ok(frame) = body
+            .frame()
+            .await
+            .expect("truncation must terminate with an error")
+        {
+            let bytes = frame.into_data().unwrap();
+            assert_eq!(bytes, original[produced..produced + bytes.len()]);
+            produced += bytes.len();
+            assert!(produced <= crate::file_body::BULK_READ_SIZE);
+        }
+        assert_eq!(produced, crate::file_body::BULK_READ_SIZE);
         assert_eq!(first.as_ref(), &original[..CHUNK]);
         assert!(body.frame().await.is_none());
     }
