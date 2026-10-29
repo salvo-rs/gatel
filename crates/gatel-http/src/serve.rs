@@ -340,16 +340,15 @@ async fn serve_connection(
     let request_work = work.clone();
     let activity = crate::connection_activity::Activity::new();
     let request_activity = activity.clone();
-    let handler = Arc::new(handler);
+    let handler = Arc::new((handler, output));
     let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
         let http1 = request.version() == hyper::Version::HTTP_11;
         request.extensions_mut().insert(request_work.clone());
-        let output = output.clone();
         let active = request_activity.request();
         let handler = handler.clone();
         async move {
-            handler.call(request).await.map(|response| {
-                if let Some(output) = output {
+            handler.0.call(request).await.map(|response| {
+                if let Some(output) = &handler.1 {
                     output.set_file(
                         http1
                             && response
