@@ -25,7 +25,6 @@ const INLINE_LIMIT: u64 = 64 * 1024;
 const CHUNK: usize = INLINE_LIMIT as usize;
 
 const READ_AHEAD_MIN: u64 = 1024 * 1024;
-const READ_AHEAD_CAPACITY: usize = 128 * 1024;
 
 /// One opened representation owns both the metadata and the eventual reader.
 /// A path replacement after opening cannot select another file for its body.
@@ -240,14 +239,14 @@ pub async fn deliver(
         return Ok(());
     }
 
-    let reader = crate::file_body::ExactReader::new(file, length);
     if length >= READ_AHEAD_MIN {
-        // Batch filesystem reads without increasing outgoing frame size. Keep
-        // small streamed responses on their original direct Tokio read path.
-        let reader = tokio::io::BufReader::with_capacity(READ_AHEAD_CAPACITY, reader);
-        response.body(crate::file_body::stream(reader, CHUNK));
+        let file = file.into_std().await;
+        response.body(crate::file_body::large_stream(file, length));
     } else {
-        response.body(crate::file_body::stream(reader, CHUNK));
+        response.body(crate::file_body::stream(
+            crate::file_body::ExactReader::new(file, length),
+            CHUNK,
+        ));
     }
     Ok(())
 }
@@ -561,7 +560,7 @@ mod tests {
             received += frame.into_data().unwrap().len();
         }
         // Already-read bytes may be forwarded, but read-ahead stays bounded.
-        assert!(received <= READ_AHEAD_CAPACITY);
+        assert!(received <= crate::file_body::STREAM_READ);
     }
 
     #[tokio::test]
@@ -595,7 +594,12 @@ mod tests {
 
     #[tokio::test]
     async fn pathname_replacement_cannot_change_an_opened_representation() {
-        for size in [32, INLINE_LIMIT as usize, INLINE_LIMIT as usize + 4096] {
+        for size in [
+            32,
+            INLINE_LIMIT as usize,
+            INLINE_LIMIT as usize + 4096,
+            READ_AHEAD_MIN as usize + 4096,
+        ] {
             let original = vec![b'a'; size];
             let path = write("replace-opened", &original).await;
             let opened = OpenedFile::open(&path).await.unwrap();
@@ -616,7 +620,12 @@ mod tests {
     #[tokio::test]
     async fn truncation_is_an_error_for_inline_and_streaming_bodies() {
         use http_body_util::BodyExt;
-        for size in [32, INLINE_LIMIT as usize, INLINE_LIMIT as usize + 4096] {
+        for size in [
+            32,
+            INLINE_LIMIT as usize,
+            INLINE_LIMIT as usize + 4096,
+            READ_AHEAD_MIN as usize + 4096,
+        ] {
             let path = write("truncate-opened", &vec![b'a'; size]).await;
             let opened = OpenedFile::open(&path).await.unwrap();
             std::fs::OpenOptions::new()

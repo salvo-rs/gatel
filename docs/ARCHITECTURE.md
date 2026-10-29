@@ -1203,20 +1203,22 @@ idle Tokio file to a standard file handle. One blocking task reads exactly the
 selected length into the outgoing buffer, avoiding a separate file read buffer.
 This does not reopen the pathname. Reads below 32 KiB keep the original outgoing
 buffer conversion on the asynchronous task. Small responses at nonzero offsets
-retain the Tokio seek/read path. Larger responses use the Tokio reader and
-at most 64 KiB per outgoing frame. Responses of at least 1 MiB place a 128 KiB
-`BufReader` around the exact-length reader to batch filesystem reads while
-preserving the frame limit. That buffer and Tokio's file read buffer are per
-live response; this increases read-ahead memory independently of the idle pool.
+retain the Tokio seek/read path. Streamed responses below 1 MiB use the Tokio
+reader. Responses of at least 1 MiB transfer the idle file handle after any
+seek, then read at most 128 KiB directly into an outgoing buffer in one blocking
+task. The batch is split into frames of at most 64 KiB. The stream yields to the
+executor between batches, and starts the next read only when polled after the
+current batch has been delivered. The selected length bounds every read.
 
 Direct reads of 32–64 KiB use initialized buffers from two process-wide size
 classes, 32 and 64 KiB. Each pooled eager `Bytes` owns a lease until its last clone
 is released, including clones retained by cache or transport consumers. Only
 the newly read prefix is exposed. Pool acquisition and return use `try_lock`;
-contention falls back to allocation or releases the buffer. Each class retains
-at most 32 idle buffers (3 MiB total). Live frames and cached bodies hold their
-own leases outside this idle bound, and a short eager body can retain a full
-size class.
+contention falls back to allocation or releases the buffer. The two eager
+classes retain at most 32 idle buffers each (3 MiB total). Streamed batches use
+a 128 KiB class retaining at most 16 idle buffers (2 MiB), for a combined 5 MiB
+idle payload bound. Live frames and cached bodies hold leases outside this
+idle bound, and a short body or split frame can retain a full size class.
 Cancellation does not assume a started blocking read can be aborted.
 
 An exact-length reader bounds growth and reports premature EOF as an error for

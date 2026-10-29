@@ -20,6 +20,8 @@ pub(crate) fn read_exact_prefix(reader: impl Read, length: usize) -> io::Result<
 pub(crate) const POOLED_MIN: usize = 32 * 1024;
 const MAX_CHUNK: usize = 64 * 1024;
 const MAX_IDLE: usize = 32;
+const MAX_IDLE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const STREAM_READ: usize = 128 * 1024;
 
 struct BufferPool {
     size: usize,
@@ -72,7 +74,7 @@ impl Drop for BufferLease {
         // Returning the last Bytes clone must not wait for the pool lock.
         // Contention and a full pool simply release the buffer.
         if let Ok(mut idle) = self.pool.idle.try_lock()
-            && idle.len() < MAX_IDLE
+            && idle.len() < MAX_IDLE.min(MAX_IDLE_BYTES / self.pool.size)
         {
             idle.push(buffer);
         }
@@ -81,9 +83,10 @@ impl Drop for BufferLease {
 
 static MEDIUM_BUFFERS: BufferPool = BufferPool::new(32 * 1024);
 static LARGE_BUFFERS: BufferPool = BufferPool::new(MAX_CHUNK);
+static STREAM_BUFFERS: BufferPool = BufferPool::new(STREAM_READ);
 
 /// Reuse initialized buffers for the eager 32–64 KiB response path.
-/// Idle retention is bounded to 32 buffers per class (3 MiB total).
+/// The two eager classes retain at most 32 buffers each (3 MiB total).
 pub(crate) fn read_bytes(reader: impl Read, length: usize) -> io::Result<bytes::Bytes> {
     assert!((POOLED_MIN..=MAX_CHUNK).contains(&length));
     if length <= MEDIUM_BUFFERS.size {
@@ -102,6 +105,43 @@ pub(crate) fn stream(
         Ok(bytes) => Ok(http_body::Frame::data(bytes)),
         Err(error) => Err(Box::new(error) as salvo_core::BoxedError),
     });
+    salvo_core::http::ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames)))
+}
+
+/// Read a bounded batch directly into its outgoing owner, then split it into
+/// 64 KiB frames. Yield between batches so ready downloads share the executor.
+pub(crate) fn large_stream(file: std::fs::File, length: u64) -> salvo_core::http::ResBody {
+    let state = (Some(file), length, bytes::Bytes::new(), false);
+    let frames = futures_util::stream::try_unfold(
+        state,
+        |(mut file, mut remaining, mut ready, started)| async move {
+            if remaining == 0 {
+                return Ok::<_, salvo_core::BoxedError>(None);
+            }
+            if ready.is_empty() {
+                if started {
+                    tokio::task::yield_now().await;
+                }
+                let length = remaining.min(STREAM_READ as u64) as usize;
+                let mut input = file.take().expect("a pending batch owns its file");
+                let (next, bytes) = tokio::task::spawn_blocking(move || {
+                    let bytes = STREAM_BUFFERS.read(&mut input, length)?;
+                    let file = (remaining > length as u64).then_some(input);
+                    Ok::<_, io::Error>((file, bytes))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                file = next;
+                ready = bytes;
+            }
+            let bytes = ready.split_to(MAX_CHUNK.min(ready.len()));
+            remaining -= bytes.len() as u64;
+            Ok(Some((
+                http_body::Frame::data(bytes),
+                (file, remaining, ready, true),
+            )))
+        },
+    );
     salvo_core::http::ResBody::Boxed(Box::pin(http_body_util::StreamBody::new(frames)))
 }
 
@@ -198,6 +238,28 @@ mod tests {
         drop(idle);
         worker.join().unwrap();
         assert!(completed.is_ok(), "returning a lease waited for the pool lock");
+    }
+
+    #[test]
+    fn split_frames_keep_the_batch_lease_until_both_are_released() {
+        static POOL: BufferPool = BufferPool::new(128);
+        let mut batch = POOL.read(&[b'x'; 128][..], 128).unwrap();
+        let first = batch.split_to(64);
+        drop(batch);
+        assert!(POOL.idle.lock().unwrap().is_empty());
+        assert_eq!(first.as_ref(), &[b'x'; 64]);
+        drop(first);
+        assert_eq!(POOL.idle.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn large_batches_respect_the_idle_byte_cap() {
+        static POOL: BufferPool = BufferPool::new(STREAM_READ);
+        let leases: Vec<_> = (0..MAX_IDLE).map(|_| POOL.read(&b"x"[..], 1).unwrap()).collect();
+        drop(leases);
+        let idle = POOL.idle.lock().unwrap();
+        assert_eq!(idle.len(), MAX_IDLE_BYTES / STREAM_READ);
+        assert_eq!(idle.iter().map(Vec::len).sum::<usize>(), MAX_IDLE_BYTES);
     }
 
     #[test]
