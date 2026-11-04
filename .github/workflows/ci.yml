@@ -318,7 +318,7 @@ jobs:
 
       # The container image is part of the deliverable, so a Dockerfile that
       # does not build is a broken release. Built, not pushed.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build the container image
         uses: docker/build-push-action@v6
         with:
