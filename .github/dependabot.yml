@@ -11,5 +11,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # This version is the project's MSRV contract, not an action release.
+    # Raise it together with workspace.package.rust-version after validation.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
     commit-message:
       prefix: "chore(ci)"

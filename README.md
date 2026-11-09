@@ -116,7 +116,7 @@ plan is [ROADMAP.md](docs/ROADMAP.md); this branch does not yet restore all v1 f
 
 ## Building
 
-Requires Rust 1.94 or newer (2024 edition). Use the committed lockfile for
+Requires Rust 1.95 or newer (2024 edition). Use the committed lockfile for
 reproducible dependency resolution. Optional plugins are checked together with
 `cargo check --workspace --all-features --all-targets --locked`; this is also
 the minimum-supported-Rust-version compilation gate.
