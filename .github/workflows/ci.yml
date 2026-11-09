@@ -190,7 +190,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-features --all-targets --locked
 
@@ -216,8 +216,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the frozen v1 baseline
+        id: v1
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/gatel-v1-target
           # Frozen historical code is a reference, not the current lint target.
           RUSTFLAGS: ""
         shell: bash
@@ -225,13 +225,19 @@ jobs:
           set -euo pipefail
           mkdir "$RUNNER_TEMP/gatel-v1-source"
           git archive eaf9bdedd97c2ab24450becfff2a2a341dc5c3e2 | tar -x -C "$RUNNER_TEMP/gatel-v1-source"
-          cargo build --manifest-path "$RUNNER_TEMP/gatel-v1-source/Cargo.toml" -p gatel --locked
+          cd "$RUNNER_TEMP/gatel-v1-source"
+          cargo build -p gatel --locked
+          target_dir=$(cargo metadata --no-deps --format-version 1 --locked | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+          printf 'binary=%s/debug/gatel\n' "$target_dir" >> "$GITHUB_OUTPUT"
       - name: Build v2 and compare real HTTP responses
+        env:
+          V1_BINARY: ${{ steps.v1.outputs.binary }}
         shell: bash
         run: |
           set -euo pipefail
           cargo build -p gatel --locked
-          python3 scripts/check-v1-compat.py --v1 "$RUNNER_TEMP/gatel-v1-target/debug/gatel" --v2 target/debug/gatel --work-dir "$RUNNER_TEMP/gatel-v1-compat"
+          target_dir=$(cargo metadata --no-deps --format-version 1 --locked | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+          python3 scripts/check-v1-compat.py --v1 "$V1_BINARY" --v2 "$target_dir/debug/gatel" --work-dir "$RUNNER_TEMP/gatel-v1-compat"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
