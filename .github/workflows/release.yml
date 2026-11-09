@@ -230,7 +230,7 @@ jobs:
             --output-signature release/SHA256SUMS.sig \
             --output-certificate release/SHA256SUMS.pem
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: release/*
           generate_release_notes: true
