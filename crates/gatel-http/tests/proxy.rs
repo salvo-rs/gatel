@@ -7,6 +7,97 @@ use std::sync::Arc;
 use support::*;
 
 #[tokio::test]
+async fn response_close_boundaries_preserve_requests_without_replay() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use http_body_util::BodyExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counted = served.clone();
+    let backend = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let counted = counted.clone();
+            tokio::spawn(async move {
+                for exchange in 0..3 {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        let Ok(byte) = socket.read_u8().await else { return };
+                        head.push(byte);
+                    }
+                    assert!(head.starts_with(b"GET ") || head.starts_with(b"POST "));
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let close = if exchange == 2 {
+                        "Connection: close\r\n"
+                    } else {
+                        ""
+                    };
+                    socket
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{close}\r\nok").as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let gateway = Gateway::new("proxy-response-close");
+    let port = free_port();
+    let outcome = gateway
+        .apply(&format!(
+            "global {{ http \"127.0.0.1:{port}\" }}\nsite \"*\" {{ route \"/*\" {{ proxy \"{address}\"; }} }}"
+        ))
+        .await;
+    assert!(
+        matches!(outcome, gatel_plan::Outcome::Started { .. }),
+        "{outcome:?}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let mut clients = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let address = gateway.address();
+            clients.spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(tokio::net::TcpStream::connect(address).await.unwrap());
+                let (mut client, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
+                let driver = tokio::spawn(connection);
+                for exchange in 0..128 {
+                    client.ready().await.unwrap();
+                    let response = client
+                        .send_request(
+                            http::Request::builder()
+                                .method(if exchange % 2 == 0 { "POST" } else { "GET" })
+                                .uri("/value")
+                                .header("host", "example.com")
+                                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 200);
+                    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "ok");
+                }
+                drop(client);
+                driver.await.unwrap().unwrap();
+            });
+        }
+        while let Some(result) = clients.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("proxy reuse across close boundaries stalled");
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        1024,
+        "a POST must never be replayed"
+    );
+    backend.abort();
+}
+
+#[tokio::test]
 async fn it_proxies_and_balances_across_backends() {
     let gateway = Gateway::new("proxy");
     let port = free_port();

@@ -133,12 +133,12 @@ impl ConnectionPool {
             return Ok((sender, None));
         }
 
-        let deadline = Instant::now() + timeouts.connect;
-        let addresses = self.addresses_for(endpoint, deadline).await?;
+        let started = Instant::now();
+        let addresses = self.addresses_for(endpoint, started, timeouts.connect).await?;
 
         let mut last: Option<CheckoutError> = None;
         for address in addresses {
-            let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
+            let Some(budget) = timeouts.connect.checked_sub(started.elapsed()) else {
                 break;
             };
             match self.dial_one(address, budget).await {
@@ -158,14 +158,15 @@ impl ConnectionPool {
     async fn addresses_for(
         &self,
         endpoint: &Endpoint,
-        deadline: Instant,
+        started: Instant,
+        total: Duration,
     ) -> Result<Vec<SocketAddr>, CheckoutError> {
         let ordered = endpoint.dial_order();
         if !ordered.is_empty() {
             return Ok(ordered);
         }
-        let budget = deadline
-            .checked_duration_since(Instant::now())
+        let budget = total
+            .checked_sub(started.elapsed())
             .ok_or_else(|| CheckoutError::Resolve("no time left to look the name up".to_string()))?;
         let resolve = self.policy().resolve;
         let policy = gatel_plan::Resolve {

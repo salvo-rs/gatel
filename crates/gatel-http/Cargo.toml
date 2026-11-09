@@ -23,11 +23,11 @@ hyper.workspace = true
 hyper-util = { workspace = true, features = ["server-graceful"] }
 pin-project-lite.workspace = true
 salvo_core.workspace = true
+socket2 = { version = "0.6", features = ["all"] }
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-socket2 = "0.6"
 gatel-decode = { version = "2.0.0-alpha.1", path = "../../plugins/decode" }
 async-compression.workspace = true
 gatel-cgi-http.workspace = true

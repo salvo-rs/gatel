@@ -24,6 +24,7 @@ pub mod prepare;
 pub mod proxy;
 pub mod proxy_protocol;
 pub mod serve;
+mod socket_output;
 pub mod upgrade;
 
 pub use bind::BindTable;
