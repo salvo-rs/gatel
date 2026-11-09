@@ -33,8 +33,8 @@ pub use directive::{
 };
 pub use gatel_plugin_runtime::secrets::SecretDependencies;
 pub use gatel_plugin_runtime::{
-    BackgroundTask, BodyTooLarge, ExecutionIdentity, PreparedDirective, RequestBodyLimit, Shutdown,
-    ShutdownSignal, blocking,
+    BackgroundTask, BodyTooLarge, BoundedFileOutput, ExecutionIdentity, PreparedDirective, RequestBodyLimit,
+    Shutdown, ShutdownSignal, blocking,
 };
 pub use generation::{
     Committed, ConfigurationCapture, Conflict, Failure, GenerationStore, Outcome, Preparation,

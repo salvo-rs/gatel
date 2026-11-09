@@ -15,6 +15,12 @@ pub use body_error::{BodyTooLarge, RequestBodyLimit};
 pub use subrequest::{Answer, Ask, SharedUpstreams, UpstreamHandle};
 pub use task::{BackgroundTask, Shutdown, ShutdownSignal};
 
+/// A bulk-file response requests an optional host output-queue bound.
+/// Hosts that do not support this hint retain their usual output policy.
+/// This zero-sized response marker carries no request or connection handle.
+#[derive(Debug, Clone, Copy)]
+pub struct BoundedFileOutput;
+
 /// Host-supplied identity of the selected execution plan and declared upstream
 /// configurations. Not an authorization capability or a generation counter.
 #[derive(Debug, Clone, Copy)]

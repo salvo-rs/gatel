@@ -204,6 +204,14 @@ Large-file delivery retains the baseline reader. Keep all original windows and
 the separate controlled-profile failures when assessing this change; do not
 merge measurements from different hosts or receive profiles.
 
+## 2026-10-30 proxy reuse and bulk-file investigation
+
+The [investigation report](proxy-range-tail-2026-10-30.md) records the HTTP/1
+pool regressions, nonzero-offset Range changes and plaintext-only bulk output
+policy. It includes production-binary identities, regression checks, the TLS
+scope decision, retained failed experiments and latency/throughput tradeoffs.
+Measurements from different hosts and source revisions remain separate.
+
 ## The files under test
 
 Generated on first run into `fixtures/www/`, which is not tracked: eleven

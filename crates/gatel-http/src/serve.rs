@@ -335,20 +335,30 @@ async fn serve_connection(
         runtime
             .service
             .hyper_handler(local.into(), peer.into(), scheme, None, ConnCtrl::new(), None);
+    let (stream, output) = crate::socket_output::configure(stream, !runtime.is_tls());
     let work = crate::connection_work::ConnectionWork::default();
     let request_work = work.clone();
     let activity = crate::connection_activity::Activity::new();
     let request_activity = activity.clone();
-    let handler = Arc::new(handler);
+    let handler = Arc::new((handler, output));
     let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
+        let http1 = request.version() == hyper::Version::HTTP_11;
         request.extensions_mut().insert(request_work.clone());
         let active = request_activity.request();
         let handler = handler.clone();
         async move {
-            handler
-                .call(request)
-                .await
-                .map(|response| response.map(|body| crate::connection_activity::Body::new(body, active)))
+            handler.0.call(request).await.map(|response| {
+                if let Some(output) = &handler.1 {
+                    output.set_file(
+                        http1
+                            && response
+                                .extensions()
+                                .get::<gatel_plan::BoundedFileOutput>()
+                                .is_some(),
+                    );
+                }
+                response.map(|body| crate::connection_activity::Body::new(body, active))
+            })
         }
     });
     let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -384,7 +394,7 @@ async fn serve_connection(
         }
         Some(config) => {
             let acceptor = TlsAcceptor::from(Arc::clone(config));
-            match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream)).await {
+            match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream.into_inner())).await {
                 Ok(Ok(stream)) => {
                     metrics.handshakes_ok.increment();
                     let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), handler);
