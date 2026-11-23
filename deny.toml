@@ -19,21 +19,7 @@ yanked = "deny"
 # An entry here is a decision, and a decision has to say what it is waiting
 # for. An ignore with no reason is how a tree ends up carrying an advisory
 # nobody remembers accepting.
-ignore = [
-    # RUSTSEC-2023-0071 - a timing side channel in `rsa`'s private-key
-    # operations (the Marvin attack). It arrives through `certon`, which is
-    # the ACME client, and no fixed version exists.
-    #
-    # Accepted because nothing here performs an RSA private-key operation: the
-    # ACME account key and every certificate key this project generates are
-    # ECDSA, produced by `rcgen`. The crate is in the tree for RSA key support
-    # that is never reached.
-    #
-    # Revisit when `rsa` publishes a fix, or if a configuration is ever able
-    # to hand a certificate an RSA private key - at which point this stops
-    # being unreachable and the answer changes.
-    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operation is reachable; no fix exists" },
-]
+ignore = []
 
 # The tool spells this key the American way; the prose here does not.
 [licenses]
